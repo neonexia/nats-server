@@ -9726,10 +9726,16 @@ func (fs *fileStore) loadLastLocked(subj string, sm *StoreMsg) (lsm *StoreMsg, e
 // LoadLastMsg will return the last message we have that matches a given subject.
 // The subject can be a wildcard.
 func (fs *fileStore) LoadLastMsg(subject string, smv *StoreMsg) (sm *StoreMsg, err error) {
+	if err := fs.prefetchS3Last(subject); err != nil {
+		return nil, err
+	}
 	if subject == _EMPTY_ || subject == fwcs {
 		sm, err = fs.msgForSeq(fs.lastSeq(), smv)
 	} else {
 		sm, err = fs.loadLast(subject, smv)
+	}
+	if errors.Is(err, errS3TierUnavailable) {
+		return nil, err
 	}
 	if sm == nil || (err != nil && err != ErrStoreClosed) {
 		err = ErrStoreMsgNotFound

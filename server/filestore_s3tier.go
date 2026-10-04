@@ -300,6 +300,35 @@ func (fs *fileStore) prefetchS3Block(start uint64, throughTail bool) error {
 	return nil
 }
 
+func (fs *fileStore) prefetchS3Last(subject string) error {
+	if fs.tier == nil {
+		return nil
+	}
+	if subject == _EMPTY_ || subject == fwcs {
+		return fs.prefetchS3Block(fs.lastSeq(), false)
+	}
+	fs.mu.RLock()
+	var index uint32
+	if subjectHasWildcard(subject) {
+		fs.psim.Match(stringToBytes(subject), func(_ []byte, state *psi) {
+			if state.lblk > index {
+				index = state.lblk
+			}
+		})
+	} else if state, ok := fs.psim.Find(stringToBytes(subject)); ok {
+		index = state.lblk
+	}
+	mb := fs.bim[index]
+	fs.mu.RUnlock()
+	if mb == nil {
+		return nil
+	}
+	if _, err := os.Stat(mb.mfn); os.IsNotExist(err) {
+		return fs.tier.ensureHydrated(index)
+	}
+	return nil
+}
+
 // evictToBudget copies sealed blocks, verifies the remote bytes, commits the
 // descriptor remotely and locally, then unlinks local payloads under block lock.
 func (t *fileS3Tier) evictToBudget() error {

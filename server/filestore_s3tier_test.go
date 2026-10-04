@@ -248,6 +248,32 @@ func TestFileStoreS3TierColdReadDoesNotHoldWriteLock(t *testing.T) {
 	}
 }
 
+func TestFileStoreS3TierLastBySubjectColdFailure(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/last-subject")
+	defer fs.Stop()
+	if _, _, err := fs.StoreMsg("older", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 99; i++ {
+		if _, _, err := fs.StoreMsg("newer", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.failGet = true
+	store.mu.Unlock()
+	if _, err := fs.LoadLastMsg("older", nil); !errors.Is(err, errS3TierUnavailable) {
+		t.Fatalf("old subject should report storage outage: %v", err)
+	}
+	if _, err := fs.LoadLastMsg("newer", nil); err != nil {
+		t.Fatalf("new subject should remain local: %v", err)
+	}
+}
+
 func TestJetStreamS3TierNativePullConsumer(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	s := RunBasicJetStreamServer(t)
