@@ -1,8 +1,34 @@
 # Experimental JetStream file/S3 tier
 
-Status: design for review, 2026-10-04. No server behavior has been implemented. This document concerns native JetStream stream and consumer reads. Nodus history services, audit archives, and analytical range APIs are outside this experiment.
+Status: experimental fork implementation, 2026-10-04. The first runnable slice is on `codex/jetstream-s3-tier-spike`; it is not enabled for Nodus or ready for production. This document concerns native JetStream stream and consumer reads. Nodus history services, audit archives, and analytical range APIs are outside this experiment.
 
-## Goal and decision
+## What the spike actually implements
+
+- `FileStoreConfig.S3Tier` enables an append-only block tier. `Options.JetStreamS3Tiers` maps `account/stream` to a tier config when the normal server path creates or recovers a stream. The option is programmatic only; the NATS config parser has no S3 stanza. Credentials are supplied by the caller rather than persisted in stream metadata.
+- The S3 adapter uses `minio-go/v7` against an S3-compatible endpoint. Object keys contain a caller-supplied unique stream prefix, block index, and SHA-256 digest. A background worker measures local `.blk` payload bytes and copies sealed blocks when they exceed the high watermark, working toward the low watermark. The active block stays local.
+- Each eviction uploads block bytes, reads them back and compares bytes, uploads a JSON descriptor, reads it back and compares bytes, syncs a local descriptor, then unlinks the local `.blk` under file-store and block locks. Restart lists remote descriptors and hydrates all referenced blocks before existing JetStream recovery runs. Missing tier configuration and checksum mismatches fail startup instead of silently treating remote blocks as lost.
+- Native durable pull consumers and direct get use the existing JetStream storage methods. Cold reads hydrate a missing block. Direct get returns `503 Storage Unavailable` on remote fetch failure instead of `404`. The normal `nats.go` request helper maps a 503 status to its `ErrNoResponders` error; raw headers distinguish the storage failure.
+- The experiment rejects config changes that would enable retention expiry, automatic old-message discard, per-subject limits, rollups, multiple replicas, compression, sources/mirrors, and asynchronous persist. Explicit delete, erase, purge, compact, truncate, stream deletion, and snapshots are rejected for tiered stores. These restrictions protect immutable remote block assumptions; they are not a complete durability or lifecycle design.
+
+## Observed results
+
+- Focused Go tests pass for block eviction, readback, remote-only file-store restart, full server restart, 100-message native durable pull replay, and corruption / missing-configuration failure. PUT failure and descriptor-commit failure leave the local block present. A blocked cold GET did not hold a local `StoreMsg` in the prefetch path. An injected GET failure left the consumer sequence at 1, and direct get returned the storage-specific 503 header.
+- The S3 adapter passed the same eviction, cold-read, and restart test against a local Moto S3 endpoint. The installed MinIO binary reported that S3 operations were disabled without a license; an older container image was unavailable in this environment. A MinIO or AWS endpoint and network-partition tests remain unverified.
+- `go test -race` passed the focused tier tests. These are correctness spikes, not latency or throughput benchmarks.
+
+## Revised assessment and remaining gaps
+
+The block and descriptor protocol is feasible for a narrow append-only stream. Native consumer sequence continuity survived eviction and restart in the tested setup. The current recovery strategy downloads every remote block before serving, so restart time and local disk use grow with total history. This is a correctness bridge, not the intended middle-tier behavior. To serve long-running workspaces, recovery must reconstruct block metadata without hydrating payloads and preserve remote-only state through full-state indexes.
+
+Cold prefetch currently scans and hydrates all remote blocks from a `LoadNextMsg` starting sequence to the tail. It keeps network I/O outside the broad file-store read lock on that path, but it can download much more than the consumer needs. Other read paths can still reach the `openBlock` fallback while holding a block lock. Hydrated blocks have no bounded cache or read-triggered re-eviction. The watermarks are a soft upload trigger, not a hard node-disk cap; upload failure logs an error and leaves bytes local. There is no transfer backlog accounting, retry schedule beyond subsequent writes, object garbage collection, remote stream deletion, or remote backup of consumer state, indexes, and encryption keys. Do not enable this for production or for Nodus's current 64 MiB logical `MaxBytes` streams without resolving these gaps and separating logical retention from the local disk budget.
+
+Next design cycle: add remote-only metadata recovery, bounded cache with pinned reads and single-flight fetch, explicit disk-cap backpressure and upload retry, correct mutation/deletion semantics, observability, S3 credentials and runtime config, and full fault injection around crash points. Benchmark cold-read, restart, and local-write latency before relaxing the experimental gate.
+
+## Target design and validation gates
+
+The sections below preserve the design target. Where they differ from the runnable spike, the observed-results and remaining-gaps sections above describe current behavior.
+
+### Goal and decision
 
 Keep a file-backed JetStream stream as one logical sequence. Write new messages to the node's local file store. When a separately configured **local disk budget** is exceeded, copy the oldest eligible sealed message blocks to S3, verify and commit their remote references, then remove their local payload files. Native consumers and direct stream reads continue using the same stream and sequence numbers. A cold read fetches the block into a bounded local cache. The current write block and recently used blocks remain local.
 

@@ -1102,6 +1102,12 @@ func (a *Account) addStreamWithAssignmentAndMode(config *StreamConfig, fsConfig 
 			mset.autoTuneFileStorageBlockSize(fsCfg)
 		}
 	}
+	if cfg.Storage == FileStorage && fsCfg.S3Tier == nil {
+		fsCfg.S3Tier = s.getOpts().JetStreamS3Tiers[a.GetName()+"/"+cfg.Name]
+	}
+	if fsCfg.S3Tier != nil && fsCfg.S3Tier.BlockSize > 0 {
+		fsCfg.BlockSize = fsCfg.S3Tier.BlockSize
+	}
 	fsCfg.StoreDir = storeDir
 	// Grab configured sync interval.
 	fsCfg.SyncInterval = s.getOpts().SyncInterval
@@ -6354,6 +6360,11 @@ func (mset *stream) getDirectRequest(req *JSApiMsgGetRequest, reply string) {
 			sm, err = store.LoadLastMsg(req.LastFor, &svp)
 		}
 		if err != nil {
+			if errors.Is(err, errS3TierUnavailable) {
+				hdr := []byte("NATS/1.0 503 Storage Unavailable\r\n\r\n")
+				mset.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+				return
+			}
 			// For batches, if we stop early we want to do EOB logic below.
 			if batch > 1 && i > 0 {
 				break

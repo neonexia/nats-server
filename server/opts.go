@@ -610,6 +610,10 @@ type Options struct {
 
 	// configDigest represents the state of configuration.
 	configDigest string
+
+	// JetStreamS3Tiers is an experimental programmatic per-stream tier mapping.
+	// Keys use "account/stream"; credentials stay out of persisted stream config.
+	JetStreamS3Tiers map[string]*S3TierConfig `json:"-"`
 }
 
 // WebsocketOpts are options for websocket

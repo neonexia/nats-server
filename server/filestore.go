@@ -77,6 +77,8 @@ type FileStoreConfig struct {
 	Cipher StoreCipher
 	// Compression is the algorithm to use when compressing.
 	Compression StoreCompression
+	// S3Tier enables the experimental, append-only block tier for this store.
+	S3Tier *S3TierConfig
 
 	// Internal reference to our server.
 	srv *Server
@@ -224,6 +226,7 @@ type fileStore struct {
 	lpex        time.Time // Last PurgeEx call.
 	dios        *diskIOSemaphore
 	sources     map[string]*StreamSourceState
+	tier        *fileS3Tier
 }
 
 // Represents a message store block and its data.
@@ -416,6 +419,9 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 	if cfg.Storage != FileStorage {
 		return nil, fmt.Errorf("fileStore requires file storage type in config")
 	}
+	if err := validateS3Tier(fcfg, cfg); err != nil {
+		return nil, err
+	}
 	// Default values.
 	if fcfg.BlockSize == 0 {
 		fcfg.BlockSize = dynBlkSize(cfg.Retention, cfg.MaxBytes, prf != nil)
@@ -465,6 +471,9 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 		srv:        fcfg.srv,
 		recovering: recovering,
 	}
+	if fcfg.S3Tier != nil {
+		fs.tier = newFileS3Tier(fs, *fcfg.S3Tier)
+	}
 	fs.syncAlways.Store(fcfg.SyncAlways && !fcfg.SyncOnFlush)
 	fs.syncOnFlush.Store(fcfg.SyncOnFlush)
 
@@ -474,6 +483,9 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 	// If we error before completion make sure to cleanup.
 	defer func() {
 		if err != nil {
+			if fs != nil && fs.tier != nil {
+				fs.tier.stop()
+			}
 			ats.Unregister()
 		}
 	}()
@@ -489,6 +501,9 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 	}
 	if err := os.MkdirAll(odir, defaultDirPerms); err != nil {
 		return nil, fmt.Errorf("could not create consumer storage directory - %v", err)
+	}
+	if err := fs.prepareS3Tier(); err != nil {
+		return nil, err
 	}
 
 	// Create highway hash for message blocks. Use sha256 of directory as key.
@@ -739,6 +754,9 @@ func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 	}
 	if cfg.Storage != FileStorage {
 		return fmt.Errorf("fileStore requires file storage type in config")
+	}
+	if err := validateS3Tier(fs.fcfg, *cfg); err != nil {
+		return err
 	}
 	if cfg.MaxMsgsPer < -1 {
 		cfg.MaxMsgsPer = -1
@@ -5618,6 +5636,9 @@ func (fs *fileStore) StoreRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 		fs.resetAgeChk(0)
 	}
 	fs.mu.Unlock()
+	if err == nil && fs.tier != nil {
+		fs.tier.kick()
+	}
 
 	if err == nil && cb != nil {
 		cb(1, int64(fileStoreMsgSize(subj, hdr, msg)), seq, subj)
@@ -5639,6 +5660,9 @@ func (fs *fileStore) StoreMsg(subj string, hdr, msg []byte, ttl int64) (uint64, 
 	err := fs.storeRawMsg(subj, hdr, msg, seq, ts, ttl, true)
 	cb := fs.scb
 	fs.mu.Unlock()
+	if err == nil && fs.tier != nil {
+		fs.tier.kick()
+	}
 
 	if err != nil {
 		seq, ts = 0, 0
@@ -6241,6 +6265,9 @@ func (fs *fileStore) removePerSubject(subj string) uint64 {
 
 // Remove a message, optionally rewriting the mb file.
 func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (bool, error) {
+	if fs.tier != nil {
+		return false, errS3TierMutation
+	}
 	if seq == 0 {
 		return false, ErrStoreMsgNotFound
 	}
@@ -8990,6 +9017,14 @@ func (mb *msgBlock) openBlock() (*os.File, error) {
 	mb.fs.dios.acquire()
 	f, err := os.Open(mb.mfn)
 	mb.fs.dios.release()
+	if os.IsNotExist(err) && mb.fs.tier != nil {
+		if err = mb.fs.tier.ensureHydrated(mb.index); err != nil {
+			return nil, err
+		}
+		mb.fs.dios.acquire()
+		f, err = os.Open(mb.mfn)
+		mb.fs.dios.release()
+	}
 	return f, err
 }
 
@@ -9574,6 +9609,9 @@ func (fs *fileStore) SubjectForSeq(seq uint64) (string, error) {
 
 // LoadMsg will lookup the message by sequence number and return it if found.
 func (fs *fileStore) LoadMsg(seq uint64, sm *StoreMsg) (*StoreMsg, error) {
+	if err := fs.prefetchS3Block(seq, false); err != nil {
+		return nil, err
+	}
 	return fs.msgForSeq(seq, sm)
 }
 
@@ -9710,6 +9748,9 @@ func (fs *fileStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *
 	if filter, ok := sl.MatchesSingleFilter(); ok {
 		return fs.LoadNextMsg(filter, subjectHasWildcard(filter), start, smp)
 	}
+	if err := fs.prefetchS3Block(start, true); err != nil {
+		return nil, 0, err
+	}
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 
@@ -9787,6 +9828,9 @@ func (fs *fileStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *
 }
 
 func (fs *fileStore) LoadNextMsg(filter string, wc bool, start uint64, sm *StoreMsg) (*StoreMsg, uint64, error) {
+	if err := fs.prefetchS3Block(start, true); err != nil {
+		return nil, 0, err
+	}
 	if fs.isClosed() {
 		return nil, 0, ErrStoreClosed
 	}
@@ -10448,6 +10492,9 @@ func compareFn(subject string) func(string, string) bool {
 // PurgeEx will remove messages based on subject filters, sequence and number of messages to keep.
 // Will return the number of purged messages.
 func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint64, err error) {
+	if fs.tier != nil {
+		return 0, errS3TierMutation
+	}
 	// sequence == 1 means "purge up to but not including 1", a no-op.
 	if sequence == 1 {
 		return 0, nil
@@ -10720,6 +10767,9 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 // Purge will remove all messages from this store.
 // Will return the number of purged messages.
 func (fs *fileStore) Purge() (uint64, error) {
+	if fs.tier != nil {
+		return 0, errS3TierMutation
+	}
 	return fs.purge(0)
 }
 
@@ -10933,6 +10983,9 @@ func (fs *fileStore) recoverPartialPurge() error {
 // but not including the seq parameter.
 // Will return the number of purged messages.
 func (fs *fileStore) Compact(seq uint64) (uint64, error) {
+	if fs.tier != nil {
+		return 0, errS3TierMutation
+	}
 	return fs.compact(seq)
 }
 
@@ -11372,6 +11425,9 @@ func (mb *msgBlock) numPriorTombsLocked() int {
 
 // Truncate will truncate a stream store up to seq. Sequence needs to be valid.
 func (fs *fileStore) Truncate(seq uint64) (rerr error) {
+	if fs.tier != nil {
+		return errS3TierMutation
+	}
 	// Check for request to reset.
 	if seq == 0 {
 		return fs.reset()
@@ -12186,6 +12242,9 @@ func (fs *fileStore) closeAllMsgBlocks(sync bool) {
 }
 
 func (fs *fileStore) Delete(inline bool) error {
+	if fs.tier != nil {
+		return errS3TierMutation
+	}
 	if fs.isClosed() {
 		// Always attempt to remove since we could have been closed beforehand.
 		os.RemoveAll(fs.fcfg.StoreDir)
@@ -12806,6 +12865,9 @@ func (fs *fileStore) stop(delete, writeState bool) error {
 	// Mark as closing. Do before releasing the lock to wait on the state flush loop
 	// so we don't end up with this function running more than once.
 	fs.closing = true
+	if fs.tier != nil {
+		fs.tier.stop()
+	}
 
 	// Release the state flusher loop.
 	if fs.qch != nil {
@@ -13063,6 +13125,9 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, includeConsumers bool, err
 
 // Create a snapshot of this stream and its consumer's state along with messages.
 func (fs *fileStore) Snapshot(deadline time.Duration, checkMsgs, includeConsumers bool) (*SnapshotResult, error) {
+	if fs.tier != nil {
+		return nil, fmt.Errorf("experimental S3 tier snapshot is not supported")
+	}
 	if fs.isClosed() {
 		return nil, ErrStoreClosed
 	}
