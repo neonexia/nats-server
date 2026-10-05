@@ -12,6 +12,57 @@ Status: experimental fork implementation, 2026-10-04. The first runnable slice i
 - Native durable pull consumers and direct get use the existing JetStream storage methods. Cold reads hydrate a missing block. Direct get returns `503 Storage Unavailable` on remote fetch failure instead of `404`. The normal `nats.go` request helper maps a 503 status to its `ErrNoResponders` error; raw headers distinguish the storage failure.
 - The experiment rejects config changes that would enable retention expiry, automatic old-message discard, per-subject limits, rollups, multiple replicas, compression, sources/mirrors, and asynchronous persist. Explicit delete, erase, purge, compact, truncate, stream deletion, and snapshots are rejected for tiered stores. These restrictions protect immutable remote block assumptions; they are not a complete durability or lifecycle design.
 
+## Configuration target
+
+The current programmatic `Options.JetStreamS3Tiers` mapping is a prototype
+test seam, not the deployment configuration model. The server configuration
+file must own S3-tier profiles, physical defaults, and stream assignments. The
+parsed result may populate internal Go structs, but an operator must not need
+to construct `S3TierConfig` in code.
+
+The intended shape is a `jetstream.s3_tier` block with named object-store
+profiles, a `defaults` block, and explicit account/stream assignments. For
+example:
+
+```text
+jetstream {
+  s3_tier {
+    defaults {
+      block_size: 8MiB
+      local_high_bytes: 512MiB
+      local_low_bytes: 384MiB
+      remote_high_bytes: 128MiB
+      remote_low_bytes: 64MiB
+      timeout: 30s
+    }
+    profiles {
+      nodus_minio {
+        endpoint: "minio.internal:9000"
+        bucket: "nodus-history"
+        tls: false
+        credential_provider: "nodus-object-store"
+      }
+    }
+    streams: [
+      { account: "$G", stream: "WORKSPACE_A", profile: "nodus_minio", prefix: "workspaces/a" }
+    ]
+  }
+}
+```
+
+Each assignment has an explicit opaque prefix because it identifies one stream
+incarnation's remote namespace. Omitted physical values inherit from
+`defaults`; a stream assignment may override only the tier tuning values, not
+the credential provider. Endpoint, bucket, TLS, and the credential-provider
+reference belong to the named profile so several streams can share one
+object-store connection policy.
+
+The initial implementation should validate this configuration at server start
+and treat it as non-reloadable. Reload semantics need separate ownership,
+connection-draining, and stream-identity rules. Raw access keys, secret keys,
+and session tokens do not belong in a stream assignment or persisted stream
+metadata; the credential provider is resolved by the server process.
+
 ## Observed results
 
 - Focused Go tests cover block eviction, readback, remote-only file-store restart while the object store rejects reads, full server restart, 100-message native durable pull replay, exact single-block cold reads, coalesced concurrent cold reads, cache re-eviction, manifest commit failure, pressure-driven write rejection, and remote tail draining through the file store and NATS API. PUT, descriptor, and manifest failures leave the local block present. A blocked cold GET does not hold a local `StoreMsg` in the retry path. An injected GET failure leaves the consumer sequence at 1, and direct get returns the storage-specific 503 header.
