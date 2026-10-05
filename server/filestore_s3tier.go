@@ -17,6 +17,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -96,6 +97,106 @@ type s3BlockDescriptor struct {
 	Size     int    `json:"size"`
 	SHA256   string `json:"sha256"`
 	Key      string `json:"key"`
+}
+
+// S3TierHistoryBlock is the immutable S3 placement record an external history
+// reader needs to select a block. It deliberately contains no message bodies.
+type S3TierHistoryBlock struct {
+	Channel  string
+	Index    uint32
+	FirstSeq uint64
+	LastSeq  uint64
+	Key      string
+	Size     int
+	SHA256   string
+}
+
+// S3TierWorkspaceCatalog is a read-only, in-memory view of every committed
+// block descriptor below one workspace prefix. S3 has no actual directories;
+// channel IDs are the first path element below WorkspacePrefix.
+type S3TierWorkspaceCatalog struct {
+	workspacePrefix string
+	channels        map[string][]S3TierHistoryBlock
+}
+
+// LoadS3TierWorkspaceCatalog lists immutable descriptors below workspacePrefix
+// and never reads a message block. A history service can rebuild this cache
+// after process loss without a separate database.
+func LoadS3TierWorkspaceCatalog(ctx context.Context, store S3TierObjectStore, workspacePrefix string) (*S3TierWorkspaceCatalog, error) {
+	if store == nil {
+		return nil, errors.New("S3 tier object store is required")
+	}
+	workspacePrefix = strings.Trim(workspacePrefix, "/")
+	if workspacePrefix == "" {
+		return nil, errors.New("workspace prefix is required")
+	}
+	prefix := workspacePrefix + "/"
+	keys, err := store.List(ctx, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("list workspace S3 tier descriptors: %w", err)
+	}
+	catalog := &S3TierWorkspaceCatalog{workspacePrefix: workspacePrefix, channels: make(map[string][]S3TierHistoryBlock)}
+	seen := make(map[string]struct{})
+	for _, key := range keys {
+		relative := strings.TrimPrefix(key, prefix)
+		parts := strings.Split(relative, "/")
+		if len(parts) != 3 || parts[0] == "" || parts[1] != "descriptors" || !strings.HasSuffix(parts[2], ".json") {
+			continue
+		}
+		buf, err := store.Get(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("read workspace S3 tier descriptor %q: %w", key, err)
+		}
+		var descriptor s3BlockDescriptor
+		if err := json.Unmarshal(buf, &descriptor); err != nil || descriptor.Version != 1 || descriptor.Index == 0 || descriptor.Key == "" || descriptor.FirstSeq == 0 || descriptor.LastSeq < descriptor.FirstSeq {
+			return nil, fmt.Errorf("invalid workspace S3 tier descriptor %q: %v", key, err)
+		}
+		identity := fmt.Sprintf("%s/%d", parts[0], descriptor.Index)
+		if _, ok := seen[identity]; ok {
+			return nil, fmt.Errorf("duplicate workspace S3 tier descriptor for %s", identity)
+		}
+		seen[identity] = struct{}{}
+		catalog.channels[parts[0]] = append(catalog.channels[parts[0]], S3TierHistoryBlock{
+			Channel: parts[0], Index: descriptor.Index, FirstSeq: descriptor.FirstSeq, LastSeq: descriptor.LastSeq,
+			Key: descriptor.Key, Size: descriptor.Size, SHA256: descriptor.SHA256,
+		})
+	}
+	for channel, blocks := range catalog.channels {
+		sort.Slice(blocks, func(i, j int) bool { return blocks[i].FirstSeq < blocks[j].FirstSeq })
+		catalog.channels[channel] = blocks
+	}
+	return catalog, nil
+}
+
+// Channels returns all known channel IDs in lexical order.
+func (c *S3TierWorkspaceCatalog) Channels() []string {
+	if c == nil {
+		return nil
+	}
+	channels := make([]string, 0, len(c.channels))
+	for channel := range c.channels {
+		channels = append(channels, channel)
+	}
+	sort.Strings(channels)
+	return channels
+}
+
+// BlocksForSequenceRange returns just the block objects overlapping the
+// inclusive sequence range. A zero last sequence means through the channel tail.
+func (c *S3TierWorkspaceCatalog) BlocksForSequenceRange(channel string, firstSeq, lastSeq uint64) []S3TierHistoryBlock {
+	if c == nil || firstSeq == 0 || (lastSeq != 0 && lastSeq < firstSeq) {
+		return nil
+	}
+	blocks := c.channels[channel]
+	start := sort.Search(len(blocks), func(i int) bool { return blocks[i].LastSeq >= firstSeq })
+	var matches []S3TierHistoryBlock
+	for _, block := range blocks[start:] {
+		if lastSeq != 0 && block.FirstSeq > lastSeq {
+			break
+		}
+		matches = append(matches, block)
+	}
+	return matches
 }
 
 type fileS3Tier struct {

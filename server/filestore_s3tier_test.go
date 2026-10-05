@@ -8,6 +8,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -27,6 +28,44 @@ type testS3BlockStore struct {
 	failPut        bool
 	failDescriptor bool
 	failGet        bool
+}
+
+type countingS3BlockStore struct {
+	store S3TierObjectStore
+	mu    sync.Mutex
+	gets  []string
+	lists int
+}
+
+func (s *countingS3BlockStore) Put(ctx context.Context, key string, buf []byte) error {
+	return s.store.Put(ctx, key, buf)
+}
+
+func (s *countingS3BlockStore) Get(ctx context.Context, key string) ([]byte, error) {
+	s.mu.Lock()
+	s.gets = append(s.gets, key)
+	s.mu.Unlock()
+	return s.store.Get(ctx, key)
+}
+
+func (s *countingS3BlockStore) List(ctx context.Context, prefix string) ([]string, error) {
+	s.mu.Lock()
+	s.lists++
+	s.mu.Unlock()
+	return s.store.List(ctx, prefix)
+}
+
+func (s *countingS3BlockStore) counts() (lists, descriptorGets, blockGets int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, key := range s.gets {
+		if strings.Contains(key, "/descriptors/") {
+			descriptorGets++
+		} else if strings.Contains(key, "/blocks/") {
+			blockGets++
+		}
+	}
+	return s.lists, descriptorGets, blockGets
 }
 
 type blockingS3BlockStore struct {
@@ -143,6 +182,67 @@ func TestFileStoreS3TierReplayAndRestart(t *testing.T) {
 		if err != nil || msg.seq != seq {
 			t.Fatalf("restart load %d: msg=%v err=%v", seq, msg, err)
 		}
+	}
+}
+
+func TestS3TierWorkspaceCatalogBootstrapsIndexesWithoutMessageBlocks(t *testing.T) {
+	const (
+		channels          = 100
+		blocksPerChannel  = 10
+		sequencesPerBlock = 1000
+	)
+	workspacePrefix := "nodus/org-01/workspace-01"
+	base := &testS3BlockStore{objects: make(map[string][]byte)}
+	store := &countingS3BlockStore{store: base}
+	var descriptorBytes int
+	for channelNumber := 0; channelNumber < channels; channelNumber++ {
+		channel := fmt.Sprintf("channel-%03d", channelNumber)
+		for blockNumber := 1; blockNumber <= blocksPerChannel; blockNumber++ {
+			first := uint64((blockNumber-1)*sequencesPerBlock + 1)
+			last := uint64(blockNumber * sequencesPerBlock)
+			objectKey := fmt.Sprintf("%s/%s/blocks/%010d-%064d.blk", workspacePrefix, channel, blockNumber, blockNumber)
+			descriptor := s3BlockDescriptor{Version: 1, Index: uint32(blockNumber), FirstSeq: first, LastSeq: last, Size: 1024 * 1024, SHA256: fmt.Sprintf("%064d", blockNumber), Key: objectKey}
+			buf, err := json.Marshal(descriptor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			descriptorBytes += len(buf)
+			descriptorKey := fmt.Sprintf("%s/%s/descriptors/%010d.json", workspacePrefix, channel, blockNumber)
+			if err := base.Put(context.Background(), descriptorKey, buf); err != nil {
+				t.Fatal(err)
+			}
+			// The catalog list sees payload objects too, but must never GET one while bootstrapping indexes.
+			if err := base.Put(context.Background(), objectKey, []byte("payload")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	catalog, err := LoadS3TierWorkspaceCatalog(context.Background(), store, workspacePrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(catalog.Channels()); got != channels {
+		t.Fatalf("channels=%d, want %d", got, channels)
+	}
+	if descriptorBytes >= 1<<20 {
+		t.Fatalf("descriptor index is unexpectedly large: %d bytes", descriptorBytes)
+	}
+	lists, descriptorGets, blockGets := store.counts()
+	if lists != 1 || descriptorGets != channels*blocksPerChannel || blockGets != 0 {
+		t.Fatalf("catalog I/O lists=%d descriptor GETs=%d block GETs=%d", lists, descriptorGets, blockGets)
+	}
+	blocks := catalog.BlocksForSequenceRange("channel-042", 1501, 4050)
+	if len(blocks) != 4 {
+		t.Fatalf("range blocks=%d, want 4", len(blocks))
+	}
+	for index, block := range blocks {
+		want := uint32(index + 2)
+		if block.Index != want {
+			t.Fatalf("block[%d].Index=%d, want %d", index, block.Index, want)
+		}
+	}
+	if blocks := catalog.BlocksForSequenceRange("channel-042", 9001, 0); len(blocks) != 1 || blocks[0].Index != 10 {
+		t.Fatalf("tail lookup returned %#v", blocks)
 	}
 }
 
