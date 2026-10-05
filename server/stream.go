@@ -1103,7 +1103,12 @@ func (a *Account) addStreamWithAssignmentAndMode(config *StreamConfig, fsConfig 
 		}
 	}
 	if cfg.Storage == FileStorage && fsCfg.S3Tier == nil {
-		fsCfg.S3Tier = s.getOpts().JetStreamS3Tiers[a.GetName()+"/"+cfg.Name]
+		opts := s.getOpts()
+		if opts.jetStreamS3Tier != nil {
+			fsCfg.S3Tier = opts.jetStreamS3Tier.streamConfig(a.GetName(), cfg.Name)
+		} else {
+			fsCfg.S3Tier = opts.JetStreamS3Tiers[a.GetName()+"/"+cfg.Name]
+		}
 	}
 	if fsCfg.S3Tier != nil && fsCfg.S3Tier.BlockSize > 0 {
 		fsCfg.BlockSize = fsCfg.S3Tier.BlockSize

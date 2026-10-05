@@ -4,7 +4,7 @@ Status: experimental fork implementation, 2026-10-04. The first runnable slice i
 
 ## What the spike actually implements
 
-- `FileStoreConfig.S3Tier` enables an append-only block tier. `Options.JetStreamS3Tiers` maps `account/stream` to a tier config when the normal server path creates or recovers a stream. The option is programmatic only; the NATS config parser has no S3 stanza. Credentials are supplied by the caller rather than persisted in stream metadata.
+- `FileStoreConfig.S3Tier` enables an append-only block tier. A server-wide `jetstream.s3_tier` block supplies one Nodus instance's endpoint, bucket, region, TLS, opaque prefix, physical watermarks, retry bounds, and environment-reference credentials. NATS derives safe per-stream paths beneath the opaque prefix. `Options.JetStreamS3Tiers` remains only as a programmatic test seam. Credentials are not persisted in stream metadata.
 - The S3 adapter uses `minio-go/v7` against an S3-compatible endpoint. Object keys contain a caller-supplied unique stream prefix, block index, and SHA-256 digest. `RemoteHighBytes` and `RemoteLowBytes` control when sealed blocks gain S3 coverage. `LocalHighBytes` and `LocalLowBytes` separately control when covered local payloads are reclaimed. The active block stays local.
 - Each eviction uploads block bytes, reads them back and compares bytes, uploads a JSON descriptor, reads it back and compares bytes, writes and verifies an immutable manifest generation, syncs local descriptor and manifest sidecars, then unlinks the local `.blk` under file-store and block locks. The S3 prefix is opaque to NATS; Nodus supplies its stream identity and a separate history service can later interpret its own namespace.
 - Restart uses local descriptor sidecars to retain remote-only block metadata without listing or reading S3. A cold reader selects one missing block, releases the normal file-store and block locks, coalesces a fetch for that block, verifies it, and retries the native read. Missing tier configuration still fails startup. Corrupt or unavailable remote data fails the read rather than being treated as missing history.
@@ -12,30 +12,35 @@ Status: experimental fork implementation, 2026-10-04. The first runnable slice i
 - Native durable pull consumers and direct get use the existing JetStream storage methods. Cold reads hydrate a missing block. Direct get returns `503 Storage Unavailable` on remote fetch failure instead of `404`. The normal `nats.go` request helper maps a 503 status to its `ErrNoResponders` error; raw headers distinguish the storage failure.
 - The experiment rejects config changes that would enable retention expiry, automatic old-message discard, per-subject limits, rollups, multiple replicas, compression, sources/mirrors, and asynchronous persist. Explicit delete, erase, purge, compact, truncate, stream deletion, and snapshots are rejected for tiered stores. These restrictions protect immutable remote block assumptions; they are not a complete durability or lifecycle design.
 
-## Configuration target
+## Configuration
 
-The current programmatic `Options.JetStreamS3Tiers` mapping is a prototype
-test seam, not the deployment configuration model. Nodus runs one NATS server
-per workspace, so the server configuration file must own one server-wide tier
-policy and physical defaults. The parsed result may populate internal Go
-structs, but an operator must not need to construct `S3TierConfig` in code.
+Nodus runs one NATS server per workspace, so the server configuration file owns
+one server-wide tier policy and physical defaults. The parsed result populates
+internal Go structs, but an operator does not construct `S3TierConfig` in code.
 
-The intended shape is one `jetstream.s3_tier` block. For example:
+The implemented shape is one `jetstream.s3_tier` block. For example:
 
 ```text
 jetstream {
   s3_tier {
     endpoint: "minio.internal:9000"
     bucket: "nodus-history"
+    region: "us-east-1"
     tls: false
-    credential_provider: "nodus-object-store"
+    credentials {
+      provider: "env"
+      access_key_env: "NODUS_S3_ACCESS_KEY"
+      secret_key_env: "NODUS_S3_SECRET_KEY"
+    }
     prefix: "instances/2dc4d8d6"
-    block_size: 8MiB
-    local_high_bytes: 512MiB
-    local_low_bytes: 384MiB
-    remote_high_bytes: 128MiB
-    remote_low_bytes: 64MiB
+    block_size: 8M
+    local_high_bytes: 512M
+    local_low_bytes: 384M
+    remote_high_bytes: 128M
+    remote_low_bytes: 64M
     timeout: 30s
+    retry_min: 1s
+    retry_max: 30s
   }
 }
 ```
@@ -48,25 +53,25 @@ stream incarnation. Defaults apply to every eligible file stream in the
 instance, and a stream that violates the restricted append-only invariants is
 rejected rather than silently receiving different retention behavior.
 
-The initial implementation should validate this configuration at server start
-and treat it as non-reloadable. Reload semantics need separate ownership,
-connection-draining, and stream-identity rules. Raw access keys, secret keys,
-and session tokens do not belong in configuration or persisted stream metadata;
-the credential provider is resolved by the server process.
+The configuration is validated at server start and is non-reloadable. Reload
+semantics need separate ownership, connection-draining, and stream-identity
+rules. The current provider is `env`, which resolves named environment
+variables at startup. Raw access keys, secret keys, and session tokens do not
+belong in the file or persisted stream metadata.
 
 ## Observed results
 
-- Focused Go tests cover block eviction, readback, remote-only file-store restart while the object store rejects reads, full server restart, 100-message native durable pull replay, exact single-block cold reads, coalesced concurrent cold reads, cache re-eviction, manifest commit failure, pressure-driven write rejection, and remote tail draining through the file store and NATS API. PUT, descriptor, and manifest failures leave the local block present. A blocked cold GET does not hold a local `StoreMsg` in the retry path. An injected GET failure leaves the consumer sequence at 1, and direct get returns the storage-specific 503 header.
-- The S3 adapter passed the same eviction, cold-read, and restart test against a local Moto S3 endpoint. The installed MinIO binary reported that S3 operations were disabled without a license; an older container image was unavailable in this environment. A MinIO or AWS endpoint and network-partition tests remain unverified.
+- Focused Go tests cover block eviction, readback, remote-only file-store restart while the object store rejects reads, full server restart, 100-message native durable pull replay, exact single-block cold reads, coalesced concurrent cold reads, cache re-eviction, manifest commit failure, pressure-driven write rejection, remote tail draining through the file store and NATS API, `server.conf` parsing/defaults, and bounded upload retry after injected outages and request timeouts. PUT, descriptor, and manifest failures leave the local block present. A blocked cold GET does not hold a local `StoreMsg` in the retry path. An injected GET failure leaves the consumer sequence at 1, and direct get returns the storage-specific 503 header.
+- The S3 adapter passed the same eviction, cold-read, and restart test against a local Moto S3 endpoint. A local MinIO AIStor server reached its health endpoint but denied `MakeBucket` and S3 operations without a license. Docker pulls from the historical MinIO registries were unavailable in this environment. A licensed MinIO or AWS endpoint and network-partition tests remain unverified.
 - `go test -race` passed the focused tier tests. These are correctness spikes, not latency or throughput benchmarks.
 
 ## Revised assessment and remaining gaps
 
 The block, descriptor, and manifest protocol is feasible for a narrow append-only stream. Native consumer sequence continuity survives eviction and remote-only restart in the tested setup. Restart does not contact S3; it keeps the existing full-state sequence and subject metadata and marks descriptor-backed missing payloads as readable remotely.
 
-Remote coverage and local residency use separate watermark pairs. A node can therefore copy sealed blocks to S3 continuously while retaining a much larger SSD-backed local window for live channels. Local reclamation prefers hydrated or otherwise covered blocks by least-recent block access; a read reaches S3 only after that local payload was reclaimed. At the next publish after an unsuccessful asynchronous eviction, the server attempts synchronously to reach the local budget and returns a transient local-capacity error if it cannot. `/jsz` stream detail exposes local and remote bytes, remote block count, transfer and cache counters, capacity errors, and both watermark pairs.
+Remote coverage and local residency use separate watermark pairs. A node can therefore copy sealed blocks to S3 continuously while retaining a much larger SSD-backed local window for live channels. Local reclamation prefers hydrated or otherwise covered blocks by least-recent block access; a read reaches S3 only after that local payload was reclaimed. Failed coverage retries with exponential backoff bounded by `retry_min` and `retry_max`. At the next publish after an unsuccessful asynchronous eviction, the server attempts synchronously to reach the local budget and returns a transient local-capacity error if it cannot. `/jsz` stream detail exposes local and remote bytes, remote block count, sealed uncovered-block backlog, retry attempts, transfer and cache counters, capacity errors, and both watermark pairs.
 
-The remaining gaps are runtime configuration and credential sources, upload retry scheduling and backlog limits, object garbage collection, remote stream deletion, replica support, encryption recovery, durable consumer and stream metadata backup, full fault injection at every crash point, and benchmarks. Read-path coverage is focused on direct gets and pull consumers; broad upstream coverage is still required. Do not enable this for production or for Nodus's current 64 MiB logical `MaxBytes` streams without those gates and a separate logical-retention decision.
+The remaining gaps are additional credential providers, bounded upload backlog policy, object garbage collection, remote stream deletion, replica support, encryption recovery, durable consumer and stream metadata backup, full fault injection at every crash point, and benchmarks. Read-path coverage is focused on direct gets and pull consumers; broad upstream coverage is still required. Do not enable this for production or for Nodus's current 64 MiB logical `MaxBytes` streams without those gates and a separate logical-retention decision.
 
 History serving remains outside this fork. A future service may consume the immutable per-stream descriptor and manifest objects, apply Nodus authorization and workspace semantics, and offer range reads without giving clients unrestricted bucket access.
 

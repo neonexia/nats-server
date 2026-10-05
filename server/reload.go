@@ -1619,6 +1619,9 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 		jsStoreDirChanged   bool
 		jsLimitsUpdate      *jetStreamLimitsOption
 	)
+	if !oldOpts.jetStreamS3Tier.equal(newOpts.jetStreamS3Tier) {
+		return nil, fmt.Errorf("config reload not supported for JetStream S3 tier")
+	}
 	for i := 0; i < oldConfig.NumField(); i++ {
 		field := oldConfig.Type().Field(i)
 		// field.PkgPath is empty for exported fields, and is not for unexported ones.

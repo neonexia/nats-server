@@ -611,8 +611,12 @@ type Options struct {
 	// configDigest represents the state of configuration.
 	configDigest string
 
-	// JetStreamS3Tiers is an experimental programmatic per-stream tier mapping.
-	// Keys use "account/stream"; credentials stay out of persisted stream config.
+	// jetStreamS3Tier is the experimental server-wide object tier parsed from
+	// the JetStream configuration block. Credentials stay out of stream config.
+	jetStreamS3Tier *S3TierServerConfig
+
+	// JetStreamS3Tiers is retained as a programmatic test seam. Keys use
+	// "account/stream" and are superseded by JetStreamS3Tier when configured.
 	JetStreamS3Tiers map[string]*S3TierConfig `json:"-"`
 }
 
@@ -2760,6 +2764,10 @@ func parseJetStream(v any, opts *Options, errors *[]error, warnings *[]error) er
 				if err := parseJetStreamTPM(tk, opts, errors); err != nil {
 					return err
 				}
+			case "s3_tier":
+				if err := parseJetStreamS3Tier(tk, mv, opts, errors, warnings); err != nil {
+					return err
+				}
 			case "unique_tag":
 				opts.JetStreamUniqueTag = strings.ToLower(strings.TrimSpace(mv.(string)))
 			case "max_outstanding_catchup":
@@ -2833,6 +2841,111 @@ func parseJetStream(v any, opts *Options, errors *[]error, warnings *[]error) er
 		return &configErr{tk, fmt.Sprintf("Expected map, bool or string to define JetStream, got %T", v)}
 	}
 
+	return nil
+}
+
+func parseJetStreamS3Tier(tk token, v any, opts *Options, errors *[]error, warnings *[]error) error {
+	var lt token
+	_, v = unwrapValue(v, &lt)
+	config, ok := v.(map[string]any)
+	if !ok {
+		return &configErr{tk, fmt.Sprintf("Expected map to define a JetStream S3 tier, got %T", v)}
+	}
+	tier := newS3TierServerConfig()
+	for key, value := range config {
+		fieldToken, value := unwrapValue(value, &lt)
+		switch strings.ToLower(key) {
+		case "endpoint":
+			tier.Endpoint = value.(string)
+		case "bucket":
+			tier.Bucket = value.(string)
+		case "region":
+			tier.Region = value.(string)
+		case "tls":
+			tier.TLS = value.(bool)
+		case "prefix":
+			tier.Prefix = value.(string)
+		case "block_size":
+			size, err := getStorageSize(value)
+			if err != nil || size <= 0 {
+				return &configErr{fieldToken, fmt.Sprintf("block_size must be a positive storage size: %v", err)}
+			}
+			tier.BlockSize = uint64(size)
+		case "local_high_bytes", "local_low_bytes", "remote_high_bytes", "remote_low_bytes":
+			size, err := getStorageSize(value)
+			if err != nil || size <= 0 {
+				return &configErr{fieldToken, fmt.Sprintf("%s must be a positive storage size: %v", key, err)}
+			}
+			switch strings.ToLower(key) {
+			case "local_high_bytes":
+				tier.LocalHighBytes = uint64(size)
+			case "local_low_bytes":
+				tier.LocalLowBytes = uint64(size)
+			case "remote_high_bytes":
+				tier.RemoteHighBytes = uint64(size)
+			case "remote_low_bytes":
+				tier.RemoteLowBytes = uint64(size)
+			}
+		case "timeout", "retry_min", "retry_max":
+			duration := parseDuration(key, fieldToken, value, errors, warnings)
+			if duration <= 0 {
+				continue
+			}
+			switch strings.ToLower(key) {
+			case "timeout":
+				tier.Timeout = duration
+			case "retry_min":
+				tier.RetryMin = duration
+			case "retry_max":
+				tier.RetryMax = duration
+			}
+		case "credentials":
+			if err := parseJetStreamS3TierCredentials(fieldToken, value, tier); err != nil {
+				return err
+			}
+		default:
+			if !fieldToken.IsUsedVariable() {
+				*errors = append(*errors, &unknownConfigFieldErr{field: key, configErr: configErr{token: fieldToken}})
+			}
+		}
+	}
+	if tier.RetryMax < tier.RetryMin {
+		return &configErr{tk, "s3_tier retry_max must be greater than or equal to retry_min"}
+	}
+	if tier.LocalHighBytes <= tier.LocalLowBytes || tier.RemoteHighBytes <= tier.RemoteLowBytes {
+		return &configErr{tk, "s3_tier high watermarks must be greater than low watermarks"}
+	}
+	if err := tier.resolveStore(); err != nil {
+		return &configErr{tk, err.Error()}
+	}
+	opts.jetStreamS3Tier = tier
+	return nil
+}
+
+func parseJetStreamS3TierCredentials(tk token, v any, tier *S3TierServerConfig) error {
+	var lt token
+	_, v = unwrapValue(v, &lt)
+	config, ok := v.(map[string]any)
+	if !ok {
+		return &configErr{tk, fmt.Sprintf("Expected map to define S3 tier credentials, got %T", v)}
+	}
+	for key, value := range config {
+		fieldToken, value := unwrapValue(value, &lt)
+		switch strings.ToLower(key) {
+		case "provider":
+			tier.CredentialProvider = strings.ToLower(value.(string))
+		case "access_key_env":
+			tier.AccessKeyEnv = value.(string)
+		case "secret_key_env":
+			tier.SecretKeyEnv = value.(string)
+		case "session_token_env":
+			tier.SessionTokenEnv = value.(string)
+		default:
+			if !fieldToken.IsUsedVariable() {
+				return &unknownConfigFieldErr{field: key, configErr: configErr{token: fieldToken}}
+			}
+		}
+	}
 	return nil
 }
 

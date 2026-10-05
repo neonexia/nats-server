@@ -30,6 +30,7 @@ type testS3BlockStore struct {
 	failManifest   bool
 	failCheckpoint bool
 	failGet        bool
+	blockPut       bool
 }
 
 type countingS3BlockStore struct {
@@ -131,6 +132,20 @@ func (s *testS3BlockStore) Put(_ context.Context, key string, buf []byte) error 
 
 func (s *testS3BlockStore) PutIfAbsent(ctx context.Context, key string, buf []byte) (bool, error) {
 	s.mu.Lock()
+	if _, ok := s.objects[key]; ok {
+		s.mu.Unlock()
+		return false, nil
+	}
+	blockPut := s.blockPut
+	s.mu.Unlock()
+	if blockPut {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.objects[key]; ok {
 		return false, nil
@@ -182,6 +197,111 @@ func testTieredFileStore(t *testing.T, store S3TierObjectStore, dir, prefix stri
 		t.Fatal(err)
 	}
 	return fs, fcfg, cfg
+}
+
+func TestJetStreamS3TierServerConfig(t *testing.T) {
+	t.Setenv("NATS_S3_TIER_ACCESS", "minio-access")
+	t.Setenv("NATS_S3_TIER_SECRET", "minio-secret")
+	config := createConfFile(t, []byte(fmt.Sprintf(`
+port: -1
+jetstream {
+  store_dir: %q
+  s3_tier {
+    endpoint: "minio.internal:9000"
+    bucket: "nodus-history"
+    region: "us-east-1"
+    tls: false
+    prefix: "instances/test-instance"
+    block_size: 1M
+    local_high_bytes: 8M
+    local_low_bytes: 4M
+    remote_high_bytes: 2M
+    remote_low_bytes: 1M
+    timeout: "2s"
+    retry_min: "10ms"
+    retry_max: "100ms"
+    credentials {
+      provider: "env"
+      access_key_env: "NATS_S3_TIER_ACCESS"
+      secret_key_env: "NATS_S3_TIER_SECRET"
+    }
+  }
+}
+`, t.TempDir())))
+	opts, err := ProcessConfigFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tier := opts.jetStreamS3Tier
+	if tier == nil || tier.Endpoint != "minio.internal:9000" || tier.Bucket != "nodus-history" || tier.store == nil {
+		t.Fatalf("tier config = %#v", tier)
+	}
+	if tier.BlockSize != 1_000_000 || tier.LocalHighBytes != 8_000_000 || tier.RemoteLowBytes != 1_000_000 || tier.Timeout != 2*time.Second || tier.RetryMax != 100*time.Millisecond {
+		t.Fatalf("unexpected tier settings: %#v", tier)
+	}
+	streamTier := tier.streamConfig("$G", "TEST")
+	if streamTier == nil || streamTier.Prefix != "instances/test-instance/streams/JEc/VEVTVA" || streamTier.Store != tier.store {
+		t.Fatalf("derived stream tier = %#v", streamTier)
+	}
+	s := RunServer(opts)
+	defer s.Shutdown()
+	stream := &StreamConfig{Name: "TEST", Subjects: []string{"events"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	mset, err := s.GlobalAccount().addStream(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := mset.store.(*fileStore)
+	if fs.tier == nil || fs.tier.cfg.Prefix != streamTier.Prefix || fs.tier.cfg.BlockSize != streamTier.BlockSize {
+		t.Fatalf("stream did not inherit server tier configuration: %#v", fs.tier)
+	}
+	changed := *opts
+	changedTier := *tier
+	changedTier.Prefix = "instances/reloaded"
+	changed.jetStreamS3Tier = &changedTier
+	if _, err := s.diffOptions(&changed); err == nil {
+		t.Fatal("expected S3 tier configuration reload to be rejected")
+	}
+}
+
+func TestJetStreamS3TierServerConfigDefaultsAndCredentialValidation(t *testing.T) {
+	t.Setenv("NATS_S3_TIER_DEFAULT_ACCESS", "minio-access")
+	t.Setenv("NATS_S3_TIER_DEFAULT_SECRET", "minio-secret")
+	config := createConfFile(t, []byte(`
+jetstream {
+  s3_tier {
+    endpoint: "minio.internal:9000"
+    bucket: "nodus-history"
+    prefix: "instances/defaults"
+    credentials {
+      provider: "environment"
+      access_key_env: "NATS_S3_TIER_DEFAULT_ACCESS"
+      secret_key_env: "NATS_S3_TIER_DEFAULT_SECRET"
+    }
+  }
+}
+`))
+	opts, err := ProcessConfigFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tier := opts.jetStreamS3Tier
+	if tier == nil || tier.BlockSize != defaultS3TierBlockSize || tier.LocalHighBytes != defaultS3TierLocalHigh || tier.RemoteLowBytes != defaultS3TierRemoteLow || tier.Timeout != defaultS3TierTimeout || tier.RetryMax != defaultS3TierRetryMax {
+		t.Fatalf("tier defaults = %#v", tier)
+	}
+	badConfig := createConfFile(t, []byte(`
+jetstream {
+  s3_tier {
+    endpoint: "minio.internal:9000"
+    bucket: "nodus-history"
+    prefix: "instances/bad-credentials"
+    credentials { provider: "env", access_key_env: "MISSING_ACCESS", secret_key_env: "MISSING_SECRET" }
+  }
+}
+`))
+	if _, err := ProcessConfigFile(badConfig); err == nil {
+		t.Fatal("expected missing credential environment variables to reject configuration")
+	}
 }
 
 func TestFileStoreS3TierReplayAndRestart(t *testing.T) {
@@ -691,6 +811,82 @@ func TestFileStoreS3TierStatsTrackPhysicalTierActivity(t *testing.T) {
 	if after.Fetches != before.Fetches+1 || after.LocalBytes <= before.LocalBytes {
 		t.Fatalf("stats after cold read: before=%#v after=%#v", before, after)
 	}
+}
+
+func TestFileStoreS3TierRetriesUploadAndReportsBacklog(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte), failPut: true}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/retry")
+	defer fs.Stop()
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
+	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1, 0
+	fs.tier.cfg.RetryMin, fs.tier.cfg.RetryMax = 5*time.Millisecond, 20*time.Millisecond
+	for i := 0; i < 40; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs.tier.kick()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		stats := fs.S3TierStats()
+		if stats.RetryAttempts > 0 && stats.BacklogBlocks > 0 && stats.BacklogBytes > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stats := fs.S3TierStats()
+	if stats.RetryAttempts == 0 || stats.BacklogBlocks == 0 || stats.BacklogBytes == 0 {
+		t.Fatalf("retry/backlog metrics = %+v", stats)
+	}
+	store.mu.Lock()
+	store.failPut = false
+	store.mu.Unlock()
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		stats = fs.S3TierStats()
+		if stats.BacklogBlocks == 0 && stats.RemoteBlocks > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("remote coverage did not recover after outage: %+v", fs.S3TierStats())
+}
+
+func TestFileStoreS3TierUploadTimeoutRetriesAndRecovers(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte), blockPut: true}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/upload-timeout")
+	defer fs.Stop()
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
+	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1, 0
+	fs.tier.cfg.Timeout = 10 * time.Millisecond
+	fs.tier.cfg.RetryMin, fs.tier.cfg.RetryMax = 5*time.Millisecond, 20*time.Millisecond
+	for i := 0; i < 40; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs.tier.kick()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if stats := fs.S3TierStats(); stats.RetryAttempts > 0 && stats.UploadErrors > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if stats := fs.S3TierStats(); stats.RetryAttempts == 0 || stats.UploadErrors == 0 {
+		t.Fatalf("timeout did not schedule retry: %+v", stats)
+	}
+	store.mu.Lock()
+	store.blockPut = false
+	store.mu.Unlock()
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if stats := fs.S3TierStats(); stats.BacklogBlocks == 0 && stats.RemoteBlocks > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("remote coverage did not recover after timeout: %+v", fs.S3TierStats())
 }
 
 func TestFileStoreS3TierCorruptionAndMissingConfigFailClosed(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -42,6 +43,46 @@ type S3TierConfig struct {
 	RemoteHighBytes uint64
 	RemoteLowBytes  uint64
 	Timeout         time.Duration
+	RetryMin        time.Duration
+	RetryMax        time.Duration
+}
+
+const (
+	defaultS3TierBlockSize  = 8_000_000
+	defaultS3TierLocalHigh  = 512_000_000
+	defaultS3TierLocalLow   = 384_000_000
+	defaultS3TierRemoteHigh = 128_000_000
+	defaultS3TierRemoteLow  = 64_000_000
+	defaultS3TierTimeout    = 30 * time.Second
+	defaultS3TierRetryMin   = time.Second
+	defaultS3TierRetryMax   = 30 * time.Second
+)
+
+// S3TierServerConfig is parsed from the server's JetStream configuration.
+// Nodus supplies one opaque Prefix per NATS server instance; stream paths are
+// derived from normal NATS identities and never contain workspace semantics.
+type S3TierServerConfig struct {
+	Endpoint string
+	Bucket   string
+	Region   string
+	TLS      bool
+	Prefix   string
+
+	CredentialProvider string
+	AccessKeyEnv       string
+	SecretKeyEnv       string
+	SessionTokenEnv    string
+
+	BlockSize       uint64
+	LocalHighBytes  uint64
+	LocalLowBytes   uint64
+	RemoteHighBytes uint64
+	RemoteLowBytes  uint64
+	Timeout         time.Duration
+	RetryMin        time.Duration
+	RetryMax        time.Duration
+
+	store S3TierObjectStore
 }
 
 // S3TierStats reports physical tier activity separately from the stream's
@@ -62,6 +103,9 @@ type S3TierStats struct {
 	RemoteHigh     uint64 `json:"remote_high_watermark"`
 	RemoteLow      uint64 `json:"remote_low_watermark"`
 	CheckpointSeq  uint64 `json:"checkpoint_sequence"`
+	BacklogBytes   uint64 `json:"backlog_bytes"`
+	BacklogBlocks  uint64 `json:"backlog_blocks"`
+	RetryAttempts  uint64 `json:"retry_attempts"`
 }
 
 // S3TierObjectStore makes the block protocol testable with fault injection.
@@ -74,6 +118,73 @@ type S3TierObjectStore interface {
 	List(context.Context, string) ([]string, error)
 }
 
+func newS3TierServerConfig() *S3TierServerConfig {
+	return &S3TierServerConfig{
+		BlockSize:       defaultS3TierBlockSize,
+		LocalHighBytes:  defaultS3TierLocalHigh,
+		LocalLowBytes:   defaultS3TierLocalLow,
+		RemoteHighBytes: defaultS3TierRemoteHigh,
+		RemoteLowBytes:  defaultS3TierRemoteLow,
+		Timeout:         defaultS3TierTimeout,
+		RetryMin:        defaultS3TierRetryMin,
+		RetryMax:        defaultS3TierRetryMax,
+	}
+}
+
+func (c *S3TierServerConfig) resolveStore() error {
+	if c == nil || c.Endpoint == "" || c.Bucket == "" || strings.Trim(c.Prefix, "/") == "" {
+		return errors.New("S3 tier requires endpoint, bucket, and opaque prefix")
+	}
+	if c.CredentialProvider != "env" && c.CredentialProvider != "environment" {
+		return fmt.Errorf("S3 tier credential provider %q is not supported", c.CredentialProvider)
+	}
+	if c.AccessKeyEnv == "" || c.SecretKeyEnv == "" {
+		return errors.New("S3 tier environment credential provider requires access_key_env and secret_key_env")
+	}
+	accessKey, ok := os.LookupEnv(c.AccessKeyEnv)
+	if !ok || accessKey == "" {
+		return fmt.Errorf("S3 tier access key environment variable %q is not set", c.AccessKeyEnv)
+	}
+	secretKey, ok := os.LookupEnv(c.SecretKeyEnv)
+	if !ok || secretKey == "" {
+		return fmt.Errorf("S3 tier secret key environment variable %q is not set", c.SecretKeyEnv)
+	}
+	var sessionToken string
+	if c.SessionTokenEnv != "" {
+		sessionToken = os.Getenv(c.SessionTokenEnv)
+	}
+	store, err := newS3TierMinIOStore(c.Endpoint, accessKey, secretKey, sessionToken, c.Region, c.Bucket, c.TLS)
+	if err != nil {
+		return err
+	}
+	c.store = store
+	return nil
+}
+
+func (c *S3TierServerConfig) streamConfig(account, stream string) *S3TierConfig {
+	if c == nil || c.store == nil {
+		return nil
+	}
+	segment := func(value string) string { return base64.RawURLEncoding.EncodeToString([]byte(value)) }
+	prefix := fmt.Sprintf("%s/streams/%s/%s", strings.Trim(c.Prefix, "/"), segment(account), segment(stream))
+	return &S3TierConfig{
+		Store: c.store, Prefix: prefix, BlockSize: c.BlockSize,
+		LocalHighBytes: c.LocalHighBytes, LocalLowBytes: c.LocalLowBytes,
+		RemoteHighBytes: c.RemoteHighBytes, RemoteLowBytes: c.RemoteLowBytes,
+		Timeout: c.Timeout, RetryMin: c.RetryMin, RetryMax: c.RetryMax,
+	}
+}
+
+func (c *S3TierServerConfig) equal(other *S3TierServerConfig) bool {
+	if c == nil || other == nil {
+		return c == other
+	}
+	return c.Endpoint == other.Endpoint && c.Bucket == other.Bucket && c.Region == other.Region && c.TLS == other.TLS && c.Prefix == other.Prefix &&
+		c.CredentialProvider == other.CredentialProvider && c.AccessKeyEnv == other.AccessKeyEnv && c.SecretKeyEnv == other.SecretKeyEnv && c.SessionTokenEnv == other.SessionTokenEnv &&
+		c.BlockSize == other.BlockSize && c.LocalHighBytes == other.LocalHighBytes && c.LocalLowBytes == other.LocalLowBytes && c.RemoteHighBytes == other.RemoteHighBytes && c.RemoteLowBytes == other.RemoteLowBytes &&
+		c.Timeout == other.Timeout && c.RetryMin == other.RetryMin && c.RetryMax == other.RetryMax
+}
+
 // S3TierMinIOStore works with AWS S3 and S3-compatible endpoints such as MinIO.
 type S3TierMinIOStore struct {
 	client *minio.Client
@@ -81,11 +192,15 @@ type S3TierMinIOStore struct {
 }
 
 func NewS3TierMinIOStore(endpoint, accessKey, secretKey, bucket string, secure bool) (*S3TierMinIOStore, error) {
+	return newS3TierMinIOStore(endpoint, accessKey, secretKey, "", "", bucket, secure)
+}
+
+func newS3TierMinIOStore(endpoint, accessKey, secretKey, sessionToken, region, bucket string, secure bool) (*S3TierMinIOStore, error) {
 	if endpoint == "" || bucket == "" {
 		return nil, fmt.Errorf("S3 tier endpoint and bucket are required")
 	}
 	client, err := minio.New(endpoint, &minio.Options{
-		Creds: credentials.NewStaticV4(accessKey, secretKey, ""), Secure: secure,
+		Creds: credentials.NewStaticV4(accessKey, secretKey, sessionToken), Secure: secure, Region: region,
 	})
 	if err != nil {
 		return nil, err
@@ -195,7 +310,7 @@ type fileS3Tier struct {
 }
 
 type s3TierCounters struct {
-	fetches, fetchErrors, cacheHits, uploads, uploadErrors, evictions, capacityErrors atomic.Uint64
+	fetches, fetchErrors, cacheHits, uploads, uploadErrors, evictions, capacityErrors, retryAttempts atomic.Uint64
 }
 
 type s3TierFetch struct {
@@ -205,7 +320,13 @@ type s3TierFetch struct {
 
 func newFileS3Tier(fs *fileStore, cfg S3TierConfig) *fileS3Tier {
 	if cfg.Timeout == 0 {
-		cfg.Timeout = 30 * time.Second
+		cfg.Timeout = defaultS3TierTimeout
+	}
+	if cfg.RetryMin == 0 {
+		cfg.RetryMin = defaultS3TierRetryMin
+	}
+	if cfg.RetryMax == 0 {
+		cfg.RetryMax = defaultS3TierRetryMax
 	}
 	if cfg.RemoteHighBytes == 0 {
 		cfg.RemoteHighBytes, cfg.RemoteLowBytes = cfg.LocalHighBytes, cfg.LocalLowBytes
@@ -218,9 +339,19 @@ func validateS3Tier(fcfg FileStoreConfig, cfg StreamConfig) error {
 		return nil
 	}
 	t := fcfg.S3Tier
+	if t.Timeout == 0 {
+		t.Timeout = defaultS3TierTimeout
+	}
+	if t.RetryMin == 0 {
+		t.RetryMin = defaultS3TierRetryMin
+	}
+	if t.RetryMax == 0 {
+		t.RetryMax = defaultS3TierRetryMax
+	}
 	if t.Store == nil || strings.Trim(t.Prefix, "/") == "" || t.LocalLowBytes == 0 || t.LocalHighBytes <= t.LocalLowBytes ||
-		(t.RemoteHighBytes > 0 && t.RemoteHighBytes <= t.RemoteLowBytes) || (t.RemoteHighBytes == 0 && t.RemoteLowBytes != 0) {
-		return fmt.Errorf("S3 tier requires store, unique prefix, local high > low > 0, and valid remote coverage watermarks")
+		(t.RemoteHighBytes > 0 && t.RemoteHighBytes <= t.RemoteLowBytes) || (t.RemoteHighBytes == 0 && t.RemoteLowBytes != 0) ||
+		t.RetryMin <= 0 || t.RetryMax < t.RetryMin {
+		return fmt.Errorf("S3 tier requires store, unique prefix, valid watermarks, and retry max >= retry min > 0")
 	}
 	if cfg.Replicas > 1 || cfg.Retention != LimitsPolicy || cfg.Discard != DiscardNew || !cfg.DenyDelete || !cfg.DenyPurge ||
 		cfg.AllowRollup || cfg.AllowMsgTTL || cfg.MaxAge != 0 || cfg.MaxMsgs > 0 || cfg.MaxMsgsPer > 0 || cfg.Compression != NoCompression ||
@@ -554,14 +685,45 @@ func (t *fileS3Tier) hasDescriptor(index uint32) bool {
 }
 
 func (t *fileS3Tier) loop() {
+	var (
+		delay  time.Duration
+		timer  *time.Timer
+		retryC <-chan time.Time
+	)
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		select {
 		case <-t.wake:
-			if err := t.evictToBudget(); err != nil {
-				t.fs.warn("S3 tier eviction failed: %v", err)
+			if timer != nil && !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
+			retryC = nil
+		case <-retryC:
+			retryC = nil
 		case <-t.quit:
 			return
+		}
+		if err := t.evictToBudget(); err != nil {
+			t.fs.warn("S3 tier eviction failed: %v", err)
+			t.stats.retryAttempts.Add(1)
+			if delay == 0 {
+				delay = t.cfg.RetryMin
+			} else if delay < t.cfg.RetryMax/2 {
+				delay *= 2
+			} else {
+				delay = t.cfg.RetryMax
+			}
+			timer = time.NewTimer(delay)
+			retryC = timer.C
+		} else {
+			delay = 0
 		}
 	}
 }
@@ -852,13 +1014,39 @@ func (t *fileS3Tier) statsSnapshot() S3TierStats {
 		checkpointSeq = t.checkpoint.CoveredThrough
 	}
 	t.mu.Unlock()
+	backlogBytes, backlogBlocks := t.backlog()
 	return S3TierStats{
 		LocalBytes: t.localBytes(), RemoteBytes: remoteBytes, RemoteBlocks: remoteBlocks,
 		Fetches: t.stats.fetches.Load(), FetchErrors: t.stats.fetchErrors.Load(), CacheHits: t.stats.cacheHits.Load(),
 		Uploads: t.stats.uploads.Load(), UploadErrors: t.stats.uploadErrors.Load(), Evictions: t.stats.evictions.Load(),
 		CapacityErrors: t.stats.capacityErrors.Load(), HighWatermark: t.cfg.LocalHighBytes, LowWatermark: t.cfg.LocalLowBytes,
 		RemoteHigh: t.cfg.RemoteHighBytes, RemoteLow: t.cfg.RemoteLowBytes, CheckpointSeq: checkpointSeq,
+		BacklogBytes: backlogBytes, BacklogBlocks: backlogBlocks, RetryAttempts: t.stats.retryAttempts.Load(),
 	}
+}
+
+// backlog is the sealed local payload that has not reached the remote tier.
+// It is physical transfer debt, separate from the stream's logical retention.
+func (t *fileS3Tier) backlog() (uint64, uint64) {
+	fs := t.fs
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var bytes, blocks uint64
+	for _, mb := range fs.blks {
+		if mb == fs.lmb {
+			continue
+		}
+		if _, covered := t.desc[mb.index]; covered {
+			continue
+		}
+		if info, err := os.Stat(mb.mfn); err == nil {
+			bytes += uint64(info.Size())
+			blocks++
+		}
+	}
+	return bytes, blocks
 }
 
 // evictBlock uploads a sealed block when needed. reclaim determines whether
@@ -893,6 +1081,7 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool) (uint64, error) {
 	}
 	record, err := t.ensureStreamRecord()
 	if err != nil {
+		t.stats.uploadErrors.Add(1)
 		return 0, err
 	}
 	d.Incarnation = record.Incarnation
