@@ -3059,6 +3059,7 @@ type StreamDetail struct {
 	Sources            []*StreamSourceInfo `json:"sources,omitempty"`
 	RaftGroup          string              `json:"stream_raft_group,omitempty"`
 	ConsumerRaftGroups []*RaftGroupDetail  `json:"consumer_raft_groups,omitempty"`
+	S3Tier             *S3TierStats        `json:"s3_tier,omitempty"`
 }
 
 // RaftGroupDetail shows information details about the Raft group.
@@ -3202,6 +3203,9 @@ func (s *Server) accountDetail(jsa *jsAccount, optStreams, optConsumers, optDire
 				Config:  cfg,
 				Mirror:  stream.mirrorInfo(),
 				Sources: stream.sourcesInfo(),
+			}
+			if store, ok := stream.store.(interface{ S3TierStats() *S3TierStats }); ok {
+				sdet.S3Tier = store.S3TierStats()
 			}
 			if optRaft && rgroup != nil {
 				sdet.RaftGroup = rgroup.Name

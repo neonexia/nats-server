@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -35,6 +36,23 @@ type S3TierConfig struct {
 	LocalHighBytes uint64
 	LocalLowBytes  uint64
 	Timeout        time.Duration
+}
+
+// S3TierStats reports physical tier activity separately from the stream's
+// logical retention counters. Values are exposed in the JetStream monitor view.
+type S3TierStats struct {
+	LocalBytes     uint64 `json:"local_bytes"`
+	RemoteBytes    uint64 `json:"remote_bytes"`
+	RemoteBlocks   uint64 `json:"remote_blocks"`
+	Fetches        uint64 `json:"fetches"`
+	FetchErrors    uint64 `json:"fetch_errors"`
+	CacheHits      uint64 `json:"cache_hits"`
+	Uploads        uint64 `json:"uploads"`
+	UploadErrors   uint64 `json:"upload_errors"`
+	Evictions      uint64 `json:"evictions"`
+	CapacityErrors uint64 `json:"capacity_errors"`
+	HighWatermark  uint64 `json:"high_watermark"`
+	LowWatermark   uint64 `json:"low_watermark"`
 }
 
 // S3TierObjectStore makes the block protocol testable with fault injection.
@@ -99,122 +117,45 @@ type s3BlockDescriptor struct {
 	Key      string `json:"key"`
 }
 
-// S3TierHistoryBlock is the immutable S3 placement record an external history
-// reader needs to select a block. It deliberately contains no message bodies.
-type S3TierHistoryBlock struct {
-	Channel  string
-	Index    uint32
-	FirstSeq uint64
-	LastSeq  uint64
-	Key      string
-	Size     int
-	SHA256   string
-}
-
-// S3TierWorkspaceCatalog is a read-only, in-memory view of every committed
-// block descriptor below one workspace prefix. S3 has no actual directories;
-// channel IDs are the first path element below WorkspacePrefix.
-type S3TierWorkspaceCatalog struct {
-	workspacePrefix string
-	channels        map[string][]S3TierHistoryBlock
-}
-
-// LoadS3TierWorkspaceCatalog lists immutable descriptors below workspacePrefix
-// and never reads a message block. A history service can rebuild this cache
-// after process loss without a separate database.
-func LoadS3TierWorkspaceCatalog(ctx context.Context, store S3TierObjectStore, workspacePrefix string) (*S3TierWorkspaceCatalog, error) {
-	if store == nil {
-		return nil, errors.New("S3 tier object store is required")
-	}
-	workspacePrefix = strings.Trim(workspacePrefix, "/")
-	if workspacePrefix == "" {
-		return nil, errors.New("workspace prefix is required")
-	}
-	prefix := workspacePrefix + "/"
-	keys, err := store.List(ctx, prefix)
-	if err != nil {
-		return nil, fmt.Errorf("list workspace S3 tier descriptors: %w", err)
-	}
-	catalog := &S3TierWorkspaceCatalog{workspacePrefix: workspacePrefix, channels: make(map[string][]S3TierHistoryBlock)}
-	seen := make(map[string]struct{})
-	for _, key := range keys {
-		relative := strings.TrimPrefix(key, prefix)
-		parts := strings.Split(relative, "/")
-		if len(parts) != 3 || parts[0] == "" || parts[1] != "descriptors" || !strings.HasSuffix(parts[2], ".json") {
-			continue
-		}
-		buf, err := store.Get(ctx, key)
-		if err != nil {
-			return nil, fmt.Errorf("read workspace S3 tier descriptor %q: %w", key, err)
-		}
-		var descriptor s3BlockDescriptor
-		if err := json.Unmarshal(buf, &descriptor); err != nil || descriptor.Version != 1 || descriptor.Index == 0 || descriptor.Key == "" || descriptor.FirstSeq == 0 || descriptor.LastSeq < descriptor.FirstSeq {
-			return nil, fmt.Errorf("invalid workspace S3 tier descriptor %q: %v", key, err)
-		}
-		identity := fmt.Sprintf("%s/%d", parts[0], descriptor.Index)
-		if _, ok := seen[identity]; ok {
-			return nil, fmt.Errorf("duplicate workspace S3 tier descriptor for %s", identity)
-		}
-		seen[identity] = struct{}{}
-		catalog.channels[parts[0]] = append(catalog.channels[parts[0]], S3TierHistoryBlock{
-			Channel: parts[0], Index: descriptor.Index, FirstSeq: descriptor.FirstSeq, LastSeq: descriptor.LastSeq,
-			Key: descriptor.Key, Size: descriptor.Size, SHA256: descriptor.SHA256,
-		})
-	}
-	for channel, blocks := range catalog.channels {
-		sort.Slice(blocks, func(i, j int) bool { return blocks[i].FirstSeq < blocks[j].FirstSeq })
-		catalog.channels[channel] = blocks
-	}
-	return catalog, nil
-}
-
-// Channels returns all known channel IDs in lexical order.
-func (c *S3TierWorkspaceCatalog) Channels() []string {
-	if c == nil {
-		return nil
-	}
-	channels := make([]string, 0, len(c.channels))
-	for channel := range c.channels {
-		channels = append(channels, channel)
-	}
-	sort.Strings(channels)
-	return channels
-}
-
-// BlocksForSequenceRange returns just the block objects overlapping the
-// inclusive sequence range. A zero last sequence means through the channel tail.
-func (c *S3TierWorkspaceCatalog) BlocksForSequenceRange(channel string, firstSeq, lastSeq uint64) []S3TierHistoryBlock {
-	if c == nil || firstSeq == 0 || (lastSeq != 0 && lastSeq < firstSeq) {
-		return nil
-	}
-	blocks := c.channels[channel]
-	start := sort.Search(len(blocks), func(i int) bool { return blocks[i].LastSeq >= firstSeq })
-	var matches []S3TierHistoryBlock
-	for _, block := range blocks[start:] {
-		if lastSeq != 0 && block.FirstSeq > lastSeq {
-			break
-		}
-		matches = append(matches, block)
-	}
-	return matches
+// s3TierManifest is an immutable snapshot of committed block descriptors.
+// Readers can discover a stream's remote index without inspecting payloads;
+// each new generation receives a new object key so a partial update can never
+// replace an earlier complete view.
+type s3TierManifest struct {
+	Version    uint8               `json:"version"`
+	Generation uint64              `json:"generation"`
+	Prefix     string              `json:"prefix"`
+	Blocks     []s3BlockDescriptor `json:"blocks"`
 }
 
 type fileS3Tier struct {
 	fs    *fileStore
 	cfg   S3TierConfig
-	mu    sync.Mutex // Serializes cache hydration and local payload unlink.
+	mu    sync.Mutex // Protects descriptors and in-flight fetches.
 	runMu sync.Mutex // One eviction pass at a time.
 	desc  map[uint32]s3BlockDescriptor
+	fetch map[uint32]*s3TierFetch
+	gen   uint64
+	stats s3TierCounters
 	wake  chan struct{}
 	quit  chan struct{}
 	once  sync.Once
+}
+
+type s3TierCounters struct {
+	fetches, fetchErrors, cacheHits, uploads, uploadErrors, evictions, capacityErrors atomic.Uint64
+}
+
+type s3TierFetch struct {
+	done chan struct{}
+	err  error
 }
 
 func newFileS3Tier(fs *fileStore, cfg S3TierConfig) *fileS3Tier {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 30 * time.Second
 	}
-	return &fileS3Tier{fs: fs, cfg: cfg, desc: make(map[uint32]s3BlockDescriptor), wake: make(chan struct{}, 1), quit: make(chan struct{})}
+	return &fileS3Tier{fs: fs, cfg: cfg, desc: make(map[uint32]s3BlockDescriptor), fetch: make(map[uint32]*s3TierFetch), wake: make(chan struct{}, 1), quit: make(chan struct{})}
 }
 
 func validateS3Tier(fcfg FileStoreConfig, cfg StreamConfig) error {
@@ -246,9 +187,18 @@ func (t *fileS3Tier) descriptorFile(index uint32) string {
 	return filepath.Join(t.fs.fcfg.StoreDir, msgDir, fmt.Sprintf("%d.tier.json", index))
 }
 
-// prepareS3Tier runs before the normal file-store recovery. Hydrating every
-// referenced block is deliberately conservative: existing recovery requires
-// local block bytes and must never infer that a remote-only range was deleted.
+func (t *fileS3Tier) manifestKey(generation uint64) string {
+	return fmt.Sprintf("%s/manifests/%020d.json", strings.Trim(t.cfg.Prefix, "/"), generation)
+}
+
+func (t *fileS3Tier) manifestFile() string {
+	return filepath.Join(t.fs.fcfg.StoreDir, msgDir, "s3-tier.manifest.json")
+}
+
+// prepareS3Tier runs before the normal file-store recovery. Descriptor sidecars
+// are durable local evidence that a missing payload belongs to the remote tier.
+// Startup must not list or fetch S3 objects: that would turn an object-store
+// outage and total history size into a restart dependency.
 func (fs *fileStore) prepareS3Tier() error {
 	marker := filepath.Join(fs.fcfg.StoreDir, "s3-tier.json")
 	if fs.tier == nil {
@@ -267,30 +217,29 @@ func (fs *fileStore) prepareS3Tier() error {
 	} else if err := writeAtomically(fs.dios, marker, []byte(strings.Trim(t.cfg.Prefix, "/")), defaultFilePerms, true); err != nil {
 		return err
 	}
-	ctx, cancel := t.ctx()
-	keys, err := t.cfg.Store.List(ctx, strings.Trim(t.cfg.Prefix, "/")+"/descriptors/")
-	cancel()
-	if err != nil {
-		return fmt.Errorf("S3 tier descriptor listing: %w", err)
+	if buf, err := os.ReadFile(t.manifestFile()); err == nil {
+		var manifest s3TierManifest
+		if err := json.Unmarshal(buf, &manifest); err != nil || manifest.Version != 1 || manifest.Generation == 0 || manifest.Prefix != strings.Trim(t.cfg.Prefix, "/") {
+			return fmt.Errorf("invalid local S3 tier manifest: %v", err)
+		}
+		t.gen = manifest.Generation
+	} else if !os.IsNotExist(err) {
+		return err
 	}
-	for _, key := range keys {
-		if !strings.HasSuffix(key, ".json") {
-			continue
-		}
-		ctx, cancel = t.ctx()
-		buf, getErr := t.cfg.Store.Get(ctx, key)
-		cancel()
-		if getErr != nil {
-			return fmt.Errorf("S3 tier descriptor %q: %w", key, getErr)
-		}
-		var d s3BlockDescriptor
-		if err := json.Unmarshal(buf, &d); err != nil || d.Version != 1 || d.Index == 0 || d.Key == "" || key != t.descriptorKey(d.Index) {
-			return fmt.Errorf("invalid S3 tier descriptor %q: %v", key, err)
-		}
-		t.desc[d.Index] = d
-		if err := writeAtomically(fs.dios, t.descriptorFile(d.Index), buf, defaultFilePerms, true); err != nil {
+	paths, err := filepath.Glob(filepath.Join(fs.fcfg.StoreDir, msgDir, "*.tier.json"))
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		buf, err := os.ReadFile(path)
+		if err != nil {
 			return err
 		}
+		var d s3BlockDescriptor
+		if err := json.Unmarshal(buf, &d); err != nil || !validS3BlockDescriptor(d) || filepath.Clean(path) != t.descriptorFile(d.Index) {
+			return fmt.Errorf("invalid local S3 tier descriptor %q: %v", path, err)
+		}
+		t.desc[d.Index] = d
 		if local, err := os.ReadFile(filepath.Join(fs.fcfg.StoreDir, msgDir, fmt.Sprintf(blkScan, d.Index))); err == nil {
 			if len(local) != d.Size || checksumS3Block(local) != d.SHA256 {
 				return fmt.Errorf("S3 tier block %d local checksum mismatch during recovery", d.Index)
@@ -298,25 +247,57 @@ func (fs *fileStore) prepareS3Tier() error {
 		} else if !os.IsNotExist(err) {
 			return err
 		}
-		if err := t.ensureHydrated(d.Index); err != nil {
-			return err
-		}
-	}
-	localDescriptors, err := filepath.Glob(filepath.Join(fs.fcfg.StoreDir, msgDir, "*.tier.json"))
-	if err != nil {
-		return err
-	}
-	for _, path := range localDescriptors {
-		var index uint32
-		if _, err := fmt.Sscanf(filepath.Base(path), "%d.tier.json", &index); err != nil {
-			return fmt.Errorf("invalid local S3 tier descriptor %q", path)
-		}
-		if _, ok := t.desc[index]; !ok {
-			return fmt.Errorf("S3 tier descriptor %d missing remotely", index)
-		}
 	}
 	go t.loop()
 	return nil
+}
+
+func validS3BlockDescriptor(d s3BlockDescriptor) bool {
+	return d.Version == 1 && d.Index != 0 && d.FirstSeq != 0 && d.LastSeq >= d.FirstSeq && d.Size > 0 && d.SHA256 != "" && d.Key != ""
+}
+
+func (t *fileS3Tier) commitManifest(d s3BlockDescriptor) error {
+	t.mu.Lock()
+	blocks := make([]s3BlockDescriptor, 0, len(t.desc)+1)
+	for _, current := range t.desc {
+		blocks = append(blocks, current)
+	}
+	blocks = append(blocks, d)
+	generation := t.gen + 1
+	t.mu.Unlock()
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Index < blocks[j].Index })
+	manifest := s3TierManifest{Version: 1, Generation: generation, Prefix: strings.Trim(t.cfg.Prefix, "/"), Blocks: blocks}
+	buf, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	key := t.manifestKey(generation)
+	ctx, cancel := t.ctx()
+	err = t.cfg.Store.Put(ctx, key, buf)
+	cancel()
+	if err != nil {
+		return err
+	}
+	ctx, cancel = t.ctx()
+	committed, err := t.cfg.Store.Get(ctx, key)
+	cancel()
+	if err != nil || !bytes.Equal(committed, buf) {
+		return fmt.Errorf("S3 tier manifest verification failed for generation %d: %w", generation, err)
+	}
+	if err := writeAtomically(t.fs.dios, t.manifestFile(), buf, defaultFilePerms, true); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	t.gen = generation
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *fileS3Tier) hasDescriptor(index uint32) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.desc[index]
+	return ok
 }
 
 func (t *fileS3Tier) loop() {
@@ -348,8 +329,8 @@ func checksumS3Block(data []byte) string {
 
 func (t *fileS3Tier) ensureHydrated(index uint32) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	d, ok := t.desc[index]
+	t.mu.Unlock()
 	if !ok {
 		return nil
 	}
@@ -358,75 +339,50 @@ func (t *fileS3Tier) ensureHydrated(index uint32) error {
 		if info.Size() != int64(d.Size) {
 			return fmt.Errorf("S3 tier block %d local size mismatch", index)
 		}
+		t.stats.cacheHits.Add(1)
 		return nil
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	t.mu.Lock()
+	if fetch := t.fetch[index]; fetch != nil {
+		t.mu.Unlock()
+		<-fetch.done
+		return fetch.err
+	}
+	fetch := &s3TierFetch{done: make(chan struct{})}
+	t.fetch[index] = fetch
+	t.mu.Unlock()
+
+	t.stats.fetches.Add(1)
+	err := t.fetchBlock(d, path)
+	if err != nil {
+		t.stats.fetchErrors.Add(1)
+	}
+	t.mu.Lock()
+	fetch.err = err
+	delete(t.fetch, index)
+	close(fetch.done)
+	t.mu.Unlock()
+	return err
+}
+
+func (t *fileS3Tier) fetchBlock(d s3BlockDescriptor, path string) error {
 	ctx, cancel := t.ctx()
 	data, err := t.cfg.Store.Get(ctx, d.Key)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("%w: block %d unavailable: %v", errS3TierUnavailable, index, err)
+		return fmt.Errorf("%w: block %d unavailable: %v", errS3TierUnavailable, d.Index, err)
 	}
 	if len(data) != d.Size || checksumS3Block(data) != d.SHA256 {
-		return fmt.Errorf("%w: block %d remote checksum mismatch", errS3TierUnavailable, index)
+		return fmt.Errorf("%w: block %d remote checksum mismatch", errS3TierUnavailable, d.Index)
 	}
-	return writeAtomically(t.fs.dios, path, data, defaultFilePerms, true)
-}
-
-// prefetchS3Block performs remote I/O before LoadNextMsg takes the broad fs
-// read lock. The all-block scan is an intentionally simple spike tradeoff.
-func (fs *fileStore) prefetchS3Block(start uint64, throughTail bool) error {
-	if fs.tier == nil {
-		return nil
+	if err := writeAtomically(t.fs.dios, path, data, defaultFilePerms, true); err != nil {
+		return err
 	}
-	fs.mu.RLock()
-	var indices []uint32
-	for _, mb := range fs.blks {
-		if mb.last.seq >= start && mb != fs.lmb {
-			if _, err := os.Stat(mb.mfn); os.IsNotExist(err) {
-				indices = append(indices, mb.index)
-			}
-			if !throughTail {
-				break
-			}
-		}
-	}
-	fs.mu.RUnlock()
-	for _, index := range indices {
-		if err := fs.tier.ensureHydrated(index); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (fs *fileStore) prefetchS3Last(subject string) error {
-	if fs.tier == nil {
-		return nil
-	}
-	if subject == _EMPTY_ || subject == fwcs {
-		return fs.prefetchS3Block(fs.lastSeq(), false)
-	}
-	fs.mu.RLock()
-	var index uint32
-	if subjectHasWildcard(subject) {
-		fs.psim.Match(stringToBytes(subject), func(_ []byte, state *psi) {
-			if state.lblk > index {
-				index = state.lblk
-			}
-		})
-	} else if state, ok := fs.psim.Find(stringToBytes(subject)); ok {
-		index = state.lblk
-	}
-	mb := fs.bim[index]
-	fs.mu.RUnlock()
-	if mb == nil {
-		return nil
-	}
-	if _, err := os.Stat(mb.mfn); os.IsNotExist(err) {
-		return fs.tier.ensureHydrated(index)
-	}
+	// A cold read adds a local payload just like a publish does. Schedule the
+	// same reclamation pass so repeated range scans cannot grow the cache.
+	t.kick()
 	return nil
 }
 
@@ -438,12 +394,27 @@ func (t *fileS3Tier) evictToBudget() error {
 	fs := t.fs
 	fs.mu.RLock()
 	var used uint64
-	var candidates []*msgBlock
+	t.mu.Lock()
+	remote := make(map[uint32]struct{}, len(t.desc))
+	for index := range t.desc {
+		remote[index] = struct{}{}
+	}
+	t.mu.Unlock()
+	type candidate struct {
+		mb     *msgBlock
+		remote bool
+		last   int64
+	}
+	var candidates []candidate
 	for _, mb := range fs.blks {
 		if info, err := os.Stat(mb.mfn); err == nil {
 			used += uint64(info.Size())
 			if mb != fs.lmb {
-				candidates = append(candidates, mb)
+				mb.mu.RLock()
+				last := mb.llts
+				mb.mu.RUnlock()
+				_, isRemote := remote[mb.index]
+				candidates = append(candidates, candidate{mb: mb, remote: isRemote, last: last})
 			}
 		}
 	}
@@ -451,11 +422,22 @@ func (t *fileS3Tier) evictToBudget() error {
 	if used <= t.cfg.LocalHighBytes {
 		return nil
 	}
-	for _, mb := range candidates {
+	// Reclaim hydrated remote blocks first, least recently used. This keeps the
+	// local directory bounded as a cache before offloading additional hot data.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].remote != candidates[j].remote {
+			return candidates[i].remote
+		}
+		if candidates[i].remote {
+			return candidates[i].last < candidates[j].last
+		}
+		return candidates[i].mb.index < candidates[j].mb.index
+	})
+	for _, candidate := range candidates {
 		if used <= t.cfg.LocalLowBytes {
 			break
 		}
-		size, err := t.evictBlock(mb)
+		size, err := t.evictBlock(candidate.mb)
 		if err != nil {
 			return err
 		}
@@ -468,8 +450,59 @@ func (t *fileS3Tier) evictToBudget() error {
 	return nil
 }
 
+// ensureLocalCapacity is invoked before accepting another publish after a
+// previous asynchronous eviction could not reclaim enough local space. It
+// deliberately returns a transient error instead of poisoning fs.werr: S3 can
+// recover and a later publish may then make progress.
+func (t *fileS3Tier) ensureLocalCapacity() error {
+	if t.localBytes() <= t.cfg.LocalHighBytes {
+		return nil
+	}
+	if err := t.evictToBudget(); err != nil {
+		t.stats.capacityErrors.Add(1)
+		return fmt.Errorf("%w: %v", errS3TierLocalCapacity, err)
+	}
+	if t.localBytes() > t.cfg.LocalHighBytes {
+		t.stats.capacityErrors.Add(1)
+		return errS3TierLocalCapacity
+	}
+	return nil
+}
+
+func (t *fileS3Tier) localBytes() uint64 {
+	fs := t.fs
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	var used uint64
+	for _, mb := range fs.blks {
+		if info, err := os.Stat(mb.mfn); err == nil {
+			used += uint64(info.Size())
+		}
+	}
+	return used
+}
+
+func (t *fileS3Tier) statsSnapshot() S3TierStats {
+	t.mu.Lock()
+	var remoteBytes uint64
+	for _, d := range t.desc {
+		remoteBytes += uint64(d.Size)
+	}
+	remoteBlocks := uint64(len(t.desc))
+	t.mu.Unlock()
+	return S3TierStats{
+		LocalBytes: t.localBytes(), RemoteBytes: remoteBytes, RemoteBlocks: remoteBlocks,
+		Fetches: t.stats.fetches.Load(), FetchErrors: t.stats.fetchErrors.Load(), CacheHits: t.stats.cacheHits.Load(),
+		Uploads: t.stats.uploads.Load(), UploadErrors: t.stats.uploadErrors.Load(), Evictions: t.stats.evictions.Load(),
+		CapacityErrors: t.stats.capacityErrors.Load(), HighWatermark: t.cfg.LocalHighBytes, LowWatermark: t.cfg.LocalLowBytes,
+	}
+}
+
 func (t *fileS3Tier) evictBlock(mb *msgBlock) (uint64, error) {
 	fs := t.fs
+	t.mu.Lock()
+	_, alreadyRemote := t.desc[mb.index]
+	t.mu.Unlock()
 	fs.mu.RLock()
 	mb.mu.RLock()
 	if fs.closing || fs.lmb == mb || mb.pendingWriteSizeLocked() != 0 {
@@ -487,18 +520,24 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock) (uint64, error) {
 		}
 		return 0, err
 	}
+	if alreadyRemote {
+		return t.removeLocalBlock(mb, data, nil)
+	}
 	d.SHA256 = checksumS3Block(data)
 	d.Key = fmt.Sprintf("%s/blocks/%010d-%s.blk", strings.Trim(t.cfg.Prefix, "/"), d.Index, d.SHA256)
+	t.stats.uploads.Add(1)
 	ctx, cancel := t.ctx()
 	err = t.cfg.Store.Put(ctx, d.Key, data)
 	cancel()
 	if err != nil {
+		t.stats.uploadErrors.Add(1)
 		return 0, err
 	}
 	ctx, cancel = t.ctx()
 	verified, err := t.cfg.Store.Get(ctx, d.Key)
 	cancel()
 	if err != nil || !bytes.Equal(verified, data) {
+		t.stats.uploadErrors.Add(1)
 		return 0, fmt.Errorf("S3 tier upload verification failed for block %d: %w", d.Index, err)
 	}
 	buf, err := json.Marshal(d)
@@ -509,17 +548,29 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock) (uint64, error) {
 	err = t.cfg.Store.Put(ctx, t.descriptorKey(d.Index), buf)
 	cancel()
 	if err != nil {
+		t.stats.uploadErrors.Add(1)
 		return 0, err
 	}
 	ctx, cancel = t.ctx()
 	committed, err := t.cfg.Store.Get(ctx, t.descriptorKey(d.Index))
 	cancel()
 	if err != nil || !bytes.Equal(committed, buf) {
+		t.stats.uploadErrors.Add(1)
 		return 0, fmt.Errorf("S3 tier descriptor verification failed for block %d: %w", d.Index, err)
 	}
-	if err := writeAtomically(fs.dios, t.descriptorFile(d.Index), buf, defaultFilePerms, true); err != nil {
+	if err := t.commitManifest(d); err != nil {
+		t.stats.uploadErrors.Add(1)
 		return 0, err
 	}
+	if err := writeAtomically(fs.dios, t.descriptorFile(d.Index), buf, defaultFilePerms, true); err != nil {
+		t.stats.uploadErrors.Add(1)
+		return 0, err
+	}
+	return t.removeLocalBlock(mb, data, &d)
+}
+
+func (t *fileS3Tier) removeLocalBlock(mb *msgBlock, expected []byte, descriptor *s3BlockDescriptor) (uint64, error) {
+	fs := t.fs
 	fs.mu.Lock()
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
@@ -527,11 +578,20 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock) (uint64, error) {
 	if fs.closing || fs.lmb == mb {
 		return 0, nil
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	current, err := os.ReadFile(mb.mfn)
-	if err != nil || !bytes.Equal(current, data) {
-		return 0, fmt.Errorf("S3 tier block %d changed during upload: %w", d.Index, err)
+	if err != nil || !bytes.Equal(current, expected) {
+		return 0, fmt.Errorf("S3 tier block %d changed during upload: %w", mb.index, err)
+	}
+	if descriptor != nil {
+		t.mu.Lock()
+		t.desc[descriptor.Index] = *descriptor
+		t.mu.Unlock()
+	}
+	t.mu.Lock()
+	_, committed := t.desc[mb.index]
+	t.mu.Unlock()
+	if !committed {
+		return 0, fmt.Errorf("S3 tier block %d has no durable descriptor", mb.index)
 	}
 	mb.closeFDsLockedNoCheck()
 	if err := os.Remove(mb.mfn); err != nil {
@@ -542,9 +602,30 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock) (uint64, error) {
 			return 0, err
 		}
 	}
-	t.desc[d.Index] = d
-	return uint64(len(data)), nil
+	t.stats.evictions.Add(1)
+	return uint64(len(expected)), nil
 }
 
 var errS3TierMutation = errors.New("experimental S3 tier does not support deletion or rewrite")
 var errS3TierUnavailable = errors.New("S3 tier storage unavailable")
+var errS3TierLocalCapacity = errors.New("S3 tier local capacity exceeded")
+
+// errS3TierBlockNotHydrated crosses the local read path without doing network
+// I/O under file-store or block locks. Its caller hydrates precisely this block
+// and retries the normal read path.
+type errS3TierBlockNotHydrated struct{ index uint32 }
+
+func (e *errS3TierBlockNotHydrated) Error() string {
+	return fmt.Sprintf("S3 tier block %d is not hydrated", e.index)
+}
+
+func (fs *fileStore) hydrateS3TierMiss(err error) (bool, error) {
+	var missing *errS3TierBlockNotHydrated
+	if !errors.As(err, &missing) {
+		return false, nil
+	}
+	if fs.tier == nil {
+		return false, err
+	}
+	return true, fs.tier.ensureHydrated(missing.index)
+}

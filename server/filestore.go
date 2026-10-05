@@ -2151,8 +2151,8 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 				bi += n
 			}
 
-			// Pre-emptively mark block as closed, we'll confirm this block
-			// still exists on disk and report it as lost if not.
+			// Pre-emptively mark block as closed. A local payload or a durable tier
+			// descriptor will confirm that it remains readable during recovery.
 			mb.closed = true
 
 			// Only add in if not empty or the lmb.
@@ -2187,7 +2187,6 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 
 	// First let's check the happy path, open the blk file that was the lmb when we created the full state.
 	// See if we have the last block available.
-	var matched bool
 	mb := fs.lmb
 	if mb == nil || mb.index != blkIndex {
 		_ = os.Remove(fn)
@@ -2202,7 +2201,7 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 		fs.warn("Stream state detected prior state, could not locate msg block %d", blkIndex)
 		return errPriorState
 	}
-	if matched = bytes.Equal(mb.lastChecksum(), lchk[:]); !matched {
+	if _, err := os.Stat(mb.mfn); err == nil && !bytes.Equal(mb.lastChecksum(), lchk[:]) {
 		// Detected a stale index.db, we didn't write it upon shutdown so can't rely on it being correct.
 		fs.warn("Stream state outdated, last block has additional entries, will rebuild")
 		return errPriorState
@@ -2238,6 +2237,10 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 	var rebuild bool
 	for _, mb := range fs.blks {
 		if mb.closed {
+			if fs.tier != nil && fs.tier.hasDescriptor(mb.index) {
+				mb.closed = false
+				continue
+			}
 			rebuild = true
 			if ld, _, _ := mb.rebuildState(); ld != nil {
 				fs.addLostData(ld)
@@ -5621,6 +5624,11 @@ func (fs *fileStore) setWriteErr(err error) {
 
 // StoreRawMsg stores a raw message with expected sequence number and timestamp.
 func (fs *fileStore) StoreRawMsg(subj string, hdr, msg []byte, seq uint64, ts, ttl int64, discardNewCheck bool) error {
+	if fs.tier != nil {
+		if err := fs.tier.ensureLocalCapacity(); err != nil {
+			return err
+		}
+	}
 	fs.mu.Lock()
 	// Always return previous write errors.
 	if err := fs.werr; err != nil {
@@ -5649,6 +5657,11 @@ func (fs *fileStore) StoreRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 
 // Store stores a message. We hold the main filestore lock for any write operation.
 func (fs *fileStore) StoreMsg(subj string, hdr, msg []byte, ttl int64) (uint64, int64, error) {
+	if fs.tier != nil {
+		if err := fs.tier.ensureLocalCapacity(); err != nil {
+			return 0, 0, err
+		}
+	}
 	fs.mu.Lock()
 	// Always return previous write errors.
 	if err := fs.werr; err != nil {
@@ -9017,13 +9030,8 @@ func (mb *msgBlock) openBlock() (*os.File, error) {
 	mb.fs.dios.acquire()
 	f, err := os.Open(mb.mfn)
 	mb.fs.dios.release()
-	if os.IsNotExist(err) && mb.fs.tier != nil {
-		if err = mb.fs.tier.ensureHydrated(mb.index); err != nil {
-			return nil, err
-		}
-		mb.fs.dios.acquire()
-		f, err = os.Open(mb.mfn)
-		mb.fs.dios.release()
+	if os.IsNotExist(err) && mb.fs.tier != nil && mb.fs.tier.hasDescriptor(mb.index) {
+		return nil, &errS3TierBlockNotHydrated{index: mb.index}
 	}
 	return f, err
 }
@@ -9609,10 +9617,16 @@ func (fs *fileStore) SubjectForSeq(seq uint64) (string, error) {
 
 // LoadMsg will lookup the message by sequence number and return it if found.
 func (fs *fileStore) LoadMsg(seq uint64, sm *StoreMsg) (*StoreMsg, error) {
-	if err := fs.prefetchS3Block(seq, false); err != nil {
-		return nil, err
+	for {
+		msg, err := fs.msgForSeq(seq, sm)
+		if handled, hydrateErr := fs.hydrateS3TierMiss(err); handled {
+			if hydrateErr != nil {
+				return nil, hydrateErr
+			}
+			continue
+		}
+		return msg, err
 	}
-	return fs.msgForSeq(seq, sm)
 }
 
 // loadLast will load the last message for a subject. Subject should be non empty and not ">".
@@ -9726,13 +9740,19 @@ func (fs *fileStore) loadLastLocked(subj string, sm *StoreMsg) (lsm *StoreMsg, e
 // LoadLastMsg will return the last message we have that matches a given subject.
 // The subject can be a wildcard.
 func (fs *fileStore) LoadLastMsg(subject string, smv *StoreMsg) (sm *StoreMsg, err error) {
-	if err := fs.prefetchS3Last(subject); err != nil {
-		return nil, err
-	}
-	if subject == _EMPTY_ || subject == fwcs {
-		sm, err = fs.msgForSeq(fs.lastSeq(), smv)
-	} else {
-		sm, err = fs.loadLast(subject, smv)
+	for {
+		if subject == _EMPTY_ || subject == fwcs {
+			sm, err = fs.msgForSeq(fs.lastSeq(), smv)
+		} else {
+			sm, err = fs.loadLast(subject, smv)
+		}
+		if handled, hydrateErr := fs.hydrateS3TierMiss(err); handled {
+			if hydrateErr != nil {
+				return nil, hydrateErr
+			}
+			continue
+		}
+		break
 	}
 	if errors.Is(err, errS3TierUnavailable) {
 		return nil, err
@@ -9745,6 +9765,19 @@ func (fs *fileStore) LoadLastMsg(subject string, smv *StoreMsg) (sm *StoreMsg, e
 
 // LoadNextMsgMulti will find the next message matching any entry in the sublist.
 func (fs *fileStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *StoreMsg) (sm *StoreMsg, skip uint64, err error) {
+	for {
+		sm, skip, err = fs.loadNextMsgMulti(sl, start, smp)
+		if handled, hydrateErr := fs.hydrateS3TierMiss(err); handled {
+			if hydrateErr != nil {
+				return nil, 0, hydrateErr
+			}
+			continue
+		}
+		return sm, skip, err
+	}
+}
+
+func (fs *fileStore) loadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *StoreMsg) (sm *StoreMsg, skip uint64, err error) {
 	if fs.isClosed() {
 		return nil, 0, ErrStoreClosed
 	}
@@ -9753,9 +9786,6 @@ func (fs *fileStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *
 	}
 	if filter, ok := sl.MatchesSingleFilter(); ok {
 		return fs.LoadNextMsg(filter, subjectHasWildcard(filter), start, smp)
-	}
-	if err := fs.prefetchS3Block(start, true); err != nil {
-		return nil, 0, err
 	}
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
@@ -9834,9 +9864,19 @@ func (fs *fileStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *
 }
 
 func (fs *fileStore) LoadNextMsg(filter string, wc bool, start uint64, sm *StoreMsg) (*StoreMsg, uint64, error) {
-	if err := fs.prefetchS3Block(start, true); err != nil {
-		return nil, 0, err
+	for {
+		msg, next, err := fs.loadNextMsg(filter, wc, start, sm)
+		if handled, hydrateErr := fs.hydrateS3TierMiss(err); handled {
+			if hydrateErr != nil {
+				return nil, 0, hydrateErr
+			}
+			continue
+		}
+		return msg, next, err
 	}
+}
+
+func (fs *fileStore) loadNextMsg(filter string, wc bool, start uint64, sm *StoreMsg) (*StoreMsg, uint64, error) {
 	if fs.isClosed() {
 		return nil, 0, ErrStoreClosed
 	}
@@ -10057,6 +10097,19 @@ func (mb *msgBlock) prevMatching(filter string, wc bool, start uint64, sm *Store
 
 // Will load the previous message matching the filter subject, starting at the start sequence and walking backwards.
 func (fs *fileStore) LoadPrevMsg(filter string, wc bool, start uint64, smp *StoreMsg) (sm *StoreMsg, skip uint64, err error) {
+	for {
+		sm, skip, err = fs.loadPrevMsg(filter, wc, start, smp)
+		if handled, hydrateErr := fs.hydrateS3TierMiss(err); handled {
+			if hydrateErr != nil {
+				return nil, 0, hydrateErr
+			}
+			continue
+		}
+		return sm, skip, err
+	}
+}
+
+func (fs *fileStore) loadPrevMsg(filter string, wc bool, start uint64, smp *StoreMsg) (sm *StoreMsg, skip uint64, err error) {
 	if fs.isClosed() {
 		return nil, 0, ErrStoreClosed
 	}
@@ -10093,6 +10146,19 @@ func (fs *fileStore) LoadPrevMsg(filter string, wc bool, start uint64, smp *Stor
 
 // LoadPrevMsgMulti will find the previous message matching any entry in the sublist.
 func (fs *fileStore) LoadPrevMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *StoreMsg) (sm *StoreMsg, skip uint64, err error) {
+	for {
+		sm, skip, err = fs.loadPrevMsgMulti(sl, start, smp)
+		if handled, hydrateErr := fs.hydrateS3TierMiss(err); handled {
+			if hydrateErr != nil {
+				return nil, 0, hydrateErr
+			}
+			continue
+		}
+		return sm, skip, err
+	}
+}
+
+func (fs *fileStore) loadPrevMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *StoreMsg) (sm *StoreMsg, skip uint64, err error) {
 	if fs.isClosed() {
 		return nil, 0, ErrStoreClosed
 	}
@@ -10221,6 +10287,16 @@ func (fs *fileStore) State() StreamState {
 		state.NumDeleted = len(state.Deleted)
 	}
 	return state
+}
+
+// S3TierStats returns physical object-tier state without changing logical
+// JetStream retention accounting.
+func (fs *fileStore) S3TierStats() *S3TierStats {
+	if fs.tier == nil {
+		return nil
+	}
+	stats := fs.tier.statsSnapshot()
+	return &stats
 }
 
 func (fs *fileStore) Utilization() (total, reported uint64, err error) {

@@ -27,6 +27,7 @@ type testS3BlockStore struct {
 	objects        map[string][]byte
 	failPut        bool
 	failDescriptor bool
+	failManifest   bool
 	failGet        bool
 }
 
@@ -68,17 +69,28 @@ func (s *countingS3BlockStore) counts() (lists, descriptorGets, blockGets int) {
 	return s.lists, descriptorGets, blockGets
 }
 
+func (s *countingS3BlockStore) reset() {
+	s.mu.Lock()
+	s.gets = nil
+	s.lists = 0
+	s.mu.Unlock()
+}
+
 type blockingS3BlockStore struct {
 	*testS3BlockStore
-	mu       sync.Mutex
-	blocking bool
-	entered  chan struct{}
-	release  chan struct{}
+	mu        sync.Mutex
+	blocking  bool
+	blockGets int
+	entered   chan struct{}
+	release   chan struct{}
 }
 
 func (s *blockingS3BlockStore) Get(ctx context.Context, key string) ([]byte, error) {
 	s.mu.Lock()
 	blocking := s.blocking && strings.Contains(key, "/blocks/")
+	if strings.Contains(key, "/blocks/") {
+		s.blockGets++
+	}
 	s.mu.Unlock()
 	if blocking {
 		select {
@@ -94,10 +106,22 @@ func (s *blockingS3BlockStore) Get(ctx context.Context, key string) ([]byte, err
 	return s.testS3BlockStore.Get(ctx, key)
 }
 
+func (s *blockingS3BlockStore) resetBlockGets() {
+	s.mu.Lock()
+	s.blockGets = 0
+	s.mu.Unlock()
+}
+
+func (s *blockingS3BlockStore) blockGetCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.blockGets
+}
+
 func (s *testS3BlockStore) Put(_ context.Context, key string, buf []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.failPut || (s.failDescriptor && strings.Contains(key, "/descriptors/")) {
+	if s.failPut || (s.failDescriptor && strings.Contains(key, "/descriptors/")) || (s.failManifest && strings.Contains(key, "/manifests/")) {
 		return errors.New("injected PUT failure")
 	}
 	s.objects[key] = append([]byte(nil), buf...)
@@ -185,78 +209,173 @@ func TestFileStoreS3TierReplayAndRestart(t *testing.T) {
 	}
 }
 
-func TestS3TierWorkspaceCatalogBootstrapsIndexesWithoutMessageBlocks(t *testing.T) {
-	const (
-		channels          = 100
-		blocksPerChannel  = 10
-		sequencesPerBlock = 1000
-	)
-	workspacePrefix := "nodus/org-01/workspace-01"
+func TestFileStoreS3TierColdReadFetchesOnlySelectedBlock(t *testing.T) {
 	base := &testS3BlockStore{objects: make(map[string][]byte)}
 	store := &countingS3BlockStore{store: base}
-	var descriptorBytes int
-	for channelNumber := 0; channelNumber < channels; channelNumber++ {
-		channel := fmt.Sprintf("channel-%03d", channelNumber)
-		for blockNumber := 1; blockNumber <= blocksPerChannel; blockNumber++ {
-			first := uint64((blockNumber-1)*sequencesPerBlock + 1)
-			last := uint64(blockNumber * sequencesPerBlock)
-			objectKey := fmt.Sprintf("%s/%s/blocks/%010d-%064d.blk", workspacePrefix, channel, blockNumber, blockNumber)
-			descriptor := s3BlockDescriptor{Version: 1, Index: uint32(blockNumber), FirstSeq: first, LastSeq: last, Size: 1024 * 1024, SHA256: fmt.Sprintf("%064d", blockNumber), Key: objectKey}
-			buf, err := json.Marshal(descriptor)
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/selected-block")
+	defer fs.Stop()
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	store.reset()
+	msg, next, err := fs.LoadNextMsg(_EMPTY_, false, 1, nil)
+	if err != nil || msg.seq != 1 || next != 1 {
+		t.Fatalf("first message = (%v, %d, %v)", msg, next, err)
+	}
+	_, _, blockGets := store.counts()
+	if blockGets != 1 {
+		t.Fatalf("cold read fetched %d payload blocks, want 1", blockGets)
+	}
+}
+
+func TestFileStoreS3TierRestartDoesNotContactObjectStore(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), "test/offline-restart")
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.failGet = true
+	store.mu.Unlock()
+	fs, err := newFileStore(fcfg, cfg)
+	if err != nil {
+		t.Fatalf("restart while object store is unavailable: %v", err)
+	}
+	defer fs.Stop()
+	if state := fs.State(); state.Msgs != 100 || state.FirstSeq != 1 || state.LastSeq != 100 {
+		t.Fatalf("recovered state: %+v", state)
+	}
+}
+
+func TestFileStoreS3TierCoalescesConcurrentColdReads(t *testing.T) {
+	store := &blockingS3BlockStore{testS3BlockStore: &testS3BlockStore{objects: make(map[string][]byte)},
+		entered: make(chan struct{}, 1), release: make(chan struct{})}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/coalesced-read")
+	defer fs.Stop()
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	store.resetBlockGets()
+	store.mu.Lock()
+	store.blocking = true
+	store.mu.Unlock()
+	readDone := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := fs.LoadMsg(1, nil)
+			readDone <- err
+		}()
+	}
+	select {
+	case <-store.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cold read did not reach S3")
+	}
+	close(store.release)
+	for range 2 {
+		select {
+		case err := <-readDone:
 			if err != nil {
 				t.Fatal(err)
 			}
-			descriptorBytes += len(buf)
-			descriptorKey := fmt.Sprintf("%s/%s/descriptors/%010d.json", workspacePrefix, channel, blockNumber)
-			if err := base.Put(context.Background(), descriptorKey, buf); err != nil {
-				t.Fatal(err)
-			}
-			// The catalog list sees payload objects too, but must never GET one while bootstrapping indexes.
-			if err := base.Put(context.Background(), objectKey, []byte("payload")); err != nil {
-				t.Fatal(err)
-			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("cold reads did not complete")
 		}
 	}
-	catalog, err := LoadS3TierWorkspaceCatalog(context.Background(), store, workspacePrefix)
-	if err != nil {
+	if gets := store.blockGetCount(); gets != 1 {
+		t.Fatalf("payload GETs=%d, want 1", gets)
+	}
+}
+
+func TestFileStoreS3TierReclaimsHydratedCacheBeforeLocalBlocks(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/cache-bound")
+	defer fs.Stop()
+	fs.tier.stop()
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 32*1024, 16*1024
+	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(catalog.Channels()); got != channels {
-		t.Fatalf("channels=%d, want %d", got, channels)
-	}
-	if descriptorBytes >= 1<<20 {
-		t.Fatalf("descriptor index is unexpectedly large: %d bytes", descriptorBytes)
-	}
-	lists, descriptorGets, blockGets := store.counts()
-	if lists != 1 || descriptorGets != channels*blocksPerChannel || blockGets != 0 {
-		t.Fatalf("catalog I/O lists=%d descriptor GETs=%d block GETs=%d", lists, descriptorGets, blockGets)
-	}
-	blocks := catalog.BlocksForSequenceRange("channel-042", 1501, 4050)
-	if len(blocks) != 4 {
-		t.Fatalf("range blocks=%d, want 4", len(blocks))
-	}
-	for index, block := range blocks {
-		want := uint32(index + 2)
-		if block.Index != want {
-			t.Fatalf("block[%d].Index=%d, want %d", index, block.Index, want)
+	for _, seq := range []uint64{1, 20} {
+		if _, err := fs.LoadMsg(seq, nil); err != nil {
+			t.Fatalf("load %d: %v", seq, err)
 		}
 	}
-	if blocks := catalog.BlocksForSequenceRange("channel-042", 9001, 0); len(blocks) != 1 || blocks[0].Index != 10 {
-		t.Fatalf("tail lookup returned %#v", blocks)
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	if got := fs.tier.localBytes(); got > fs.tier.cfg.LocalLowBytes {
+		t.Fatalf("local cache bytes=%d, want <= %d", got, fs.tier.cfg.LocalLowBytes)
+	}
+}
+
+func TestFileStoreS3TierRejectsWritesWhenOffloadCannotRelievePressure(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/local-pressure")
+	defer fs.Stop()
+	fs.tier.stop()
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 32*1024, 16*1024
+	store.mu.Lock()
+	store.failPut = true
+	store.mu.Unlock()
+	if _, _, err := fs.StoreMsg("events", nil, []byte("blocked"), 0); !errors.Is(err, errS3TierLocalCapacity) {
+		t.Fatalf("write error = %v, want local capacity error", err)
+	}
+	store.mu.Lock()
+	store.failPut = false
+	store.mu.Unlock()
+	if _, _, err := fs.StoreMsg("events", nil, []byte("recovered"), 0); err != nil {
+		t.Fatalf("write after object store recovery: %v", err)
 	}
 }
 
 func TestFileStoreS3TierFailureKeepsLocalCopy(t *testing.T) {
 	for _, failDescriptor := range []bool{false, true} {
 		t.Run(fmt.Sprintf("descriptor=%v", failDescriptor), func(t *testing.T) {
-			store := &testS3BlockStore{objects: make(map[string][]byte), failPut: !failDescriptor, failDescriptor: failDescriptor}
+			store := &testS3BlockStore{objects: make(map[string][]byte)}
 			fs, fcfg, _ := testTieredFileStore(t, store, t.TempDir(), "test/stream")
 			defer fs.Stop()
+			fs.tier.stop()
+			fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 			for i := 0; i < 100; i++ {
 				if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
 					t.Fatal(err)
 				}
 			}
+			store.mu.Lock()
+			store.failPut, store.failDescriptor = !failDescriptor, failDescriptor
+			store.mu.Unlock()
+			fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = fcfg.S3Tier.LocalHighBytes, fcfg.S3Tier.LocalLowBytes
 			if err := fs.tier.evictToBudget(); err == nil {
 				t.Fatal("expected remote failure")
 			}
@@ -264,6 +383,87 @@ func TestFileStoreS3TierFailureKeepsLocalCopy(t *testing.T) {
 				t.Fatalf("local block lost after remote failure: %v", err)
 			}
 		})
+	}
+}
+
+func TestFileStoreS3TierManifestCommitFailureKeepsLocalCopy(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/manifest-failure")
+	defer fs.Stop()
+	fs.tier.stop()
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 32*1024, 16*1024
+	store.mu.Lock()
+	store.failManifest = true
+	store.mu.Unlock()
+	if err := fs.tier.evictToBudget(); err == nil {
+		t.Fatal("expected manifest commit failure")
+	}
+	if _, err := os.Stat(filepath.Join(fs.fcfg.StoreDir, msgDir, "1.blk")); err != nil {
+		t.Fatalf("local block lost after manifest failure: %v", err)
+	}
+}
+
+func TestFileStoreS3TierWritesImmutableManifest(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/manifest")
+	defer fs.Stop()
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	var latest s3TierManifest
+	for key, data := range store.objects {
+		if strings.Contains(key, "/manifests/") {
+			if err := json.Unmarshal(data, &latest); err != nil {
+				store.mu.Unlock()
+				t.Fatal(err)
+			}
+		}
+	}
+	store.mu.Unlock()
+	if latest.Version != 1 || latest.Generation == 0 || len(latest.Blocks) == 0 {
+		t.Fatalf("invalid manifest: %#v", latest)
+	}
+	for _, d := range latest.Blocks {
+		if !validS3BlockDescriptor(d) {
+			t.Fatalf("invalid manifest descriptor: %#v", d)
+		}
+	}
+}
+
+func TestFileStoreS3TierStatsTrackPhysicalTierActivity(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/stats")
+	defer fs.Stop()
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	before := fs.S3TierStats()
+	if before == nil || before.RemoteBlocks == 0 || before.RemoteBytes == 0 || before.Evictions == 0 || before.Uploads == 0 {
+		t.Fatalf("stats after offload: %#v", before)
+	}
+	if _, err := fs.LoadMsg(1, nil); err != nil {
+		t.Fatal(err)
+	}
+	after := fs.S3TierStats()
+	if after.Fetches != before.Fetches+1 || after.LocalBytes <= before.LocalBytes {
+		t.Fatalf("stats after cold read: before=%#v after=%#v", before, after)
 	}
 }
 
@@ -293,8 +493,13 @@ func TestFileStoreS3TierCorruptionAndMissingConfigFailClosed(t *testing.T) {
 	store.mu.Lock()
 	store.objects[firstRemote.Key][0] ^= 0xff
 	store.mu.Unlock()
-	if _, err := newFileStore(fcfg, cfg); err == nil {
-		t.Fatal("corrupt remote block accepted during recovery")
+	fs, err := newFileStore(fcfg, cfg)
+	if err != nil {
+		t.Fatalf("remote-only restart should not require S3: %v", err)
+	}
+	defer fs.Stop()
+	if _, err := fs.LoadMsg(1, nil); !errors.Is(err, errS3TierUnavailable) {
+		t.Fatalf("corrupt remote block read error = %v, want unavailable", err)
 	}
 }
 
