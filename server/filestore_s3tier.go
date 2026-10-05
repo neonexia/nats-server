@@ -35,7 +35,12 @@ type S3TierConfig struct {
 	BlockSize      uint64 // Optional experimental block size override.
 	LocalHighBytes uint64
 	LocalLowBytes  uint64
-	Timeout        time.Duration
+	// RemoteHighBytes and RemoteLowBytes control when sealed local blocks gain
+	// remote coverage. Zero values retain the original behavior of using the
+	// local watermarks for both policies.
+	RemoteHighBytes uint64
+	RemoteLowBytes  uint64
+	Timeout         time.Duration
 }
 
 // S3TierStats reports physical tier activity separately from the stream's
@@ -53,6 +58,8 @@ type S3TierStats struct {
 	CapacityErrors uint64 `json:"capacity_errors"`
 	HighWatermark  uint64 `json:"high_watermark"`
 	LowWatermark   uint64 `json:"low_watermark"`
+	RemoteHigh     uint64 `json:"remote_high_watermark"`
+	RemoteLow      uint64 `json:"remote_low_watermark"`
 }
 
 // S3TierObjectStore makes the block protocol testable with fault injection.
@@ -155,6 +162,9 @@ func newFileS3Tier(fs *fileStore, cfg S3TierConfig) *fileS3Tier {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 30 * time.Second
 	}
+	if cfg.RemoteHighBytes == 0 {
+		cfg.RemoteHighBytes, cfg.RemoteLowBytes = cfg.LocalHighBytes, cfg.LocalLowBytes
+	}
 	return &fileS3Tier{fs: fs, cfg: cfg, desc: make(map[uint32]s3BlockDescriptor), fetch: make(map[uint32]*s3TierFetch), wake: make(chan struct{}, 1), quit: make(chan struct{})}
 }
 
@@ -163,8 +173,9 @@ func validateS3Tier(fcfg FileStoreConfig, cfg StreamConfig) error {
 		return nil
 	}
 	t := fcfg.S3Tier
-	if t.Store == nil || strings.Trim(t.Prefix, "/") == "" || t.LocalLowBytes == 0 || t.LocalHighBytes <= t.LocalLowBytes {
-		return fmt.Errorf("S3 tier requires store, unique prefix, and high > low > 0 byte watermarks")
+	if t.Store == nil || strings.Trim(t.Prefix, "/") == "" || t.LocalLowBytes == 0 || t.LocalHighBytes <= t.LocalLowBytes ||
+		(t.RemoteHighBytes > 0 && t.RemoteHighBytes <= t.RemoteLowBytes) || (t.RemoteHighBytes == 0 && t.RemoteLowBytes != 0) {
+		return fmt.Errorf("S3 tier requires store, unique prefix, local high > low > 0, and valid remote coverage watermarks")
 	}
 	if cfg.Replicas > 1 || cfg.Retention != LimitsPolicy || cfg.Discard != DiscardNew || !cfg.DenyDelete || !cfg.DenyPurge ||
 		cfg.AllowRollup || cfg.AllowMsgTTL || cfg.MaxAge != 0 || cfg.MaxMsgs > 0 || cfg.MaxMsgsPer > 0 || cfg.Compression != NoCompression ||
@@ -386,14 +397,16 @@ func (t *fileS3Tier) fetchBlock(d s3BlockDescriptor, path string) error {
 	return nil
 }
 
-// evictToBudget copies sealed blocks, verifies the remote bytes, commits the
-// descriptor remotely and locally, then unlinks local payloads under block lock.
+// evictToBudget first gives old sealed blocks remote coverage, then separately
+// reclaims local copies only when the node-local budget requires it. The two
+// watermark pairs intentionally allow an online stream to overlap local and
+// remote copies for normal replay performance.
 func (t *fileS3Tier) evictToBudget() error {
 	t.runMu.Lock()
 	defer t.runMu.Unlock()
 	fs := t.fs
 	fs.mu.RLock()
-	var used uint64
+	var used, uncovered uint64
 	t.mu.Lock()
 	remote := make(map[uint32]struct{}, len(t.desc))
 	for index := range t.desc {
@@ -415,13 +428,45 @@ func (t *fileS3Tier) evictToBudget() error {
 				mb.mu.RUnlock()
 				_, isRemote := remote[mb.index]
 				candidates = append(candidates, candidate{mb: mb, remote: isRemote, last: last})
+				if !isRemote {
+					uncovered += uint64(info.Size())
+				}
 			}
 		}
 	}
 	fs.mu.RUnlock()
+	// Remote coverage is governed by its own threshold and does not evict a
+	// local copy. This is how a live channel can remain fast after S3 upload.
+	if uncovered > t.cfg.RemoteHighBytes {
+		for _, candidate := range candidates {
+			if uncovered <= t.cfg.RemoteLowBytes {
+				break
+			}
+			if candidate.remote {
+				continue
+			}
+			size, err := t.evictBlock(candidate.mb, false)
+			if err != nil {
+				return err
+			}
+			if size > uncovered {
+				uncovered = 0
+			} else {
+				uncovered -= size
+			}
+		}
+	}
 	if used <= t.cfg.LocalHighBytes {
 		return nil
 	}
+	// Coverage may have changed above. Refresh the candidate view before
+	// choosing local victims so newly uploaded blocks are preferred for
+	// reclamation over blocks that still lack a durable remote copy.
+	t.mu.Lock()
+	for i := range candidates {
+		_, candidates[i].remote = t.desc[candidates[i].mb.index]
+	}
+	t.mu.Unlock()
 	// Reclaim hydrated remote blocks first, least recently used. This keeps the
 	// local directory bounded as a cache before offloading additional hot data.
 	sort.SliceStable(candidates, func(i, j int) bool {
@@ -437,7 +482,7 @@ func (t *fileS3Tier) evictToBudget() error {
 		if used <= t.cfg.LocalLowBytes {
 			break
 		}
-		size, err := t.evictBlock(candidate.mb)
+		size, err := t.evictBlock(candidate.mb, true)
 		if err != nil {
 			return err
 		}
@@ -498,7 +543,9 @@ func (t *fileS3Tier) statsSnapshot() S3TierStats {
 	}
 }
 
-func (t *fileS3Tier) evictBlock(mb *msgBlock) (uint64, error) {
+// evictBlock uploads a sealed block when needed. reclaim determines whether
+// the local copy is removed after remote coverage is durably recorded.
+func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool) (uint64, error) {
 	fs := t.fs
 	t.mu.Lock()
 	_, alreadyRemote := t.desc[mb.index]
@@ -521,7 +568,10 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock) (uint64, error) {
 		return 0, err
 	}
 	if alreadyRemote {
-		return t.removeLocalBlock(mb, data, nil)
+		if reclaim {
+			return t.removeLocalBlock(mb, data, nil)
+		}
+		return uint64(len(data)), nil
 	}
 	d.SHA256 = checksumS3Block(data)
 	d.Key = fmt.Sprintf("%s/blocks/%010d-%s.blk", strings.Trim(t.cfg.Prefix, "/"), d.Index, d.SHA256)
@@ -566,7 +616,32 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock) (uint64, error) {
 		t.stats.uploadErrors.Add(1)
 		return 0, err
 	}
-	return t.removeLocalBlock(mb, data, &d)
+	if reclaim {
+		return t.removeLocalBlock(mb, data, &d)
+	}
+	if err := t.recordRemoteBlock(mb, data, d); err != nil {
+		return 0, err
+	}
+	return uint64(len(data)), nil
+}
+
+func (t *fileS3Tier) recordRemoteBlock(mb *msgBlock, expected []byte, d s3BlockDescriptor) error {
+	fs := t.fs
+	fs.mu.Lock()
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	defer fs.mu.Unlock()
+	if fs.closing || fs.lmb == mb || mb.pendingWriteSizeLocked() != 0 {
+		return nil
+	}
+	current, err := os.ReadFile(mb.mfn)
+	if err != nil || !bytes.Equal(current, expected) {
+		return fmt.Errorf("S3 tier block %d changed during upload: %w", mb.index, err)
+	}
+	t.mu.Lock()
+	t.desc[d.Index] = d
+	t.mu.Unlock()
+	return nil
 }
 
 func (t *fileS3Tier) removeLocalBlock(mb *msgBlock, expected []byte, descriptor *s3BlockDescriptor) (uint64, error) {

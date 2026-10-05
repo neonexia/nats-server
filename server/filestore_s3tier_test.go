@@ -333,6 +333,35 @@ func TestFileStoreS3TierReclaimsHydratedCacheBeforeLocalBlocks(t *testing.T) {
 	}
 }
 
+func TestFileStoreS3TierSeparatesRemoteCoverageFromLocalResidency(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/overlap")
+	defer fs.Stop()
+	fs.tier.stop()
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 256*1024, 128*1024
+	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 32*1024, 16*1024
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	fs.tier.mu.Lock()
+	covered := len(fs.tier.desc)
+	fs.tier.mu.Unlock()
+	if covered == 0 {
+		t.Fatal("expected sealed blocks to gain remote coverage")
+	}
+	if _, err := os.Stat(filepath.Join(fs.fcfg.StoreDir, msgDir, "1.blk")); err != nil {
+		t.Fatalf("covered block should remain local below residency budget: %v", err)
+	}
+	if got := fs.tier.localBytes(); got > fs.tier.cfg.LocalHighBytes {
+		t.Fatalf("local bytes=%d, want <= %d", got, fs.tier.cfg.LocalHighBytes)
+	}
+}
+
 func TestFileStoreS3TierRejectsWritesWhenOffloadCannotRelievePressure(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/local-pressure")
