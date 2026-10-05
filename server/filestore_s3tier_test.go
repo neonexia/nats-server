@@ -28,6 +28,7 @@ type testS3BlockStore struct {
 	failPut        bool
 	failDescriptor bool
 	failManifest   bool
+	failCheckpoint bool
 	failGet        bool
 }
 
@@ -38,8 +39,8 @@ type countingS3BlockStore struct {
 	lists int
 }
 
-func (s *countingS3BlockStore) Put(ctx context.Context, key string, buf []byte) error {
-	return s.store.Put(ctx, key, buf)
+func (s *countingS3BlockStore) PutIfAbsent(ctx context.Context, key string, buf []byte) (bool, error) {
+	return s.store.PutIfAbsent(ctx, key, buf)
 }
 
 func (s *countingS3BlockStore) Get(ctx context.Context, key string) ([]byte, error) {
@@ -121,11 +122,27 @@ func (s *blockingS3BlockStore) blockGetCount() int {
 func (s *testS3BlockStore) Put(_ context.Context, key string, buf []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.failPut || (s.failDescriptor && strings.Contains(key, "/descriptors/")) || (s.failManifest && strings.Contains(key, "/manifests/")) {
+	if s.failPut || (s.failDescriptor && strings.Contains(key, "/descriptors/")) || (s.failManifest && strings.Contains(key, "/manifests/")) || (s.failCheckpoint && strings.Contains(key, "/checkpoints/")) {
 		return errors.New("injected PUT failure")
 	}
 	s.objects[key] = append([]byte(nil), buf...)
 	return nil
+}
+
+func (s *testS3BlockStore) PutIfAbsent(ctx context.Context, key string, buf []byte) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.objects[key]; ok {
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if s.failPut || (s.failDescriptor && strings.Contains(key, "/descriptors/")) || (s.failManifest && strings.Contains(key, "/manifests/")) || (s.failCheckpoint && strings.Contains(key, "/checkpoints/")) {
+		return false, errors.New("injected PUT failure")
+	}
+	s.objects[key] = append([]byte(nil), buf...)
+	return true, nil
 }
 
 func (s *testS3BlockStore) Get(_ context.Context, key string) ([]byte, error) {
@@ -394,6 +411,115 @@ func TestFileStoreS3TierDrainSealsAndCoversTail(t *testing.T) {
 	}
 }
 
+func TestFileStoreS3TierDrainCreatesImmutableCheckpoint(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/checkpoint")
+	defer fs.Stop()
+	fs.tier.stop()
+	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1<<30, 1<<29
+	for i := 0; i < 10; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if drained, err := fs.DrainS3Tier(); err != nil || drained != 1 {
+		t.Fatalf("drain = (%d, %v), want (1, nil)", drained, err)
+	}
+	fs.tier.mu.Lock()
+	record := *fs.tier.record
+	checkpoint := *fs.tier.checkpoint
+	fs.tier.mu.Unlock()
+	if checkpoint.CoveredThrough != 10 || checkpoint.Incarnation != record.Incarnation {
+		t.Fatalf("checkpoint = %+v, record = %+v", checkpoint, record)
+	}
+	store.mu.Lock()
+	recordData := append([]byte(nil), store.objects[fs.tier.streamRecordKey()]...)
+	checkpointData := append([]byte(nil), store.objects[fs.tier.checkpointKey(10)]...)
+	manifestData := append([]byte(nil), store.objects[checkpoint.ManifestKey]...)
+	objectCount := len(store.objects)
+	store.mu.Unlock()
+	if checksumS3Block(manifestData) != checkpoint.ManifestSHA256 {
+		t.Fatal("checkpoint manifest digest does not match remote manifest")
+	}
+	var storedRecord s3TierStreamRecord
+	var storedCheckpoint s3TierCheckpoint
+	var manifest s3TierManifest
+	if err := json.Unmarshal(recordData, &storedRecord); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(checkpointData, &storedCheckpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if storedRecord.Incarnation != manifest.Incarnation || manifest.Version != 2 || storedCheckpoint.ManifestGeneration != manifest.Generation {
+		t.Fatalf("record=%+v checkpoint=%+v manifest=%+v", storedRecord, storedCheckpoint, manifest)
+	}
+	if drained, err := fs.DrainS3Tier(); err != nil || drained != 0 {
+		t.Fatalf("repeat drain = (%d, %v), want (0, nil)", drained, err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.objects) != objectCount {
+		t.Fatalf("repeat drain wrote %d objects, want %d", len(store.objects), objectCount)
+	}
+}
+
+func TestFileStoreS3TierDrainCheckpointFailurePreservesLocalPayload(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte), failCheckpoint: true}
+	fs, fcfg, _ := testTieredFileStore(t, store, t.TempDir(), "test/checkpoint-failure")
+	defer fs.Stop()
+	fs.tier.stop()
+	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1<<30, 1<<29
+	for i := 0; i < 10; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := fs.DrainS3Tier(); err == nil {
+		t.Fatal("expected checkpoint failure")
+	}
+	if _, err := os.Stat(filepath.Join(fcfg.StoreDir, msgDir, "1.blk")); err != nil {
+		t.Fatalf("checkpoint failure removed local payload: %v", err)
+	}
+	if _, err := os.Stat(fs.tier.checkpointFile()); !os.IsNotExist(err) {
+		t.Fatalf("checkpoint sidecar present after failed checkpoint: %v", err)
+	}
+	store.mu.Lock()
+	_, exists := store.objects[fs.tier.checkpointKey(10)]
+	store.mu.Unlock()
+	if exists {
+		t.Fatal("checkpoint object present after injected failure")
+	}
+}
+
+func TestFileStoreS3TierRejectsConflictingStreamRecord(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/record-conflict")
+	defer fs.Stop()
+	fs.tier.stop()
+	foreign := s3TierStreamRecord{Version: 1, Incarnation: "other", Prefix: "test/record-conflict", StreamName: "OTHER", Created: 1, ConfigSHA256: "other"}
+	data, err := json.Marshal(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.objects[fs.tier.streamRecordKey()] = data
+	if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.DrainS3Tier(); err == nil {
+		t.Fatal("expected stream record conflict")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for key := range store.objects {
+		if strings.Contains(key, "/blocks/") || strings.Contains(key, "/descriptors/") {
+			t.Fatalf("conflicting stream record allowed remote data write: %q", key)
+		}
+	}
+}
+
 func TestJetStreamS3TierDrainRemoteAPI(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	s := RunBasicJetStreamServer(t)
@@ -532,7 +658,7 @@ func TestFileStoreS3TierWritesImmutableManifest(t *testing.T) {
 		}
 	}
 	store.mu.Unlock()
-	if latest.Version != 1 || latest.Generation == 0 || len(latest.Blocks) == 0 {
+	if latest.Version != 2 || latest.Incarnation == "" || latest.Generation == 0 || len(latest.Blocks) == 0 {
 		t.Fatalf("invalid manifest: %#v", latest)
 	}
 	for _, d := range latest.Blocks {

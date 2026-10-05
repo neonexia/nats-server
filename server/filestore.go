@@ -5935,8 +5935,11 @@ func (fs *fileStore) DrainS3Tier() (uint64, error) {
 			fs.dirty++
 		}
 	}
+	// The sequence is captured after rolling the tail. Subsequent publishes use
+	// the new active block and therefore cannot change this recovery boundary.
+	coveredThrough := fs.state.LastSeq
 	fs.mu.Unlock()
-	return fs.tier.drain()
+	return fs.tier.drain(coveredThrough)
 }
 
 // Lock should be held.

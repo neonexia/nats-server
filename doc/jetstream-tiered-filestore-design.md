@@ -30,6 +30,100 @@ History serving remains outside this fork. A future service may consume the immu
 
 Remote coverage watermarks do not drain a quiet active block: it remains mutable and local-only until the next block roll. A lifecycle manager should call `DRAIN_REMOTE` when retiring a channel or when its own inactivity policy requires coverage of the tail. The operation creates a new empty local active block, so frequent use raises block-roll and manifest-write overhead.
 
+## Remote recovery foundation
+
+This implementation adds a recovery *boundary*, not snapshot or restore. A
+future restore implementation must be able to discover a complete immutable
+message set without relying on node-local descriptor sidecars. It must not
+infer a recoverable JetStream stream from block objects alone.
+
+### Immutable object layout
+
+```text
+{opaque-stream-prefix}/
+  stream-record.json
+  blocks/{index}-{sha256}.blk
+  descriptors/{index}.json
+  manifests/{generation}.json
+  checkpoints/{covered-through-sequence}.json
+```
+
+`stream-record.json` is conditionally created once. It records a random stream
+incarnation ID, the opaque prefix, stream name and creation time, the stream
+configuration digest, and the S3-tier format version. It prevents a later
+stream using the same human-readable name from being confused with an earlier
+stream incarnation.
+
+The object-store adapter exposes an explicit conditional-create operation. The
+MinIO adapter implements it with `If-None-Match: *`; every immutable write is
+then read back and compared byte-for-byte. A collision is acceptable only when
+the existing bytes match exactly. This prevents a retry, a second writer, or a
+prefix mistake from replacing a block, descriptor, manifest, or checkpoint.
+
+Descriptors and manifests bind to that incarnation. Manifests remain immutable
+complete descriptor sets. A checkpoint is written only by a successful remote
+drain after the active block is sealed and all sealed blocks through its
+`covered_through_sequence` are represented in a verified manifest. Its object
+key is the covered-through sequence, making repeated drains at the same
+boundary idempotent.
+
+Commit order for a drain is:
+
+```text
+stream record → sealed block bytes → descriptor → manifest → checkpoint
+```
+
+Each object is read back and checked before the next object is committed. The
+checkpoint is the durable statement that a future move or restore may use; an
+ordinary manifest created by background coverage is not such a statement.
+
+### Scope boundary
+
+A checkpoint reserves references for future stream metadata, consumer state,
+and encryption-key metadata, but this slice does not create or restore those
+artifacts. It deliberately does not upload raw `index.db`: that is an internal
+file-store implementation detail and omits consumer acknowledgement state.
+
+The normal same-disk restart path continues to use local sidecars and does not
+contact S3. A future disk-loss restore may list `checkpoints/`, select a valid
+checkpoint, read its manifest and descriptors, then combine them with an
+explicit future metadata checkpoint. Until that metadata format exists, a
+checkpoint proves message-block coverage only and cannot recreate a live
+JetStream stream.
+
+No checkpoint can include messages in a mutable active block after an
+unexpected disk loss. A planned move or archive obtains a bounded message set
+by calling `DRAIN_REMOTE`; zero-loss unplanned recovery requires a separate
+replication or synchronous-durability design.
+
+### Recovery modes and lifecycle decisions
+
+The foundation deliberately separates three recovery cases:
+
+| Case | Current behavior | Future use of this foundation |
+| --- | --- | --- |
+| Same node and disk restart | Local descriptor, stream-record, manifest, and checkpoint sidecars recover without contacting S3. | No restore flow is needed. |
+| Planned workspace move or retirement | `DRAIN_REMOTE` seals the current tail and creates a verified checkpoint while retaining local payloads. | A future exporter/restore protocol can select the checkpoint after it captures stream and consumer metadata. |
+| Disk loss or node loss | Not supported as a live-stream restore. An unflushed active tail can be absent remotely. | A future restore can list checkpoints and reconstruct message blocks after it has a compatible metadata and consumer-state format. |
+
+`DRAIN_REMOTE` is an external lifecycle operation, not normal retention. It
+does not reclaim local data. Nodus can use it before retiring a workspace, then
+release node-local resources while leaving remote objects for future history or
+audit work. Stream deletion currently must leave remote objects in place.
+
+Remote GC means only removal of safe protocol debris such as a payload written
+before its descriptor failed, or a manifest/checkpoint generation made
+unreachable by a future format. It must never be coupled to stream deletion or
+used to remove remotely covered workspace history. This slice implements no
+remote-object deletion.
+
+Snapshot and restore are separate future features. A JetStream snapshot is a
+point-in-time export sufficient to recreate a stream elsewhere; it must include
+stream configuration, stream state, consumer acknowledgement state, relevant
+key references, and the selected remote checkpoint. The current checkpoint is
+only the message-block part of that future export, so it cannot start live
+pub/sub on another node by itself.
+
 ## Target design and validation gates
 
 The sections below preserve the design target. Where they differ from the runnable spike, the observed-results and remaining-gaps sections above describe current behavior.

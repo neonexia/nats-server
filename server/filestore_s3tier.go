@@ -9,6 +9,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -60,12 +61,15 @@ type S3TierStats struct {
 	LowWatermark   uint64 `json:"low_watermark"`
 	RemoteHigh     uint64 `json:"remote_high_watermark"`
 	RemoteLow      uint64 `json:"remote_low_watermark"`
+	CheckpointSeq  uint64 `json:"checkpoint_sequence"`
 }
 
 // S3TierObjectStore makes the block protocol testable with fault injection.
 // Keys are relative to a bucket and must be treated as immutable once written.
 type S3TierObjectStore interface {
-	Put(context.Context, string, []byte) error
+	// PutIfAbsent creates an immutable object. A false result means the key
+	// already existed and the caller must verify it contains the same bytes.
+	PutIfAbsent(context.Context, string, []byte) (bool, error)
 	Get(context.Context, string) ([]byte, error)
 	List(context.Context, string) ([]string, error)
 }
@@ -94,6 +98,19 @@ func (s *S3TierMinIOStore) Put(ctx context.Context, key string, data []byte) err
 	return err
 }
 
+func (s *S3TierMinIOStore) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+	opts := minio.PutObjectOptions{}
+	opts.SetMatchETagExcept("*")
+	_, err := s.client.PutObject(ctx, s.bucket, key, bytes.NewReader(data), int64(len(data)), opts)
+	if err == nil {
+		return true, nil
+	}
+	if minio.ToErrorResponse(err).Code == "PreconditionFailed" {
+		return false, nil
+	}
+	return false, err
+}
+
 func (s *S3TierMinIOStore) Get(ctx context.Context, key string) ([]byte, error) {
 	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
 	if err != nil {
@@ -115,13 +132,14 @@ func (s *S3TierMinIOStore) List(ctx context.Context, prefix string) ([]string, e
 }
 
 type s3BlockDescriptor struct {
-	Version  uint8  `json:"version"`
-	Index    uint32 `json:"index"`
-	FirstSeq uint64 `json:"first_seq"`
-	LastSeq  uint64 `json:"last_seq"`
-	Size     int    `json:"size"`
-	SHA256   string `json:"sha256"`
-	Key      string `json:"key"`
+	Version     uint8  `json:"version"`
+	Index       uint32 `json:"index"`
+	FirstSeq    uint64 `json:"first_seq"`
+	LastSeq     uint64 `json:"last_seq"`
+	Size        int    `json:"size"`
+	SHA256      string `json:"sha256"`
+	Key         string `json:"key"`
+	Incarnation string `json:"incarnation,omitempty"`
 }
 
 // s3TierManifest is an immutable snapshot of committed block descriptors.
@@ -129,24 +147,51 @@ type s3BlockDescriptor struct {
 // each new generation receives a new object key so a partial update can never
 // replace an earlier complete view.
 type s3TierManifest struct {
-	Version    uint8               `json:"version"`
-	Generation uint64              `json:"generation"`
-	Prefix     string              `json:"prefix"`
-	Blocks     []s3BlockDescriptor `json:"blocks"`
+	Version     uint8               `json:"version"`
+	Generation  uint64              `json:"generation"`
+	Prefix      string              `json:"prefix"`
+	Incarnation string              `json:"incarnation,omitempty"`
+	Blocks      []s3BlockDescriptor `json:"blocks"`
+}
+
+// s3TierStreamRecord separates a stream incarnation from the caller supplied
+// prefix. The name can be reused, while an immutable record cannot be reused.
+type s3TierStreamRecord struct {
+	Version      uint8  `json:"version"`
+	Incarnation  string `json:"incarnation"`
+	Prefix       string `json:"prefix"`
+	StreamName   string `json:"stream_name"`
+	Created      int64  `json:"created"`
+	ConfigSHA256 string `json:"config_sha256"`
+}
+
+// s3TierCheckpoint is a message-block recovery boundary. Metadata references
+// are intentionally deferred until stream/consumer recovery has a format.
+type s3TierCheckpoint struct {
+	Version            uint8  `json:"version"`
+	Incarnation        string `json:"incarnation"`
+	ManifestGeneration uint64 `json:"manifest_generation"`
+	ManifestKey        string `json:"manifest_key"`
+	ManifestSHA256     string `json:"manifest_sha256"`
+	CoveredThrough     uint64 `json:"covered_through_sequence"`
+	ConfigSHA256       string `json:"config_sha256"`
 }
 
 type fileS3Tier struct {
-	fs    *fileStore
-	cfg   S3TierConfig
-	mu    sync.Mutex // Protects descriptors and in-flight fetches.
-	runMu sync.Mutex // One eviction pass at a time.
-	desc  map[uint32]s3BlockDescriptor
-	fetch map[uint32]*s3TierFetch
-	gen   uint64
-	stats s3TierCounters
-	wake  chan struct{}
-	quit  chan struct{}
-	once  sync.Once
+	fs             *fileStore
+	cfg            S3TierConfig
+	mu             sync.Mutex // Protects descriptors and in-flight fetches.
+	runMu          sync.Mutex // One eviction pass at a time.
+	desc           map[uint32]s3BlockDescriptor
+	fetch          map[uint32]*s3TierFetch
+	gen            uint64
+	manifestSHA256 string
+	record         *s3TierStreamRecord
+	checkpoint     *s3TierCheckpoint
+	stats          s3TierCounters
+	wake           chan struct{}
+	quit           chan struct{}
+	once           sync.Once
 }
 
 type s3TierCounters struct {
@@ -206,6 +251,22 @@ func (t *fileS3Tier) manifestFile() string {
 	return filepath.Join(t.fs.fcfg.StoreDir, msgDir, "s3-tier.manifest.json")
 }
 
+func (t *fileS3Tier) streamRecordKey() string {
+	return fmt.Sprintf("%s/stream-record.json", strings.Trim(t.cfg.Prefix, "/"))
+}
+
+func (t *fileS3Tier) streamRecordFile() string {
+	return filepath.Join(t.fs.fcfg.StoreDir, msgDir, "s3-tier.stream.json")
+}
+
+func (t *fileS3Tier) checkpointKey(sequence uint64) string {
+	return fmt.Sprintf("%s/checkpoints/%020d.json", strings.Trim(t.cfg.Prefix, "/"), sequence)
+}
+
+func (t *fileS3Tier) checkpointFile() string {
+	return filepath.Join(t.fs.fcfg.StoreDir, msgDir, "s3-tier.checkpoint.json")
+}
+
 // prepareS3Tier runs before the normal file-store recovery. Descriptor sidecars
 // are durable local evidence that a missing payload belongs to the remote tier.
 // Startup must not list or fetch S3 objects: that would turn an object-store
@@ -219,6 +280,7 @@ func (fs *fileStore) prepareS3Tier() error {
 		return nil
 	}
 	t := fs.tier
+	var manifestIncarnation string
 	if buf, err := os.ReadFile(marker); err == nil {
 		if string(buf) != strings.Trim(t.cfg.Prefix, "/") {
 			return fmt.Errorf("S3 tier prefix changed for existing store")
@@ -230,10 +292,39 @@ func (fs *fileStore) prepareS3Tier() error {
 	}
 	if buf, err := os.ReadFile(t.manifestFile()); err == nil {
 		var manifest s3TierManifest
-		if err := json.Unmarshal(buf, &manifest); err != nil || manifest.Version != 1 || manifest.Generation == 0 || manifest.Prefix != strings.Trim(t.cfg.Prefix, "/") {
+		if err := json.Unmarshal(buf, &manifest); err != nil || (manifest.Version != 1 && manifest.Version != 2) || manifest.Generation == 0 || manifest.Prefix != strings.Trim(t.cfg.Prefix, "/") {
 			return fmt.Errorf("invalid local S3 tier manifest: %v", err)
 		}
 		t.gen = manifest.Generation
+		t.manifestSHA256 = checksumS3Block(buf)
+		manifestIncarnation = manifest.Incarnation
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if buf, err := os.ReadFile(t.streamRecordFile()); err == nil {
+		var record s3TierStreamRecord
+		if err := json.Unmarshal(buf, &record); err != nil || !t.validStreamRecord(&record) {
+			return fmt.Errorf("invalid local S3 tier stream record: %v", err)
+		}
+		t.record = &record
+		if manifestIncarnation != "" && manifestIncarnation != record.Incarnation {
+			return errors.New("local S3 tier manifest and stream record disagree")
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if manifestIncarnation != "" && t.record == nil {
+		return errors.New("local S3 tier manifest has no stream record")
+	}
+	if buf, err := os.ReadFile(t.checkpointFile()); err == nil {
+		var checkpoint s3TierCheckpoint
+		if err := json.Unmarshal(buf, &checkpoint); err != nil || !t.validCheckpoint(&checkpoint) {
+			return fmt.Errorf("invalid local S3 tier checkpoint: %v", err)
+		}
+		t.checkpoint = &checkpoint
+		if t.record != nil && checkpoint.Incarnation != t.record.Incarnation {
+			return errors.New("local S3 tier checkpoint and stream record disagree")
+		}
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -264,27 +355,39 @@ func (fs *fileStore) prepareS3Tier() error {
 }
 
 func validS3BlockDescriptor(d s3BlockDescriptor) bool {
-	return d.Version == 1 && d.Index != 0 && d.FirstSeq != 0 && d.LastSeq >= d.FirstSeq && d.Size > 0 && d.SHA256 != "" && d.Key != ""
+	return (d.Version == 1 || d.Version == 2) &&
+		d.Index != 0 && d.FirstSeq != 0 && d.LastSeq >= d.FirstSeq && d.Size > 0 &&
+		d.SHA256 != "" && d.Key != "" && (d.Version == 1 || d.Incarnation != "")
 }
 
-func (t *fileS3Tier) commitManifest(d s3BlockDescriptor) error {
-	t.mu.Lock()
-	blocks := make([]s3BlockDescriptor, 0, len(t.desc)+1)
-	for _, current := range t.desc {
-		blocks = append(blocks, current)
-	}
-	blocks = append(blocks, d)
-	generation := t.gen + 1
-	t.mu.Unlock()
-	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Index < blocks[j].Index })
-	manifest := s3TierManifest{Version: 1, Generation: generation, Prefix: strings.Trim(t.cfg.Prefix, "/"), Blocks: blocks}
-	buf, err := json.Marshal(manifest)
+func (t *fileS3Tier) configSHA256() (string, error) {
+	buf, err := json.Marshal(t.fs.cfg.StreamConfig)
 	if err != nil {
-		return err
+		return "", err
 	}
-	key := t.manifestKey(generation)
+	return checksumS3Block(buf), nil
+}
+
+func (t *fileS3Tier) validStreamRecord(record *s3TierStreamRecord) bool {
+	if record == nil || record.Version != 1 || record.Incarnation == "" || record.Prefix != strings.Trim(t.cfg.Prefix, "/") || record.StreamName != t.fs.cfg.Name {
+		return false
+	}
+	digest, err := t.configSHA256()
+	return err == nil && record.ConfigSHA256 == digest
+}
+
+func (t *fileS3Tier) validCheckpoint(checkpoint *s3TierCheckpoint) bool {
+	if checkpoint == nil || checkpoint.Version != 1 || checkpoint.Incarnation == "" || checkpoint.ManifestGeneration == 0 || checkpoint.ManifestKey == "" || checkpoint.ManifestSHA256 == "" || checkpoint.CoveredThrough == 0 {
+		return false
+	}
+	digest, err := t.configSHA256()
+	return err == nil && checkpoint.ConfigSHA256 == digest &&
+		checkpoint.ManifestKey == t.manifestKey(checkpoint.ManifestGeneration)
+}
+
+func (t *fileS3Tier) putImmutable(key string, data []byte) error {
 	ctx, cancel := t.ctx()
-	err = t.cfg.Store.Put(ctx, key, buf)
+	_, err := t.cfg.Store.PutIfAbsent(ctx, key, data)
 	cancel()
 	if err != nil {
 		return err
@@ -292,7 +395,85 @@ func (t *fileS3Tier) commitManifest(d s3BlockDescriptor) error {
 	ctx, cancel = t.ctx()
 	committed, err := t.cfg.Store.Get(ctx, key)
 	cancel()
-	if err != nil || !bytes.Equal(committed, buf) {
+	if err != nil || !bytes.Equal(committed, data) {
+		return fmt.Errorf("S3 tier immutable object verification failed for %q: %w", key, err)
+	}
+	return nil
+}
+
+func (t *fileS3Tier) ensureStreamRecord() (*s3TierStreamRecord, error) {
+	t.mu.Lock()
+	if t.record != nil {
+		record := *t.record
+		t.mu.Unlock()
+		return &record, nil
+	}
+	t.mu.Unlock()
+	digest, err := t.configSHA256()
+	if err != nil {
+		return nil, err
+	}
+	incarnation := make([]byte, 16)
+	if _, err := rand.Read(incarnation); err != nil {
+		return nil, err
+	}
+	record := &s3TierStreamRecord{Version: 1, Incarnation: hex.EncodeToString(incarnation), Prefix: strings.Trim(t.cfg.Prefix, "/"), StreamName: t.fs.cfg.Name, Created: t.fs.cfg.Created.UnixNano(), ConfigSHA256: digest}
+	buf, err := json.Marshal(record)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := t.ctx()
+	created, err := t.cfg.Store.PutIfAbsent(ctx, t.streamRecordKey(), buf)
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	if !created {
+		ctx, cancel = t.ctx()
+		buf, err = t.cfg.Store.Get(ctx, t.streamRecordKey())
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(buf, record); err != nil || !t.validStreamRecord(record) {
+			return nil, fmt.Errorf("S3 tier stream record conflicts with local stream")
+		}
+	}
+	if err := writeAtomically(t.fs.dios, t.streamRecordFile(), buf, defaultFilePerms, true); err != nil {
+		return nil, err
+	}
+	t.mu.Lock()
+	if t.record == nil {
+		t.record = record
+	}
+	result := *t.record
+	t.mu.Unlock()
+	return &result, nil
+}
+
+func (t *fileS3Tier) commitManifest(add *s3BlockDescriptor) error {
+	record, err := t.ensureStreamRecord()
+	if err != nil {
+		return err
+	}
+	t.mu.Lock()
+	blocks := make([]s3BlockDescriptor, 0, len(t.desc)+1)
+	for _, current := range t.desc {
+		blocks = append(blocks, current)
+	}
+	if add != nil {
+		blocks = append(blocks, *add)
+	}
+	generation := t.gen + 1
+	t.mu.Unlock()
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Index < blocks[j].Index })
+	manifest := s3TierManifest{Version: 2, Generation: generation, Prefix: strings.Trim(t.cfg.Prefix, "/"), Incarnation: record.Incarnation, Blocks: blocks}
+	buf, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	key := t.manifestKey(generation)
+	if err := t.putImmutable(key, buf); err != nil {
 		return fmt.Errorf("S3 tier manifest verification failed for generation %d: %w", generation, err)
 	}
 	if err := writeAtomically(t.fs.dios, t.manifestFile(), buf, defaultFilePerms, true); err != nil {
@@ -300,6 +481,67 @@ func (t *fileS3Tier) commitManifest(d s3BlockDescriptor) error {
 	}
 	t.mu.Lock()
 	t.gen = generation
+	t.manifestSHA256 = checksumS3Block(buf)
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *fileS3Tier) findCheckpoint(sequence uint64) (*s3TierCheckpoint, error) {
+	ctx, cancel := t.ctx()
+	keys, err := t.cfg.Store.List(ctx, t.checkpointKey(sequence))
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	key := t.checkpointKey(sequence)
+	found := false
+	for _, candidate := range keys {
+		if candidate == key {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, nil
+	}
+	ctx, cancel = t.ctx()
+	buf, err := t.cfg.Store.Get(ctx, key)
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	var checkpoint s3TierCheckpoint
+	if err := json.Unmarshal(buf, &checkpoint); err != nil || !t.validCheckpoint(&checkpoint) || checkpoint.CoveredThrough != sequence {
+		return nil, fmt.Errorf("invalid remote S3 tier checkpoint at sequence %d", sequence)
+	}
+	return &checkpoint, nil
+}
+
+func (t *fileS3Tier) commitCheckpoint(sequence uint64) error {
+	t.mu.Lock()
+	if t.checkpoint != nil && t.checkpoint.CoveredThrough == sequence {
+		t.mu.Unlock()
+		return nil
+	}
+	record := t.record
+	generation, manifestSHA256 := t.gen, t.manifestSHA256
+	t.mu.Unlock()
+	if record == nil || generation == 0 || manifestSHA256 == "" {
+		return errors.New("S3 tier checkpoint has no committed manifest")
+	}
+	checkpoint := &s3TierCheckpoint{Version: 1, Incarnation: record.Incarnation, ManifestGeneration: generation, ManifestKey: t.manifestKey(generation), ManifestSHA256: manifestSHA256, CoveredThrough: sequence, ConfigSHA256: record.ConfigSHA256}
+	buf, err := json.Marshal(checkpoint)
+	if err != nil {
+		return err
+	}
+	if err := t.putImmutable(t.checkpointKey(sequence), buf); err != nil {
+		return fmt.Errorf("S3 tier checkpoint verification failed at sequence %d: %w", sequence, err)
+	}
+	if err := writeAtomically(t.fs.dios, t.checkpointFile(), buf, defaultFilePerms, true); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	t.checkpoint = checkpoint
 	t.mu.Unlock()
 	return nil
 }
@@ -498,7 +740,8 @@ func (t *fileS3Tier) evictToBudget() error {
 // drain seals the active block before it is called, then ensures every local
 // sealed block has a verified remote descriptor. It intentionally preserves
 // local payloads; lifecycle code decides whether to reclaim them later.
-func (t *fileS3Tier) drain() (uint64, error) {
+// A checkpoint is only committed after this exact coverage boundary exists.
+func (t *fileS3Tier) drain(coveredThrough uint64) (uint64, error) {
 	t.runMu.Lock()
 	defer t.runMu.Unlock()
 	fs := t.fs
@@ -510,6 +753,37 @@ func (t *fileS3Tier) drain() (uint64, error) {
 		}
 	}
 	fs.mu.RUnlock()
+	if len(candidates) == 0 || coveredThrough == 0 {
+		return 0, nil
+	}
+	if _, err := t.ensureStreamRecord(); err != nil {
+		return 0, err
+	}
+	t.mu.Lock()
+	localCheckpoint := t.checkpoint != nil && t.checkpoint.CoveredThrough == coveredThrough
+	t.mu.Unlock()
+	if localCheckpoint {
+		return 0, nil
+	}
+	if checkpoint, err := t.findCheckpoint(coveredThrough); err != nil {
+		return 0, err
+	} else if checkpoint != nil {
+		record, err := t.ensureStreamRecord()
+		if err != nil || checkpoint.Incarnation != record.Incarnation {
+			return 0, fmt.Errorf("S3 tier checkpoint conflicts with stream record")
+		}
+		buf, err := json.Marshal(checkpoint)
+		if err != nil {
+			return 0, err
+		}
+		if err := writeAtomically(t.fs.dios, t.checkpointFile(), buf, defaultFilePerms, true); err != nil {
+			return 0, err
+		}
+		t.mu.Lock()
+		t.checkpoint = checkpoint
+		t.mu.Unlock()
+		return 0, nil
+	}
 	var drained uint64
 	for _, mb := range candidates {
 		t.mu.Lock()
@@ -522,6 +796,14 @@ func (t *fileS3Tier) drain() (uint64, error) {
 			return drained, err
 		}
 		drained++
+	}
+	// Always write a fresh v2 manifest before a new checkpoint. It binds every
+	// descriptor, including any pre-foundation descriptors, to this record.
+	if err := t.commitManifest(nil); err != nil {
+		return drained, err
+	}
+	if err := t.commitCheckpoint(coveredThrough); err != nil {
+		return drained, err
 	}
 	return drained, nil
 }
@@ -565,12 +847,17 @@ func (t *fileS3Tier) statsSnapshot() S3TierStats {
 		remoteBytes += uint64(d.Size)
 	}
 	remoteBlocks := uint64(len(t.desc))
+	var checkpointSeq uint64
+	if t.checkpoint != nil {
+		checkpointSeq = t.checkpoint.CoveredThrough
+	}
 	t.mu.Unlock()
 	return S3TierStats{
 		LocalBytes: t.localBytes(), RemoteBytes: remoteBytes, RemoteBlocks: remoteBlocks,
 		Fetches: t.stats.fetches.Load(), FetchErrors: t.stats.fetchErrors.Load(), CacheHits: t.stats.cacheHits.Load(),
 		Uploads: t.stats.uploads.Load(), UploadErrors: t.stats.uploadErrors.Load(), Evictions: t.stats.evictions.Load(),
 		CapacityErrors: t.stats.capacityErrors.Load(), HighWatermark: t.cfg.LocalHighBytes, LowWatermark: t.cfg.LocalLowBytes,
+		RemoteHigh: t.cfg.RemoteHighBytes, RemoteLow: t.cfg.RemoteLowBytes, CheckpointSeq: checkpointSeq,
 	}
 }
 
@@ -589,7 +876,7 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool) (uint64, error) {
 		return 0, nil
 	}
 	data, err := os.ReadFile(mb.mfn)
-	d := s3BlockDescriptor{Version: 1, Index: mb.index, FirstSeq: mb.first.seq, LastSeq: mb.last.seq, Size: len(data)}
+	d := s3BlockDescriptor{Version: 2, Index: mb.index, FirstSeq: mb.first.seq, LastSeq: mb.last.seq, Size: len(data)}
 	mb.mu.RUnlock()
 	fs.mu.RUnlock()
 	if err != nil {
@@ -604,42 +891,27 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool) (uint64, error) {
 		}
 		return uint64(len(data)), nil
 	}
+	record, err := t.ensureStreamRecord()
+	if err != nil {
+		return 0, err
+	}
+	d.Incarnation = record.Incarnation
 	d.SHA256 = checksumS3Block(data)
 	d.Key = fmt.Sprintf("%s/blocks/%010d-%s.blk", strings.Trim(t.cfg.Prefix, "/"), d.Index, d.SHA256)
 	t.stats.uploads.Add(1)
-	ctx, cancel := t.ctx()
-	err = t.cfg.Store.Put(ctx, d.Key, data)
-	cancel()
-	if err != nil {
+	if err := t.putImmutable(d.Key, data); err != nil {
 		t.stats.uploadErrors.Add(1)
 		return 0, err
-	}
-	ctx, cancel = t.ctx()
-	verified, err := t.cfg.Store.Get(ctx, d.Key)
-	cancel()
-	if err != nil || !bytes.Equal(verified, data) {
-		t.stats.uploadErrors.Add(1)
-		return 0, fmt.Errorf("S3 tier upload verification failed for block %d: %w", d.Index, err)
 	}
 	buf, err := json.Marshal(d)
 	if err != nil {
 		return 0, err
 	}
-	ctx, cancel = t.ctx()
-	err = t.cfg.Store.Put(ctx, t.descriptorKey(d.Index), buf)
-	cancel()
-	if err != nil {
+	if err := t.putImmutable(t.descriptorKey(d.Index), buf); err != nil {
 		t.stats.uploadErrors.Add(1)
 		return 0, err
 	}
-	ctx, cancel = t.ctx()
-	committed, err := t.cfg.Store.Get(ctx, t.descriptorKey(d.Index))
-	cancel()
-	if err != nil || !bytes.Equal(committed, buf) {
-		t.stats.uploadErrors.Add(1)
-		return 0, fmt.Errorf("S3 tier descriptor verification failed for block %d: %w", d.Index, err)
-	}
-	if err := t.commitManifest(d); err != nil {
+	if err := t.commitManifest(&d); err != nil {
 		t.stats.uploadErrors.Add(1)
 		return 0, err
 	}
