@@ -495,6 +495,37 @@ func (t *fileS3Tier) evictToBudget() error {
 	return nil
 }
 
+// drain seals the active block before it is called, then ensures every local
+// sealed block has a verified remote descriptor. It intentionally preserves
+// local payloads; lifecycle code decides whether to reclaim them later.
+func (t *fileS3Tier) drain() (uint64, error) {
+	t.runMu.Lock()
+	defer t.runMu.Unlock()
+	fs := t.fs
+	fs.mu.RLock()
+	candidates := make([]*msgBlock, 0, len(fs.blks))
+	for _, mb := range fs.blks {
+		if mb != fs.lmb {
+			candidates = append(candidates, mb)
+		}
+	}
+	fs.mu.RUnlock()
+	var drained uint64
+	for _, mb := range candidates {
+		t.mu.Lock()
+		_, covered := t.desc[mb.index]
+		t.mu.Unlock()
+		if covered {
+			continue
+		}
+		if _, err := t.evictBlock(mb, false); err != nil {
+			return drained, err
+		}
+		drained++
+	}
+	return drained, nil
+}
+
 // ensureLocalCapacity is invoked before accepting another publish after a
 // previous asynchronous eviction could not reclaim enough local space. It
 // deliberately returns a transient error instead of poisoning fs.werr: S3 can
@@ -684,6 +715,8 @@ func (t *fileS3Tier) removeLocalBlock(mb *msgBlock, expected []byte, descriptor 
 var errS3TierMutation = errors.New("experimental S3 tier does not support deletion or rewrite")
 var errS3TierUnavailable = errors.New("S3 tier storage unavailable")
 var errS3TierLocalCapacity = errors.New("S3 tier local capacity exceeded")
+var errS3TierNotEnabled = errors.New("S3 tier is not enabled for this stream")
+var errS3TierClusteredDrain = errors.New("S3 tier remote drain does not support clustered streams")
 
 // errS3TierBlockNotHydrated crosses the local read path without doing network
 // I/O under file-store or block locks. Its caller hydrates precisely this block

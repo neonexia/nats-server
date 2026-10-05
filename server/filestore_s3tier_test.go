@@ -362,6 +362,77 @@ func TestFileStoreS3TierSeparatesRemoteCoverageFromLocalResidency(t *testing.T) 
 	}
 }
 
+func TestFileStoreS3TierDrainSealsAndCoversTail(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/drain")
+	defer fs.Stop()
+	fs.tier.stop()
+	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1<<30, 1<<29
+	for i := 0; i < 10; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	drained, err := fs.DrainS3Tier()
+	if err != nil || drained != 1 {
+		t.Fatalf("drain = (%d, %v), want (1, nil)", drained, err)
+	}
+	fs.tier.mu.Lock()
+	_, covered := fs.tier.desc[1]
+	fs.tier.mu.Unlock()
+	if !covered {
+		t.Fatal("sealed tail block lacks remote coverage")
+	}
+	if fs.lmb.index != 2 {
+		t.Fatalf("active block index=%d, want 2", fs.lmb.index)
+	}
+	if _, err := os.Stat(filepath.Join(fs.fcfg.StoreDir, msgDir, "1.blk")); err != nil {
+		t.Fatalf("drain should preserve local payload: %v", err)
+	}
+	if drained, err := fs.DrainS3Tier(); err != nil || drained != 0 {
+		t.Fatalf("second drain = (%d, %v), want (0, nil)", drained, err)
+	}
+}
+
+func TestJetStreamS3TierDrainRemoteAPI(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	cfg := &StreamConfig{Name: "DRAIN", Subjects: []string{"drain.events"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	fcfg := &FileStoreConfig{BlockSize: 16 * 1024, S3Tier: &S3TierConfig{
+		Store: store, Prefix: "test/drain-api", LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29,
+		RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
+	}}
+	mset, err := s.GlobalAccount().addStreamWithStore(cfg, fcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+	for i := 0; i < 10; i++ {
+		sendStreamMsg(t, nc, "drain.events", strings.Repeat("x", 1000))
+	}
+	response, err := nc.Request(fmt.Sprintf(JSApiStreamDrainRemoteT, "DRAIN"), nil, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp JSApiStreamDrainRemoteResponse
+	if err := json.Unmarshal(response.Data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error != nil || !resp.Success || resp.Drained != 1 {
+		t.Fatalf("drain API response: %+v", resp)
+	}
+	fs := mset.store.(*fileStore)
+	fs.tier.mu.Lock()
+	_, covered := fs.tier.desc[1]
+	fs.tier.mu.Unlock()
+	if !covered {
+		t.Fatal("drain API did not cover sealed tail")
+	}
+}
+
 func TestFileStoreS3TierRejectsWritesWhenOffloadCannotRelievePressure(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/local-pressure")

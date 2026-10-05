@@ -5905,6 +5905,40 @@ func (fs *fileStore) FlushAllPending() error {
 	return fs.checkAndFlushLastBlock()
 }
 
+// DrainS3Tier seals the current write block and waits until every sealed block
+// has remote coverage. It does not alter the local residency policy or remove
+// local payloads, so an external lifecycle manager can drain a retired stream
+// without degrading an active stream's hot read path.
+func (fs *fileStore) DrainS3Tier() (uint64, error) {
+	if fs.tier == nil {
+		return 0, errS3TierNotEnabled
+	}
+	fs.mu.Lock()
+	if fs.isClosed() {
+		fs.mu.Unlock()
+		return 0, ErrStoreClosed
+	}
+	if fs.werr != nil {
+		err := fs.werr
+		fs.mu.Unlock()
+		return 0, err
+	}
+	if fs.lmb != nil {
+		fs.lmb.mu.RLock()
+		hasMessages := fs.lmb.msgs > 0
+		fs.lmb.mu.RUnlock()
+		if hasMessages {
+			if _, err := fs.newMsgBlockForWrite(); err != nil {
+				fs.mu.Unlock()
+				return 0, err
+			}
+			fs.dirty++
+		}
+	}
+	fs.mu.Unlock()
+	return fs.tier.drain()
+}
+
 // Lock should be held.
 func (fs *fileStore) rebuildFirst() error {
 	if len(fs.blks) == 0 {

@@ -80,6 +80,11 @@ const (
 	JSApiStreamPurge  = "$JS.API.STREAM.PURGE.*"
 	JSApiStreamPurgeT = "$JS.API.STREAM.PURGE.%s"
 
+	// JSApiStreamDrainRemote seals and remotely covers an experimental S3-tiered stream.
+	// Will return JSON response.
+	JSApiStreamDrainRemote  = "$JS.API.STREAM.DRAIN_REMOTE.*"
+	JSApiStreamDrainRemoteT = "$JS.API.STREAM.DRAIN_REMOTE.%s"
+
 	// JSApiStreamSnapshot is the endpoint to snapshot streams.
 	// Will return a stream of chunks with a nil chunk as EOF to
 	// the deliver subject. Caller should respond to each chunk
@@ -568,6 +573,15 @@ type JSApiStreamPurgeResponse struct {
 }
 
 const JSApiStreamPurgeResponseType = "io.nats.jetstream.api.v1.stream_purge_response"
+
+// JSApiStreamDrainRemoteResponse reports synchronous remote coverage work.
+type JSApiStreamDrainRemoteResponse struct {
+	ApiResponse
+	Success bool   `json:"success,omitempty"`
+	Drained uint64 `json:"drained"`
+}
+
+const JSApiStreamDrainRemoteResponseType = "io.nats.jetstream.api.v1.stream_drain_remote_response"
 
 type JSApiConsumerUnpinRequest struct {
 	Group string `json:"group"`
@@ -1132,6 +1146,7 @@ func (s *Server) setJetStreamExportSubs() error {
 		{JSApiStreamUpdate, s.jsStreamUpdateRequest},
 		{JSApiStreamDelete, s.jsStreamDeleteRequest},
 		{JSApiStreamPurge, s.jsStreamPurgeRequest},
+		{JSApiStreamDrainRemote, s.jsStreamDrainRemoteRequest},
 		{JSApiStreamSnapshot, s.jsStreamSnapshotRequest},
 		{JSApiStreamRestore, s.jsStreamRestoreRequest},
 		{JSApiStreamRemovePeer, s.jsStreamRemovePeerRequest},
@@ -3744,6 +3759,11 @@ func (s *Server) jsStreamDeleteRequest(sub *subscription, c *client, _ *Account,
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	if s.JetStreamIsClustered() {
+		resp.Error = NewJSStreamGeneralError(errS3TierClusteredDrain, Unless(errS3TierClusteredDrain))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 	stream := streamNameFromSubject(subject)
 
 	// Clustered.
@@ -4322,6 +4342,52 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, _ *Account, 
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 	} else {
 		resp.Purged = purged
+		resp.Success = true
+	}
+	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
+}
+
+// jsStreamDrainRemoteRequest seals the mutable tail, then waits for immutable
+// remote coverage. Normal JetStream API subject permissions authorize the
+// caller; S3 credentials are never exposed through this endpoint.
+func (s *Server) jsStreamDrainRemoteRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	if c == nil || !s.JetStreamEnabled() {
+		return
+	}
+	ci, acc, hdr, msg, err := s.getRequestInfo(c, rmsg)
+	if err != nil {
+		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+	resp := JSApiStreamDrainRemoteResponse{ApiResponse: ApiResponse{Type: JSApiStreamDrainRemoteResponseType}}
+	if errorOnRequiredApiLevel(hdr) {
+		resp.Error = NewJSRequiredApiLevelError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if hasJS, doErr := acc.checkJetStream(); !hasJS {
+		if doErr {
+			resp.Error = NewJSNotEnabledForAccountError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+	stream := streamNameFromSubject(subject)
+	mset, err := acc.lookupStream(stream)
+	if err != nil {
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	drain, ok := mset.store.(interface{ DrainS3Tier() (uint64, error) })
+	if !ok {
+		resp.Error = NewJSStreamGeneralError(errS3TierNotEnabled, Unless(errS3TierNotEnabled))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if resp.Drained, err = drain.DrainS3Tier(); err != nil {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+	} else {
 		resp.Success = true
 	}
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
