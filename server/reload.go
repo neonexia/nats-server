@@ -1589,6 +1589,8 @@ func imposeOrder(value any) error {
 		*URLAccResolver, *MemAccResolver, *DirAccResolver, *CacheDirAccResolver, Authentication, MQTTOpts, jwt.TagList,
 		*OCSPConfig, map[string]string, map[string]bool, JSLimitOpts, StoreCipher, *OCSPResponseCacheConfig, *ProxiesConfig, WriteTimeoutPolicy:
 		// explicitly skipped types
+	case map[string]*S3TierConfig:
+		// Programmatic tier mappings are a test seam, not reloadable configuration.
 	case *AuthCallout:
 	case JSTpmOpts:
 	default:

@@ -3759,11 +3759,6 @@ func (s *Server) jsStreamDeleteRequest(sub *subscription, c *client, _ *Account,
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
-	if s.JetStreamIsClustered() {
-		resp.Error = NewJSStreamGeneralError(errS3TierClusteredDrain, Unless(errS3TierClusteredDrain))
-		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
-		return
-	}
 	stream := streamNameFromSubject(subject)
 
 	// Clustered.
@@ -4370,6 +4365,11 @@ func (s *Server) jsStreamDrainRemoteRequest(_ *subscription, c *client, _ *Accou
 			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
+		return
+	}
+	if s.JetStreamIsClustered() {
+		resp.Error = NewJSStreamGeneralError(errS3TierClusteredDrain, Unless(errS3TierClusteredDrain))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	stream := streamNameFromSubject(subject)
