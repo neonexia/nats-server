@@ -15,53 +15,44 @@ Status: experimental fork implementation, 2026-10-04. The first runnable slice i
 ## Configuration target
 
 The current programmatic `Options.JetStreamS3Tiers` mapping is a prototype
-test seam, not the deployment configuration model. The server configuration
-file must own S3-tier profiles, physical defaults, and stream assignments. The
-parsed result may populate internal Go structs, but an operator must not need
-to construct `S3TierConfig` in code.
+test seam, not the deployment configuration model. Nodus runs one NATS server
+per workspace, so the server configuration file must own one server-wide tier
+policy and physical defaults. The parsed result may populate internal Go
+structs, but an operator must not need to construct `S3TierConfig` in code.
 
-The intended shape is a `jetstream.s3_tier` block with named object-store
-profiles, a `defaults` block, and explicit account/stream assignments. For
-example:
+The intended shape is one `jetstream.s3_tier` block. For example:
 
 ```text
 jetstream {
   s3_tier {
-    defaults {
-      block_size: 8MiB
-      local_high_bytes: 512MiB
-      local_low_bytes: 384MiB
-      remote_high_bytes: 128MiB
-      remote_low_bytes: 64MiB
-      timeout: 30s
-    }
-    profiles {
-      nodus_minio {
-        endpoint: "minio.internal:9000"
-        bucket: "nodus-history"
-        tls: false
-        credential_provider: "nodus-object-store"
-      }
-    }
-    streams: [
-      { account: "$G", stream: "WORKSPACE_A", profile: "nodus_minio", prefix: "workspaces/a" }
-    ]
+    endpoint: "minio.internal:9000"
+    bucket: "nodus-history"
+    tls: false
+    credential_provider: "nodus-object-store"
+    prefix: "instances/2dc4d8d6"
+    block_size: 8MiB
+    local_high_bytes: 512MiB
+    local_low_bytes: 384MiB
+    remote_high_bytes: 128MiB
+    remote_low_bytes: 64MiB
+    timeout: 30s
   }
 }
 ```
 
-Each assignment has an explicit opaque prefix because it identifies one stream
-incarnation's remote namespace. Omitted physical values inherit from
-`defaults`; a stream assignment may override only the tier tuning values, not
-the credential provider. Endpoint, bucket, TLS, and the credential-provider
-reference belong to the named profile so several streams can share one
-object-store connection policy.
+`prefix` is an opaque, Nodus-supplied root unique to the NATS server instance.
+NATS derives distinct per-stream object paths from that root and ordinary
+account/stream identities; it does not know workspace IDs or interpret Nodus
+semantics. The immutable stream record still binds the resulting path to one
+stream incarnation. Defaults apply to every eligible file stream in the
+instance, and a stream that violates the restricted append-only invariants is
+rejected rather than silently receiving different retention behavior.
 
 The initial implementation should validate this configuration at server start
 and treat it as non-reloadable. Reload semantics need separate ownership,
 connection-draining, and stream-identity rules. Raw access keys, secret keys,
-and session tokens do not belong in a stream assignment or persisted stream
-metadata; the credential provider is resolved by the server process.
+and session tokens do not belong in configuration or persisted stream metadata;
+the credential provider is resolved by the server process.
 
 ## Observed results
 
