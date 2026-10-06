@@ -1586,13 +1586,21 @@ func TestGatewayUseUpdatedURLs(t *testing.T) {
 	// on a given URL. Then we create cluster A with a gateway to B with server B's
 	// GW url, and we expect server B to ultimately create an outbound GW connection
 	// to server A (with the URL it will get from server A connecting to it).
+	// Reserve then release a port instead of assuming a well-known local port is
+	// unused. Developer services can legitimately occupy a fixed port.
+	l, err := natsListen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Error on listen: %v", err)
+	}
+	wrongPort := l.Addr().(*net.TCPAddr).Port
+	l.Close()
 
-	ob := testGatewayOptionsFromToWithURLs(t, "B", "A", []string{"nats://127.0.0.1:1234"})
+	ob := testGatewayOptionsFromToWithURLs(t, "B", "A", []string{fmt.Sprintf("nats://127.0.0.1:%d", wrongPort)})
 	sb := runGatewayServer(ob)
 	defer sb.Shutdown()
 
 	// Add a delay before starting server A to make sure that server B start
-	// initiating the connection to A on inexistant server at :1234.
+	// initiating the connection to A on an unavailable address.
 	time.Sleep(100 * time.Millisecond)
 
 	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
