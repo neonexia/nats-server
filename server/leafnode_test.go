@@ -847,8 +847,22 @@ func (l *loopDetectedLogger) Errorf(format string, v ...any) {
 
 func TestLeafNodeLoop(t *testing.T) {
 	test := func(t *testing.T, cluster bool) {
-		// This test requires that we set the port to known value because
-		// we want A point to B and B to A.
+		// Reserve two distinct ports before starting either server. The servers
+		// must point at each other, but fixed ports may belong to local services.
+		aPortListener, err := natsListen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Error reserving A leaf node port: %v", err)
+		}
+		bPortListener, err := natsListen("tcp", "127.0.0.1:0")
+		if err != nil {
+			aPortListener.Close()
+			t.Fatalf("Error reserving B leaf node port: %v", err)
+		}
+		portA := aPortListener.Addr().(*net.TCPAddr).Port
+		portB := bPortListener.Addr().(*net.TCPAddr).Port
+		aPortListener.Close()
+		bPortListener.Close()
+
 		oa := DefaultOptions()
 		oa.ServerName = "A"
 		if !cluster {
@@ -856,8 +870,8 @@ func TestLeafNodeLoop(t *testing.T) {
 			oa.Cluster.Name = _EMPTY_
 		}
 		oa.LeafNode.ReconnectInterval = 10 * time.Millisecond
-		oa.LeafNode.Port = 1234
-		ub, _ := url.Parse("nats://127.0.0.1:5678")
+		oa.LeafNode.Port = portA
+		ub, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", portB))
 		oa.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ub}}}
 		oa.LeafNode.connDelay = 50 * time.Millisecond
 		sa := RunServer(oa)
@@ -875,8 +889,8 @@ func TestLeafNodeLoop(t *testing.T) {
 			ob.Cluster.Name = "xyz"
 		}
 		ob.LeafNode.ReconnectInterval = 10 * time.Millisecond
-		ob.LeafNode.Port = 5678
-		ua, _ := url.Parse("nats://127.0.0.1:1234")
+		ob.LeafNode.Port = portB
+		ua, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", portA))
 		ob.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ua}}}
 		ob.LeafNode.connDelay = 50 * time.Millisecond
 		sb := RunServer(ob)
