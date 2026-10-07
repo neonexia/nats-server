@@ -85,6 +85,18 @@ const (
 	JSApiStreamDrainRemote  = "$JS.API.STREAM.DRAIN_REMOTE.*"
 	JSApiStreamDrainRemoteT = "$JS.API.STREAM.DRAIN_REMOTE.%s"
 
+	// Remote restore operations create an immutable source checkpoint. They are
+	// deliberately separate so a retried control request can resume a durable
+	// state transition instead of relying on one long-lived client connection.
+	JSApiStreamPrepareRemoteRestore     = "$JS.API.STREAM.PREPARE_REMOTE_RESTORE.*"
+	JSApiStreamPrepareRemoteRestoreT    = "$JS.API.STREAM.PREPARE_REMOTE_RESTORE.%s"
+	JSApiStreamCheckpointRemoteRestore  = "$JS.API.STREAM.CHECKPOINT_REMOTE_RESTORE.*"
+	JSApiStreamCheckpointRemoteRestoreT = "$JS.API.STREAM.CHECKPOINT_REMOTE_RESTORE.%s"
+	JSApiStreamAbortRemoteRestore       = "$JS.API.STREAM.ABORT_REMOTE_RESTORE.*"
+	JSApiStreamAbortRemoteRestoreT      = "$JS.API.STREAM.ABORT_REMOTE_RESTORE.%s"
+	JSApiStreamRemoteRestoreStatus      = "$JS.API.STREAM.REMOTE_RESTORE_STATUS.*"
+	JSApiStreamRemoteRestoreStatusT     = "$JS.API.STREAM.REMOTE_RESTORE_STATUS.%s"
+
 	// JSApiStreamSnapshot is the endpoint to snapshot streams.
 	// Will return a stream of chunks with a nil chunk as EOF to
 	// the deliver subject. Caller should respond to each chunk
@@ -582,6 +594,28 @@ type JSApiStreamDrainRemoteResponse struct {
 }
 
 const JSApiStreamDrainRemoteResponseType = "io.nats.jetstream.api.v1.stream_drain_remote_response"
+
+// JSApiStreamRemoteRestoreRequest identifies one durable remote restore
+// operation. Callers must retain and retry the same operation ID after a lost
+// response; the server never derives it from a client connection.
+type JSApiStreamRemoteRestoreRequest struct {
+	OperationID string `json:"operation_id"`
+}
+
+// JSApiStreamRemoteRestoreResponse reports source-side fencing and checkpoint
+// state. CheckpointKey is opaque S3 metadata; credentials stay in server
+// configuration and are never returned by this API.
+type JSApiStreamRemoteRestoreResponse struct {
+	ApiResponse
+	Success          bool   `json:"success,omitempty"`
+	OperationID      string `json:"operation_id,omitempty"`
+	Epoch            uint64 `json:"epoch,omitempty"`
+	State            string `json:"state,omitempty"`
+	CheckpointKey    string `json:"checkpoint_key,omitempty"`
+	CheckpointSHA256 string `json:"checkpoint_sha256,omitempty"`
+}
+
+const JSApiStreamRemoteRestoreResponseType = "io.nats.jetstream.api.v1.stream_remote_restore_response"
 
 type JSApiConsumerUnpinRequest struct {
 	Group string `json:"group"`
@@ -1147,6 +1181,10 @@ func (s *Server) setJetStreamExportSubs() error {
 		{JSApiStreamDelete, s.jsStreamDeleteRequest},
 		{JSApiStreamPurge, s.jsStreamPurgeRequest},
 		{JSApiStreamDrainRemote, s.jsStreamDrainRemoteRequest},
+		{JSApiStreamPrepareRemoteRestore, s.jsStreamPrepareRemoteRestoreRequest},
+		{JSApiStreamCheckpointRemoteRestore, s.jsStreamCheckpointRemoteRestoreRequest},
+		{JSApiStreamAbortRemoteRestore, s.jsStreamAbortRemoteRestoreRequest},
+		{JSApiStreamRemoteRestoreStatus, s.jsStreamRemoteRestoreStatusRequest},
 		{JSApiStreamSnapshot, s.jsStreamSnapshotRequest},
 		{JSApiStreamRestore, s.jsStreamRestoreRequest},
 		{JSApiStreamRemovePeer, s.jsStreamRemovePeerRequest},
@@ -4390,6 +4428,175 @@ func (s *Server) jsStreamDrainRemoteRequest(_ *subscription, c *client, _ *Accou
 	} else {
 		resp.Success = true
 	}
+	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
+}
+
+type s3TierRemoteRestoreAction uint8
+
+const (
+	s3TierRemoteRestorePrepare s3TierRemoteRestoreAction = iota + 1
+	s3TierRemoteRestoreCheckpointAction
+	s3TierRemoteRestoreAbort
+	s3TierRemoteRestoreStatus
+)
+
+func (s *Server) jsStreamPrepareRemoteRestoreRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	s.jsStreamRemoteRestoreRequest(c, subject, reply, rmsg, s3TierRemoteRestorePrepare)
+}
+
+func (s *Server) jsStreamCheckpointRemoteRestoreRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	s.jsStreamRemoteRestoreRequest(c, subject, reply, rmsg, s3TierRemoteRestoreCheckpointAction)
+}
+
+func (s *Server) jsStreamAbortRemoteRestoreRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	s.jsStreamRemoteRestoreRequest(c, subject, reply, rmsg, s3TierRemoteRestoreAbort)
+}
+
+func (s *Server) jsStreamRemoteRestoreStatusRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	s.jsStreamRemoteRestoreRequest(c, subject, reply, rmsg, s3TierRemoteRestoreStatus)
+}
+
+func remoteRestoreResponse(resp *JSApiStreamRemoteRestoreResponse, state *s3TierRemoteRestoreState) {
+	if state == nil {
+		return
+	}
+	resp.OperationID, resp.Epoch, resp.State = state.OperationID, state.Epoch, state.State
+	resp.CheckpointKey, resp.CheckpointSHA256 = state.CheckpointKey, state.CheckpointSHA256
+}
+
+// jsStreamRemoteRestoreRequest performs the source half of the remote restore
+// protocol. It serializes with publication so the persisted fence and the
+// message boundary cannot race an accepted write. Target activation remains a
+// separate, coordinator-authorized operation.
+func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, rmsg []byte, action s3TierRemoteRestoreAction) {
+	if c == nil || !s.JetStreamEnabled() {
+		return
+	}
+	ci, acc, hdr, msg, err := s.getRequestInfo(c, rmsg)
+	if err != nil {
+		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+	resp := JSApiStreamRemoteRestoreResponse{ApiResponse: ApiResponse{Type: JSApiStreamRemoteRestoreResponseType}}
+	if errorOnRequiredApiLevel(hdr) {
+		resp.Error = NewJSRequiredApiLevelError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if hasJS, doErr := acc.checkJetStream(); !hasJS {
+		if doErr {
+			resp.Error = NewJSNotEnabledForAccountError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+	if s.JetStreamIsClustered() {
+		resp.Error = NewJSStreamGeneralError(errS3TierClusteredDrain, Unless(errS3TierClusteredDrain))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	stream := streamNameFromSubject(subject)
+	mset, err := acc.lookupStream(stream)
+	if err != nil {
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	mset.mu.RLock()
+	fs, ok := mset.store.(*fileStore)
+	mset.mu.RUnlock()
+	if !ok || fs.tier == nil {
+		resp.Error = NewJSStreamGeneralError(errS3TierNotEnabled, Unless(errS3TierNotEnabled))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	var req JSApiStreamRemoteRestoreRequest
+	if action != s3TierRemoteRestoreStatus {
+		if err := json.Unmarshal(msg, &req); err != nil {
+			resp.Error = NewJSStreamGeneralError(fmt.Errorf("invalid remote restore request: %w", err), Unless(err))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
+	}
+
+	if action == s3TierRemoteRestoreStatus {
+		remoteRestoreResponse(&resp, fs.tier.remoteRestoreState())
+		resp.Success = true
+		s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
+		return
+	}
+	if action == s3TierRemoteRestorePrepare {
+		mset.mu.RLock()
+		hasConsumers := len(mset.consumers) > 0
+		mset.mu.RUnlock()
+		if hasConsumers {
+			prepareErr := errors.New("remote restore prepare requires a stream without consumers")
+			resp.Error = NewJSStreamGeneralError(prepareErr, Unless(prepareErr))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
+	}
+
+	// A prepare, checkpoint, or abort must wait for any inflight publish before
+	// recording state. Holding isolateMu also makes newly queued publishes see
+	// the persisted fence before they reach the file store.
+	mset.isolateMu.Lock()
+	defer mset.isolateMu.Unlock()
+
+	var state *s3TierRemoteRestoreState
+	switch action {
+	case s3TierRemoteRestorePrepare:
+		state, err = fs.tier.prepareRemoteRestore(req.OperationID)
+	case s3TierRemoteRestoreAbort:
+		state, err = fs.tier.abortRemoteRestore(req.OperationID)
+	case s3TierRemoteRestoreCheckpointAction:
+		mset.mu.RLock()
+		current := mset.remoteRestore
+		mset.mu.RUnlock()
+		if current == nil || current.OperationID != req.OperationID || current.State != s3TierRemoteRestorePrepared {
+			err = errors.New("remote restore operation is not prepared")
+			break
+		}
+		if _, err = fs.DrainS3Tier(); err != nil {
+			break
+		}
+		checkpoint := fs.tier.remoteRestoreState()
+		if checkpoint == nil {
+			err = errors.New("remote restore state disappeared during checkpoint")
+			break
+		}
+		fs.tier.mu.Lock()
+		messageCheckpoint := fs.tier.checkpoint
+		fs.tier.mu.Unlock()
+		if messageCheckpoint == nil {
+			err = errors.New("remote restore requires at least one message checkpoint")
+			break
+		}
+		var streamState StreamState
+		fs.FastState(&streamState)
+		mset.mu.RLock()
+		streamConfig, created := mset.cfg, mset.created
+		mset.mu.RUnlock()
+		messageCheckpointCopy := *messageCheckpoint
+		state, err = fs.tier.checkpointRemoteRestore(req.OperationID, &s3TierRemoteRestoreCheckpoint{
+			Epoch:             checkpoint.Epoch,
+			Created:           created,
+			StreamConfig:      streamConfig,
+			StreamState:       streamState,
+			MessageCheckpoint: messageCheckpointCopy,
+		})
+	}
+	if err != nil {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	mset.mu.Lock()
+	mset.remoteRestore = state
+	mset.mu.Unlock()
+	remoteRestoreResponse(&resp, state)
+	resp.Success = true
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 }
 

@@ -681,6 +681,242 @@ func TestJetStreamS3TierDrainRemoteAPI(t *testing.T) {
 	}
 }
 
+func TestJetStreamS3TierRemoteRestoreSourceAPI(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	cfg := &StreamConfig{Name: "MOVE", Subjects: []string{"move.events"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	fcfg := &FileStoreConfig{BlockSize: 16 * 1024, S3Tier: &S3TierConfig{
+		Store: store, Prefix: "test/remote-restore-api", LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29,
+		RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
+	}}
+	mset, err := s.GlobalAccount().addStreamWithStore(cfg, fcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+	for i := 0; i < 10; i++ {
+		sendStreamMsg(t, nc, "move.events", strings.Repeat("x", 1000))
+	}
+	request := func(subject string) JSApiStreamRemoteRestoreResponse {
+		t.Helper()
+		body, err := json.Marshal(JSApiStreamRemoteRestoreRequest{OperationID: "move_1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg, err := nc.Request(subject, body, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resp JSApiStreamRemoteRestoreResponse
+		if err := json.Unmarshal(msg.Data, &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	prepare := request(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "MOVE"))
+	if prepare.Error != nil || !prepare.Success || prepare.State != s3TierRemoteRestorePrepared || prepare.Epoch != 1 {
+		t.Fatalf("prepare response: %+v", prepare)
+	}
+	// The source stays readable, but the persisted fence rejects a new publish.
+	stored, err := mset.getMsg(1)
+	if err != nil || stored == nil || len(stored.Data) != 1000 {
+		t.Fatalf("source read while prepared = (%+v, %v)", stored, err)
+	}
+	msg, err := nc.Request("move.events", []byte("blocked"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pubAck JSPubAckResponse
+	if err := json.Unmarshal(msg.Data, &pubAck); err != nil {
+		t.Fatal(err)
+	}
+	if pubAck.Error == nil || !strings.Contains(pubAck.Error.Description, "fenced for remote restore") {
+		t.Fatalf("publish while prepared response: %+v", pubAck)
+	}
+	checkpoint := request(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "MOVE"))
+	if checkpoint.Error != nil || !checkpoint.Success || checkpoint.State != s3TierRemoteRestoreCheckpointed || checkpoint.CheckpointKey == "" || checkpoint.CheckpointSHA256 == "" {
+		t.Fatalf("checkpoint response: %+v", checkpoint)
+	}
+	store.mu.Lock()
+	checkpointData := append([]byte(nil), store.objects[checkpoint.CheckpointKey]...)
+	store.mu.Unlock()
+	var remoteCheckpoint s3TierRemoteRestoreCheckpoint
+	if err := json.Unmarshal(checkpointData, &remoteCheckpoint); err != nil {
+		t.Fatal(err)
+	}
+	if remoteCheckpoint.OperationID != "move_1" || remoteCheckpoint.Epoch != prepare.Epoch || remoteCheckpoint.MessageCheckpoint.CoveredThrough != 10 {
+		t.Fatalf("remote checkpoint: %+v", remoteCheckpoint)
+	}
+	if remoteCheckpoint.StreamConfig.Name != "MOVE" || remoteCheckpoint.StreamState.LastSeq != 10 {
+		t.Fatalf("remote checkpoint stream metadata: %+v", remoteCheckpoint)
+	}
+	statusMsg, err := nc.Request(fmt.Sprintf(JSApiStreamRemoteRestoreStatusT, "MOVE"), nil, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(statusMsg.Data, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Error != nil || status.State != s3TierRemoteRestoreCheckpointed || status.OperationID != "move_1" {
+		t.Fatalf("status response: %+v", status)
+	}
+}
+
+func TestJetStreamS3TierRemoteRestoreAbortResumesSource(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	cfg := &StreamConfig{Name: "ABORT", Subjects: []string{"abort.events"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	fcfg := &FileStoreConfig{BlockSize: 16 * 1024, S3Tier: &S3TierConfig{
+		Store: store, Prefix: "test/remote-restore-abort", LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29,
+		RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
+	}}
+	if _, err := s.GlobalAccount().addStreamWithStore(cfg, fcfg); err != nil {
+		t.Fatal(err)
+	}
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+	call := func(subject string) JSApiStreamRemoteRestoreResponse {
+		t.Helper()
+		body, _ := json.Marshal(JSApiStreamRemoteRestoreRequest{OperationID: "abort_1"})
+		msg, err := nc.Request(subject, body, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resp JSApiStreamRemoteRestoreResponse
+		if err := json.Unmarshal(msg.Data, &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	if resp := call(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "ABORT")); resp.Error != nil || resp.State != s3TierRemoteRestorePrepared {
+		t.Fatalf("prepare response: %+v", resp)
+	}
+	if resp := call(fmt.Sprintf(JSApiStreamAbortRemoteRestoreT, "ABORT")); resp.Error != nil || resp.State != s3TierRemoteRestoreAborted {
+		t.Fatalf("abort response: %+v", resp)
+	}
+	sendStreamMsg(t, nc, "abort.events", "accepted-after-abort")
+}
+
+func TestJetStreamS3TierRemoteRestorePrepareRejectsConsumers(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	cfg := &StreamConfig{Name: "CONSUMERS", Subjects: []string{"consumers.events"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	fcfg := &FileStoreConfig{BlockSize: 16 * 1024, S3Tier: &S3TierConfig{
+		Store: store, Prefix: "test/remote-restore-consumers", LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29,
+		RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
+	}}
+	mset, err := s.GlobalAccount().addStreamWithStore(cfg, fcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mset.addConsumer(&ConsumerConfig{Durable: "C", AckPolicy: AckExplicit}); err != nil {
+		t.Fatal(err)
+	}
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+	body, _ := json.Marshal(JSApiStreamRemoteRestoreRequest{OperationID: "consumers_1"})
+	msg, err := nc.Request(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "CONSUMERS"), body, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Description, "without consumers") {
+		t.Fatalf("prepare with consumer response: %+v", resp)
+	}
+}
+
+func TestJetStreamS3TierRemoteRestoreFenceSurvivesRestart(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	opts := DefaultTestOptions
+	opts.Port = -1
+	opts.JetStream = true
+	opts.StoreDir = t.TempDir()
+	opts.JetStreamS3Tiers = map[string]*S3TierConfig{"$G/FENCED": {
+		Store: store, Prefix: "test/remote-restore-restart", BlockSize: 16 * 1024, LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29,
+		RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
+	}}
+	s := RunServer(&opts)
+	cfg := &StreamConfig{Name: "FENCED", Subjects: []string{"fenced.events"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	if _, err := s.GlobalAccount().addStream(cfg); err != nil {
+		s.Shutdown()
+		t.Fatal(err)
+	}
+	nc := clientConnectToServer(t, s)
+	for i := 0; i < 3; i++ {
+		sendStreamMsg(t, nc, "fenced.events", "before-fence")
+	}
+	body, _ := json.Marshal(JSApiStreamRemoteRestoreRequest{OperationID: "restart_1"})
+	msg, err := nc.Request(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "FENCED"), body, 5*time.Second)
+	if err != nil {
+		nc.Close()
+		s.Shutdown()
+		t.Fatal(err)
+	}
+	var prepared JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(msg.Data, &prepared); err != nil || prepared.Error != nil || prepared.State != s3TierRemoteRestorePrepared {
+		nc.Close()
+		s.Shutdown()
+		t.Fatalf("prepare response: %+v, %v", prepared, err)
+	}
+	nc.Close()
+	s.Shutdown()
+
+	s = RunServer(&opts)
+	defer s.Shutdown()
+	nc = clientConnectToServer(t, s)
+	defer nc.Close()
+	msg, err = nc.Request("fenced.events", []byte("after-restart"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pubAck JSPubAckResponse
+	if err := json.Unmarshal(msg.Data, &pubAck); err != nil {
+		t.Fatal(err)
+	}
+	if pubAck.Error == nil || !strings.Contains(pubAck.Error.Description, "fenced for remote restore") {
+		t.Fatalf("publish after restart response: %+v", pubAck)
+	}
+}
+
+func TestFileStoreS3TierRemoteRestorePrepareAdoptsRemoteIntent(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), "test/remote-restore-intent")
+	state, err := fs.tier.prepareRemoteRestore("intent_1")
+	if err != nil || state.State != s3TierRemoteRestorePrepared {
+		fs.Stop()
+		t.Fatalf("prepare = (%+v, %v)", state, err)
+	}
+	if err := os.Remove(fs.tier.remoteRestoreFile()); err != nil {
+		fs.Stop()
+		t.Fatal(err)
+	}
+	fs.Stop()
+
+	// Simulate a crash after S3 committed the intent but before the local
+	// journal was durable. Retrying the same operation must adopt the marker.
+	fs, err = newFileStore(fcfg, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Stop()
+	state, err = fs.tier.prepareRemoteRestore("intent_1")
+	if err != nil || state.State != s3TierRemoteRestorePrepared || state.Epoch != 1 {
+		t.Fatalf("retry prepare = (%+v, %v)", state, err)
+	}
+}
+
 func TestFileStoreS3TierRejectsWritesWhenOffloadCannotRelievePressure(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/local-pressure")

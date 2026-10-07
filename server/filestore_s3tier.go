@@ -292,6 +292,42 @@ type s3TierCheckpoint struct {
 	ConfigSHA256       string `json:"config_sha256"`
 }
 
+const (
+	s3TierRemoteRestorePrepared     = "prepared"
+	s3TierRemoteRestoreCheckpointed = "checkpointed"
+	s3TierRemoteRestoreAborted      = "aborted"
+)
+
+// s3TierRemoteRestoreState is the durable source-side fence for a remote
+// restore operation. The local copy makes a source restart preserve its write
+// fence; the immutable remote markers make a completed checkpoint discoverable
+// when the source disk is later retired.
+type s3TierRemoteRestoreState struct {
+	Version     uint8     `json:"version"`
+	OperationID string    `json:"operation_id"`
+	Epoch       uint64    `json:"epoch"`
+	State       string    `json:"state"`
+	Created     time.Time `json:"created"`
+	Updated     time.Time `json:"updated"`
+
+	CheckpointKey    string `json:"checkpoint_key,omitempty"`
+	CheckpointSHA256 string `json:"checkpoint_sha256,omitempty"`
+}
+
+// s3TierRemoteRestoreCheckpoint binds one source fence to the immutable
+// message boundary and stream identity needed by a future target restore. It
+// intentionally does not create a writable target; activation needs a
+// coordinator-owned lease and is implemented separately.
+type s3TierRemoteRestoreCheckpoint struct {
+	Version           uint8            `json:"version"`
+	OperationID       string           `json:"operation_id"`
+	Epoch             uint64           `json:"epoch"`
+	Created           time.Time        `json:"created"`
+	StreamConfig      StreamConfig     `json:"stream_config"`
+	StreamState       StreamState      `json:"stream_state"`
+	MessageCheckpoint s3TierCheckpoint `json:"message_checkpoint"`
+}
+
 type fileS3Tier struct {
 	fs             *fileStore
 	cfg            S3TierConfig
@@ -303,6 +339,7 @@ type fileS3Tier struct {
 	manifestSHA256 string
 	record         *s3TierStreamRecord
 	checkpoint     *s3TierCheckpoint
+	restore        *s3TierRemoteRestoreState
 	stats          s3TierCounters
 	wake           chan struct{}
 	quit           chan struct{}
@@ -398,6 +435,26 @@ func (t *fileS3Tier) checkpointFile() string {
 	return filepath.Join(t.fs.fcfg.StoreDir, msgDir, "s3-tier.checkpoint.json")
 }
 
+func (t *fileS3Tier) remoteRestoreFile() string {
+	return filepath.Join(t.fs.fcfg.StoreDir, msgDir, "s3-tier.remote-restore.json")
+}
+
+func (t *fileS3Tier) remoteRestorePrefix(operationID string) string {
+	return fmt.Sprintf("%s/restore/%s", strings.Trim(t.cfg.Prefix, "/"), operationID)
+}
+
+func (t *fileS3Tier) remoteRestoreIntentKey(operationID string) string {
+	return t.remoteRestorePrefix(operationID) + "/intent.json"
+}
+
+func (t *fileS3Tier) remoteRestoreAbortKey(operationID string) string {
+	return t.remoteRestorePrefix(operationID) + "/abort.json"
+}
+
+func (t *fileS3Tier) remoteRestoreCheckpointKey(operationID string) string {
+	return t.remoteRestorePrefix(operationID) + "/checkpoint.json"
+}
+
 // prepareS3Tier runs before the normal file-store recovery. Descriptor sidecars
 // are durable local evidence that a missing payload belongs to the remote tier.
 // Startup must not list or fetch S3 objects: that would turn an object-store
@@ -459,6 +516,15 @@ func (fs *fileStore) prepareS3Tier() error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	if buf, err := os.ReadFile(t.remoteRestoreFile()); err == nil {
+		var restore s3TierRemoteRestoreState
+		if err := json.Unmarshal(buf, &restore); err != nil || !validS3TierRemoteRestoreState(&restore) {
+			return fmt.Errorf("invalid local S3 tier remote restore state: %v", err)
+		}
+		t.restore = &restore
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	paths, err := filepath.Glob(filepath.Join(fs.fcfg.StoreDir, msgDir, "*.tier.json"))
 	if err != nil {
 		return err
@@ -516,6 +582,202 @@ func (t *fileS3Tier) validCheckpoint(checkpoint *s3TierCheckpoint) bool {
 		checkpoint.ManifestKey == t.manifestKey(checkpoint.ManifestGeneration)
 }
 
+func validS3TierRemoteRestoreOperationID(operationID string) bool {
+	if len(operationID) == 0 || len(operationID) > 128 {
+		return false
+	}
+	for _, r := range operationID {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func validS3TierRemoteRestoreState(state *s3TierRemoteRestoreState) bool {
+	if state == nil || state.Version != 1 || !validS3TierRemoteRestoreOperationID(state.OperationID) || state.Epoch == 0 || state.Created.IsZero() || state.Updated.IsZero() {
+		return false
+	}
+	switch state.State {
+	case s3TierRemoteRestorePrepared, s3TierRemoteRestoreAborted:
+		return state.CheckpointKey == "" && state.CheckpointSHA256 == ""
+	case s3TierRemoteRestoreCheckpointed:
+		return state.CheckpointKey != "" && state.CheckpointSHA256 != ""
+	default:
+		return false
+	}
+}
+
+func (state *s3TierRemoteRestoreState) fenced() bool {
+	return state != nil && (state.State == s3TierRemoteRestorePrepared || state.State == s3TierRemoteRestoreCheckpointed)
+}
+
+func (t *fileS3Tier) remoteRestoreState() *s3TierRemoteRestoreState {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.restore == nil {
+		return nil
+	}
+	state := *t.restore
+	return &state
+}
+
+func (t *fileS3Tier) writeRemoteRestoreState(state *s3TierRemoteRestoreState) error {
+	buf, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	if err := writeAtomically(t.fs.dios, t.remoteRestoreFile(), buf, defaultFilePerms, true); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	stateCopy := *state
+	t.restore = &stateCopy
+	t.mu.Unlock()
+	return nil
+}
+
+// prepareRemoteRestore persists the source intent before the caller starts
+// rejecting publishes. An operation ID makes retried control requests
+// idempotent after a lost response or a source restart.
+func (t *fileS3Tier) prepareRemoteRestore(operationID string) (*s3TierRemoteRestoreState, error) {
+	if !validS3TierRemoteRestoreOperationID(operationID) {
+		return nil, errors.New("remote restore operation ID must contain only letters, digits, '-' or '_'")
+	}
+	t.mu.Lock()
+	if current := t.restore; current != nil {
+		if current.OperationID == operationID {
+			state := *current
+			t.mu.Unlock()
+			if state.fenced() {
+				return &state, nil
+			}
+			return nil, errors.New("remote restore operation was aborted; use a new operation ID")
+		}
+		if current.fenced() {
+			t.mu.Unlock()
+			return nil, errors.New("another remote restore operation already fences this stream")
+		}
+	}
+	epoch := uint64(1)
+	if t.restore != nil {
+		epoch = t.restore.Epoch + 1
+	}
+	t.mu.Unlock()
+
+	if buf, found, err := t.getImmutableIfPresent(t.remoteRestoreIntentKey(operationID)); err != nil {
+		return nil, err
+	} else if found {
+		var state s3TierRemoteRestoreState
+		if err := json.Unmarshal(buf, &state); err != nil || !validS3TierRemoteRestoreState(&state) || state.OperationID != operationID || state.State != s3TierRemoteRestorePrepared {
+			return nil, errors.New("remote restore intent conflicts with local operation")
+		}
+		if err := t.writeRemoteRestoreState(&state); err != nil {
+			return nil, err
+		}
+		return &state, nil
+	}
+	now := time.Now().UTC()
+	state := &s3TierRemoteRestoreState{Version: 1, OperationID: operationID, Epoch: epoch, State: s3TierRemoteRestorePrepared, Created: now, Updated: now}
+	buf, err := json.Marshal(state)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.putImmutable(t.remoteRestoreIntentKey(operationID), buf); err != nil {
+		return nil, fmt.Errorf("S3 tier remote restore intent verification failed: %w", err)
+	}
+	if err := t.writeRemoteRestoreState(state); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func (t *fileS3Tier) abortRemoteRestore(operationID string) (*s3TierRemoteRestoreState, error) {
+	t.mu.Lock()
+	if t.restore == nil || t.restore.OperationID != operationID || t.restore.State != s3TierRemoteRestorePrepared {
+		t.mu.Unlock()
+		return nil, errors.New("remote restore operation is not prepared")
+	}
+	state := *t.restore
+	t.mu.Unlock()
+	state.State, state.Updated = s3TierRemoteRestoreAborted, time.Now().UTC()
+	if buf, found, err := t.getImmutableIfPresent(t.remoteRestoreAbortKey(operationID)); err != nil {
+		return nil, err
+	} else if found {
+		if err := json.Unmarshal(buf, &state); err != nil || !validS3TierRemoteRestoreState(&state) || state.OperationID != operationID || state.State != s3TierRemoteRestoreAborted {
+			return nil, errors.New("remote restore abort conflicts with local operation")
+		}
+		if err := t.writeRemoteRestoreState(&state); err != nil {
+			return nil, err
+		}
+		return &state, nil
+	}
+	buf, err := json.Marshal(&state)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.putImmutable(t.remoteRestoreAbortKey(operationID), buf); err != nil {
+		return nil, fmt.Errorf("S3 tier remote restore abort verification failed: %w", err)
+	}
+	if err := t.writeRemoteRestoreState(&state); err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+func (t *fileS3Tier) checkpointRemoteRestore(operationID string, checkpoint *s3TierRemoteRestoreCheckpoint) (*s3TierRemoteRestoreState, error) {
+	if checkpoint == nil {
+		return nil, errors.New("remote restore checkpoint is required")
+	}
+	t.mu.Lock()
+	if t.restore == nil || t.restore.OperationID != operationID {
+		t.mu.Unlock()
+		return nil, errors.New("remote restore operation was not prepared")
+	}
+	if t.restore.State == s3TierRemoteRestoreCheckpointed {
+		state := *t.restore
+		t.mu.Unlock()
+		return &state, nil
+	}
+	if t.restore.State != s3TierRemoteRestorePrepared {
+		t.mu.Unlock()
+		return nil, errors.New("remote restore operation is not prepared")
+	}
+	state := *t.restore
+	t.mu.Unlock()
+
+	key := t.remoteRestoreCheckpointKey(operationID)
+	if buf, found, err := t.getImmutableIfPresent(key); err != nil {
+		return nil, err
+	} else if found {
+		var existing s3TierRemoteRestoreCheckpoint
+		if err := json.Unmarshal(buf, &existing); err != nil || existing.Version != 1 || existing.OperationID != state.OperationID || existing.Epoch != state.Epoch {
+			return nil, errors.New("remote restore checkpoint conflicts with local operation")
+		}
+		state.State, state.Updated = s3TierRemoteRestoreCheckpointed, time.Now().UTC()
+		state.CheckpointKey, state.CheckpointSHA256 = key, checksumS3Block(buf)
+		if err := t.writeRemoteRestoreState(&state); err != nil {
+			return nil, err
+		}
+		return &state, nil
+	}
+	checkpoint.Version, checkpoint.OperationID, checkpoint.Epoch = 1, state.OperationID, state.Epoch
+	checkpoint.Created = time.Now().UTC()
+	buf, err := json.Marshal(checkpoint)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.putImmutable(key, buf); err != nil {
+		return nil, fmt.Errorf("S3 tier remote restore checkpoint verification failed: %w", err)
+	}
+	state.State, state.Updated = s3TierRemoteRestoreCheckpointed, time.Now().UTC()
+	state.CheckpointKey, state.CheckpointSHA256 = key, checksumS3Block(buf)
+	if err := t.writeRemoteRestoreState(&state); err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
 func (t *fileS3Tier) putImmutable(key string, data []byte) error {
 	ctx, cancel := t.ctx()
 	_, err := t.cfg.Store.PutIfAbsent(ctx, key, data)
@@ -530,6 +792,29 @@ func (t *fileS3Tier) putImmutable(key string, data []byte) error {
 		return fmt.Errorf("S3 tier immutable object verification failed for %q: %w", key, err)
 	}
 	return nil
+}
+
+// getImmutableIfPresent distinguishes an absent immutable marker from a
+// transport failure without depending on object-store-specific not-found
+// errors. Restore operation retries use it after a crash between remote and
+// local durability steps.
+func (t *fileS3Tier) getImmutableIfPresent(key string) ([]byte, bool, error) {
+	ctx, cancel := t.ctx()
+	keys, err := t.cfg.Store.List(ctx, key)
+	cancel()
+	if err != nil {
+		return nil, false, err
+	}
+	for _, candidate := range keys {
+		if candidate != key {
+			continue
+		}
+		ctx, cancel = t.ctx()
+		buf, err := t.cfg.Store.Get(ctx, key)
+		cancel()
+		return buf, err == nil, err
+	}
+	return nil, false, nil
 }
 
 func (t *fileS3Tier) ensureStreamRecord() (*s3TierStreamRecord, error) {
@@ -1178,6 +1463,7 @@ var errS3TierUnavailable = errors.New("S3 tier storage unavailable")
 var errS3TierLocalCapacity = errors.New("S3 tier local capacity exceeded")
 var errS3TierNotEnabled = errors.New("S3 tier is not enabled for this stream")
 var errS3TierClusteredDrain = errors.New("S3 tier remote drain does not support clustered streams")
+var errS3TierRemoteRestoreFenced = errors.New("S3 tier stream is fenced for remote restore")
 
 // errS3TierBlockNotHydrated crosses the local read path without doing network
 // I/O under file-store or block locks. Its caller hydrates precisely this block

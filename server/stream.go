@@ -602,6 +602,10 @@ type stream struct {
 	restoring     bool
 	restoreLeader bool
 	restoreTerm   uint64
+	// remoteRestore fences a single-replica S3-tier stream while its immutable
+	// recovery checkpoint is prepared. The file-store reloads it before stream
+	// subscriptions accept publishes after a process restart.
+	remoteRestore *s3TierRemoteRestoreState
 
 	// Mirror
 	mirror              *sourceInfo
@@ -2702,7 +2706,11 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 	mset.mu.RLock()
 	ocfg := mset.cfg
 	s := mset.srv
+	remoteRestoreFenced := mset.remoteRestore.fenced()
 	mset.mu.RUnlock()
+	if remoteRestoreFenced {
+		return NewJSStreamInvalidConfigError(errS3TierRemoteRestoreFenced, Unless(errS3TierRemoteRestoreFenced))
+	}
 
 	cfg, err := mset.jsa.configUpdateCheck(&ocfg, config, s, pedantic)
 	if err != nil {
@@ -5514,6 +5522,9 @@ func (mset *stream) setupStore(fsCfg *FileStoreConfig, recovering bool) error {
 			return err
 		}
 		mset.store = fs
+		if fs.tier != nil {
+			mset.remoteRestore = fs.tier.remoteRestoreState()
+		}
 	}
 	// This will fire the callback but we do not require the lock since md will be 0 here.
 	mset.store.RegisterStorageUpdates(mset.storeUpdates)
@@ -6533,6 +6544,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	allowRollupPurge := mset.cfg.AllowRollup && !mset.cfg.DenyPurge
 	// Snapshot if we are the leader and if we can respond.
 	isLeader, isSealed := mset.isLeaderNodeState(), mset.cfg.Sealed
+	remoteRestoreFenced := mset.remoteRestore.fenced()
 	isClustered, isMirror := mset.isClustered(), mset.cfg.Mirror != nil
 	canConsistencyCheck := !isClustered || traceOnly
 	canRespond := doAck && len(reply) > 0 && isLeader
@@ -6586,6 +6598,15 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			outq.sendMsg(reply, b)
 		}
 		return ApiErrors[JSStreamSealedErr]
+	}
+	if canConsistencyCheck && remoteRestoreFenced {
+		if canRespond && outq != nil {
+			resp.PubAck = &PubAck{Stream: name}
+			resp.Error = NewJSStreamStoreFailedError(errS3TierRemoteRestoreFenced)
+			b, _ := json.Marshal(resp)
+			outq.sendMsg(reply, b)
+		}
+		return errS3TierRemoteRestoreFenced
 	}
 
 	var buf [256]byte
