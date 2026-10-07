@@ -328,6 +328,18 @@ type s3TierRemoteRestoreCheckpoint struct {
 	MessageCheckpoint s3TierCheckpoint `json:"message_checkpoint"`
 }
 
+// s3TierRemoteRestoreActivation is a conditionally-created remote receipt for
+// one target identity. It turns a source fence epoch into a durable ownership
+// decision, so two target nodes cannot both activate the same checkpoint.
+type s3TierRemoteRestoreActivation struct {
+	Version       uint8     `json:"version"`
+	OperationID   string    `json:"operation_id"`
+	Epoch         uint64    `json:"epoch"`
+	TargetID      string    `json:"target_id"`
+	CheckpointKey string    `json:"checkpoint_key"`
+	Activated     time.Time `json:"activated"`
+}
+
 type fileS3Tier struct {
 	fs             *fileStore
 	cfg            S3TierConfig
@@ -340,6 +352,7 @@ type fileS3Tier struct {
 	record         *s3TierStreamRecord
 	checkpoint     *s3TierCheckpoint
 	restore        *s3TierRemoteRestoreState
+	activation     *s3TierRemoteRestoreActivation
 	stats          s3TierCounters
 	wake           chan struct{}
 	quit           chan struct{}
@@ -455,6 +468,14 @@ func (t *fileS3Tier) remoteRestoreCheckpointKey(operationID string) string {
 	return t.remoteRestorePrefix(operationID) + "/checkpoint.json"
 }
 
+func (t *fileS3Tier) remoteRestoreActivationKey(operationID string) string {
+	return t.remoteRestorePrefix(operationID) + "/activation.json"
+}
+
+func (t *fileS3Tier) remoteRestoreActivationFile() string {
+	return filepath.Join(t.fs.fcfg.StoreDir, msgDir, "s3-tier.remote-restore-target.json")
+}
+
 // prepareS3Tier runs before the normal file-store recovery. Descriptor sidecars
 // are durable local evidence that a missing payload belongs to the remote tier.
 // Startup must not list or fetch S3 objects: that would turn an object-store
@@ -522,6 +543,15 @@ func (fs *fileStore) prepareS3Tier() error {
 			return fmt.Errorf("invalid local S3 tier remote restore state: %v", err)
 		}
 		t.restore = &restore
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if buf, err := os.ReadFile(t.remoteRestoreActivationFile()); err == nil {
+		var activation s3TierRemoteRestoreActivation
+		if err := json.Unmarshal(buf, &activation); err != nil || !validS3TierRemoteRestoreActivation(&activation) {
+			return fmt.Errorf("invalid local S3 tier remote restore activation: %v", err)
+		}
+		t.activation = &activation
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -608,6 +638,11 @@ func validS3TierRemoteRestoreState(state *s3TierRemoteRestoreState) bool {
 	}
 }
 
+func validS3TierRemoteRestoreActivation(activation *s3TierRemoteRestoreActivation) bool {
+	return activation != nil && activation.Version == 1 && validS3TierRemoteRestoreOperationID(activation.OperationID) &&
+		activation.Epoch > 0 && activation.TargetID != "" && activation.CheckpointKey != "" && !activation.Activated.IsZero()
+}
+
 func (state *s3TierRemoteRestoreState) fenced() bool {
 	return state != nil && (state.State == s3TierRemoteRestorePrepared || state.State == s3TierRemoteRestoreCheckpointed)
 }
@@ -622,6 +657,16 @@ func (t *fileS3Tier) remoteRestoreState() *s3TierRemoteRestoreState {
 	return &state
 }
 
+func (t *fileS3Tier) remoteRestoreActivation() *s3TierRemoteRestoreActivation {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.activation == nil {
+		return nil
+	}
+	activation := *t.activation
+	return &activation
+}
+
 func (t *fileS3Tier) writeRemoteRestoreState(state *s3TierRemoteRestoreState) error {
 	buf, err := json.Marshal(state)
 	if err != nil {
@@ -633,6 +678,24 @@ func (t *fileS3Tier) writeRemoteRestoreState(state *s3TierRemoteRestoreState) er
 	t.mu.Lock()
 	stateCopy := *state
 	t.restore = &stateCopy
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *fileS3Tier) writeRemoteRestoreActivation(activation *s3TierRemoteRestoreActivation) error {
+	if !validS3TierRemoteRestoreActivation(activation) {
+		return errors.New("invalid remote restore activation")
+	}
+	buf, err := json.Marshal(activation)
+	if err != nil {
+		return err
+	}
+	if err := writeAtomically(t.fs.dios, t.remoteRestoreActivationFile(), buf, defaultFilePerms, true); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	activationCopy := *activation
+	t.activation = &activationCopy
 	t.mu.Unlock()
 	return nil
 }
@@ -815,6 +878,40 @@ func (t *fileS3Tier) getImmutableIfPresent(key string) ([]byte, bool, error) {
 		return buf, err == nil, err
 	}
 	return nil, false, nil
+}
+
+// claimRemoteRestoreActivation conditionally creates the durable target
+// receipt. A matching retry is accepted, while a different target identity is
+// rejected even when it presents the same checkpoint and epoch.
+func (t *fileS3Tier) claimRemoteRestoreActivation(operationID string, epoch uint64, targetID, checkpointKey string) (*s3TierRemoteRestoreActivation, error) {
+	if !validS3TierRemoteRestoreOperationID(operationID) || epoch == 0 || targetID == "" || checkpointKey == "" {
+		return nil, errors.New("invalid remote restore activation request")
+	}
+	key := t.remoteRestoreActivationKey(operationID)
+	if buf, found, err := t.getImmutableIfPresent(key); err != nil {
+		return nil, err
+	} else if found {
+		var activation s3TierRemoteRestoreActivation
+		if err := json.Unmarshal(buf, &activation); err != nil || !validS3TierRemoteRestoreActivation(&activation) ||
+			activation.OperationID != operationID || activation.Epoch != epoch || activation.CheckpointKey != checkpointKey {
+			return nil, errors.New("remote restore activation conflicts with checkpoint")
+		}
+		if activation.TargetID != targetID {
+			return nil, errors.New("remote restore checkpoint is already activated by another target")
+		}
+		return &activation, nil
+	}
+	activation := &s3TierRemoteRestoreActivation{
+		Version: 1, OperationID: operationID, Epoch: epoch, TargetID: targetID, CheckpointKey: checkpointKey, Activated: time.Now().UTC(),
+	}
+	buf, err := json.Marshal(activation)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.putImmutable(key, buf); err != nil {
+		return nil, fmt.Errorf("S3 tier remote restore activation verification failed: %w", err)
+	}
+	return activation, nil
 }
 
 func (t *fileS3Tier) ensureStreamRecord() (*s3TierStreamRecord, error) {

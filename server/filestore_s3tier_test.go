@@ -890,6 +890,136 @@ func TestJetStreamS3TierRemoteRestoreFenceSurvivesRestart(t *testing.T) {
 	}
 }
 
+func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	newOptions := func(dir string) Options {
+		opts := DefaultTestOptions
+		opts.Port = -1
+		opts.JetStream = true
+		opts.StoreDir = dir
+		opts.JetStreamS3Tiers = map[string]*S3TierConfig{"$G/MOVE": {
+			Store: store, Prefix: "test/remote-restore-target", BlockSize: 16 * 1024, LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29,
+			RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
+		}}
+		return opts
+	}
+	sourceOpts := newOptions(t.TempDir())
+	source := RunServer(&sourceOpts)
+	defer source.Shutdown()
+	cfg := &StreamConfig{Name: "MOVE", Subjects: []string{"move.target"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	if _, err := source.GlobalAccount().addStream(cfg); err != nil {
+		t.Fatal(err)
+	}
+	sourceNC := clientConnectToServer(t, source)
+	defer sourceNC.Close()
+	for i := 0; i < 10; i++ {
+		sendStreamMsg(t, sourceNC, "move.target", fmt.Sprintf("source-%d", i))
+	}
+	operation, _ := json.Marshal(JSApiStreamRemoteRestoreRequest{OperationID: "handoff_1"})
+	requestSource := func(subject string) JSApiStreamRemoteRestoreResponse {
+		t.Helper()
+		msg, err := sourceNC.Request(subject, operation, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response JSApiStreamRemoteRestoreResponse
+		if err := json.Unmarshal(msg.Data, &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	if response := requestSource(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "MOVE")); response.Error != nil || response.State != s3TierRemoteRestorePrepared {
+		t.Fatalf("prepare response: %+v", response)
+	}
+	checkpoint := requestSource(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "MOVE"))
+	if checkpoint.Error != nil || checkpoint.State != s3TierRemoteRestoreCheckpointed {
+		t.Fatalf("checkpoint response: %+v", checkpoint)
+	}
+
+	targetOpts := newOptions(t.TempDir())
+	target := RunServer(&targetOpts)
+	defer target.Shutdown()
+	targetNC := clientConnectToServer(t, target)
+	defer targetNC.Close()
+	restoreRequest, _ := json.Marshal(JSApiStreamRestoreRemoteRequest{OperationID: "handoff_1", ExpectedEpoch: checkpoint.Epoch, TargetID: "node-b"})
+	msg, err := targetNC.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE"), restoreRequest, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(msg.Data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Error != nil || !restored.Success || restored.State != "active" || restored.TargetID != "node-b" {
+		t.Fatalf("restore response: %+v", restored)
+	}
+	mset, err := target.GlobalAccount().lookupStream("MOVE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := mset.getMsg(10)
+	if err != nil || string(stored.Data) != "source-9" {
+		t.Fatalf("target recovered message = (%+v, %v)", stored, err)
+	}
+	sendStreamMsg(t, targetNC, "move.target", "target-11")
+	if state := mset.state(); state.LastSeq != 11 {
+		t.Fatalf("target state after publish: %+v", state)
+	}
+	// A lost restore response can be retried by the same logical target.
+	msg, err = targetNC.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE"), restoreRequest, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retried JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(msg.Data, &retried); err != nil {
+		t.Fatal(err)
+	}
+	if retried.Error != nil || !retried.Success || retried.State != "active" || retried.TargetID != "node-b" {
+		t.Fatalf("restore retry response: %+v", retried)
+	}
+	// A completed source remains readable but cannot become a second writer.
+	sourceMset, err := source.GlobalAccount().lookupStream("MOVE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err = sourceMset.getMsg(10)
+	if err != nil || string(stored.Data) != "source-9" {
+		t.Fatalf("source read after activation = (%+v, %v)", stored, err)
+	}
+	msg, err = sourceNC.Request("move.target", []byte("source-should-fail"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sourceAck JSPubAckResponse
+	if err := json.Unmarshal(msg.Data, &sourceAck); err != nil {
+		t.Fatal(err)
+	}
+	if sourceAck.Error == nil || !strings.Contains(sourceAck.Error.Description, "fenced for remote restore") {
+		t.Fatalf("source publish after activation response: %+v", sourceAck)
+	}
+	otherOpts := newOptions(t.TempDir())
+	otherTarget := RunServer(&otherOpts)
+	defer otherTarget.Shutdown()
+	otherNC := clientConnectToServer(t, otherTarget)
+	defer otherNC.Close()
+	conflictRequest, _ := json.Marshal(JSApiStreamRestoreRemoteRequest{OperationID: "handoff_1", ExpectedEpoch: checkpoint.Epoch, TargetID: "node-c"})
+	msg, err = otherNC.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE"), conflictRequest, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conflict JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(msg.Data, &conflict); err != nil {
+		t.Fatal(err)
+	}
+	if conflict.Error == nil || !strings.Contains(conflict.Error.Description, "another target") {
+		t.Fatalf("conflicting target response: %+v", conflict)
+	}
+	if _, err := otherTarget.GlobalAccount().lookupStream("MOVE"); err == nil {
+		t.Fatal("conflicting target retained an inactive stream")
+	}
+}
+
 func TestFileStoreS3TierRemoteRestorePrepareAdoptsRemoteIntent(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), "test/remote-restore-intent")

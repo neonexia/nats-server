@@ -96,6 +96,8 @@ const (
 	JSApiStreamAbortRemoteRestoreT      = "$JS.API.STREAM.ABORT_REMOTE_RESTORE.%s"
 	JSApiStreamRemoteRestoreStatus      = "$JS.API.STREAM.REMOTE_RESTORE_STATUS.*"
 	JSApiStreamRemoteRestoreStatusT     = "$JS.API.STREAM.REMOTE_RESTORE_STATUS.%s"
+	JSApiStreamRestoreRemote            = "$JS.API.STREAM.RESTORE_REMOTE.*"
+	JSApiStreamRestoreRemoteT           = "$JS.API.STREAM.RESTORE_REMOTE.%s"
 
 	// JSApiStreamSnapshot is the endpoint to snapshot streams.
 	// Will return a stream of chunks with a nil chunk as EOF to
@@ -602,6 +604,15 @@ type JSApiStreamRemoteRestoreRequest struct {
 	OperationID string `json:"operation_id"`
 }
 
+// JSApiStreamRestoreRemoteRequest selects an immutable checkpoint through its
+// operation ID. The server derives the S3 prefix and credentials from its own
+// configuration; TargetID is the coordinator's stable target-node identity.
+type JSApiStreamRestoreRemoteRequest struct {
+	OperationID   string `json:"operation_id"`
+	ExpectedEpoch uint64 `json:"expected_epoch"`
+	TargetID      string `json:"target_id"`
+}
+
 // JSApiStreamRemoteRestoreResponse reports source-side fencing and checkpoint
 // state. CheckpointKey is opaque S3 metadata; credentials stay in server
 // configuration and are never returned by this API.
@@ -613,6 +624,7 @@ type JSApiStreamRemoteRestoreResponse struct {
 	State            string `json:"state,omitempty"`
 	CheckpointKey    string `json:"checkpoint_key,omitempty"`
 	CheckpointSHA256 string `json:"checkpoint_sha256,omitempty"`
+	TargetID         string `json:"target_id,omitempty"`
 }
 
 const JSApiStreamRemoteRestoreResponseType = "io.nats.jetstream.api.v1.stream_remote_restore_response"
@@ -1185,6 +1197,7 @@ func (s *Server) setJetStreamExportSubs() error {
 		{JSApiStreamCheckpointRemoteRestore, s.jsStreamCheckpointRemoteRestoreRequest},
 		{JSApiStreamAbortRemoteRestore, s.jsStreamAbortRemoteRestoreRequest},
 		{JSApiStreamRemoteRestoreStatus, s.jsStreamRemoteRestoreStatusRequest},
+		{JSApiStreamRestoreRemote, s.jsStreamRestoreRemoteRequest},
 		{JSApiStreamSnapshot, s.jsStreamSnapshotRequest},
 		{JSApiStreamRestore, s.jsStreamRestoreRequest},
 		{JSApiStreamRemovePeer, s.jsStreamRemovePeerRequest},
@@ -4597,6 +4610,184 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 	mset.mu.Unlock()
 	remoteRestoreResponse(&resp, state)
 	resp.Success = true
+	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
+}
+
+func (s *Server) s3TierConfigForRemoteRestore(acc *Account, stream string) *S3TierConfig {
+	opts := s.getOpts()
+	if opts.jetStreamS3Tier != nil {
+		return opts.jetStreamS3Tier.streamConfig(acc.GetName(), stream)
+	}
+	if tier := opts.JetStreamS3Tiers[acc.GetName()+"/"+stream]; tier != nil {
+		copy := *tier
+		return &copy
+	}
+	return nil
+}
+
+// jsStreamRestoreRemoteRequest restores a selected immutable checkpoint into a
+// private file-store directory, verifies the recovered state, then claims the
+// target activation receipt before publishing the stream to local ingress.
+func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	if c == nil || !s.JetStreamEnabled() {
+		return
+	}
+	ci, acc, hdr, msg, err := s.getRequestInfo(c, rmsg)
+	if err != nil {
+		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+	resp := JSApiStreamRemoteRestoreResponse{ApiResponse: ApiResponse{Type: JSApiStreamRemoteRestoreResponseType}}
+	if errorOnRequiredApiLevel(hdr) {
+		resp.Error = NewJSRequiredApiLevelError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if hasJS, doErr := acc.checkJetStream(); !hasJS {
+		if doErr {
+			resp.Error = NewJSNotEnabledForAccountError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+	if s.JetStreamIsClustered() {
+		resp.Error = NewJSStreamGeneralError(errS3TierClusteredDrain, Unless(errS3TierClusteredDrain))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	stream := streamNameFromSubject(subject)
+	var req JSApiStreamRestoreRemoteRequest
+	if err := json.Unmarshal(msg, &req); err != nil {
+		resp.Error = NewJSStreamGeneralError(fmt.Errorf("invalid remote restore request: %w", err), Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if !validS3TierRemoteRestoreOperationID(req.OperationID) || req.ExpectedEpoch == 0 || req.TargetID == "" {
+		err := errors.New("remote restore requires operation_id, expected_epoch, and target_id")
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if existing, err := acc.lookupStream(stream); err == nil {
+		fs, ok := existing.store.(*fileStore)
+		if ok && fs.tier != nil {
+			activation := fs.tier.remoteRestoreActivation()
+			if activation != nil && activation.OperationID == req.OperationID && activation.Epoch == req.ExpectedEpoch && activation.TargetID == req.TargetID {
+				if err := existing.completeRestore(); err == nil {
+					resp.Success, resp.OperationID, resp.Epoch, resp.State = true, activation.OperationID, activation.Epoch, "active"
+					resp.CheckpointKey, resp.TargetID = activation.CheckpointKey, activation.TargetID
+					s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
+					return
+				}
+			}
+		}
+		resp.Error = NewJSStreamNameExistRestoreFailedError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	tierConfig := s.s3TierConfigForRemoteRestore(acc, stream)
+	if tierConfig == nil || tierConfig.Store == nil {
+		resp.Error = NewJSStreamGeneralError(errS3TierNotEnabled, Unless(errS3TierNotEnabled))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	tier := &fileS3Tier{cfg: *tierConfig}
+	material, err := tier.loadRemoteRestoreMaterial(req.OperationID, req.ExpectedEpoch)
+	if err != nil {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if material.checkpoint.StreamConfig.Name != stream || material.checkpoint.StreamConfig.Replicas != 1 {
+		err := errors.New("remote restore checkpoint does not match target stream")
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	_, jsa, err := acc.checkForJetStream()
+	if err != nil {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	stageDir := filepath.Join(jsa.storeDir, "__remote_restore__", stream, req.OperationID)
+	if err := os.RemoveAll(stageDir); err != nil {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if err := tier.stageRemoteRestore(stageDir, material); err != nil {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	streamDir := filepath.Join(jsa.storeDir, streamsDir, stream)
+	if _, err := os.Stat(streamDir); err == nil {
+		resp.Error = NewJSStreamNameExistRestoreFailedError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	} else if !os.IsNotExist(err) {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(streamDir), defaultDirPerms); err != nil {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if err := os.Rename(stageDir, streamDir); err != nil {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	mset, err := acc.addStreamForRestore(&material.checkpoint.StreamConfig)
+	if err != nil {
+		os.RemoveAll(streamDir)
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	state := mset.state()
+	expected := material.checkpoint.StreamState
+	if state.FirstSeq != expected.FirstSeq || state.LastSeq != expected.LastSeq || state.Msgs != expected.Msgs {
+		mset.stop(true, false)
+		err := errors.New("remote restore recovered stream state does not match checkpoint")
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	fs, ok := mset.store.(*fileStore)
+	if !ok || fs.tier == nil {
+		mset.stop(true, false)
+		resp.Error = NewJSStreamGeneralError(errS3TierNotEnabled, Unless(errS3TierNotEnabled))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	checkpointKey := tier.remoteRestoreCheckpointKey(req.OperationID)
+	activation, err := fs.tier.claimRemoteRestoreActivation(req.OperationID, req.ExpectedEpoch, req.TargetID, checkpointKey)
+	if err != nil {
+		mset.stop(true, false)
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if err = fs.tier.writeRemoteRestoreActivation(activation); err != nil {
+		// The remote receipt is intentionally retained. A retry by the same
+		// target identity can rebuild the private directory and adopt it.
+		mset.stop(true, false)
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	err = mset.completeRestore()
+	if err != nil {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	resp.Success, resp.OperationID, resp.Epoch, resp.State = true, activation.OperationID, activation.Epoch, "active"
+	resp.CheckpointKey, resp.TargetID = activation.CheckpointKey, activation.TargetID
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 }
 
