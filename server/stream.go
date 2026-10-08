@@ -1504,6 +1504,31 @@ func (mset *stream) setLeader(isLeader bool, term uint64) error {
 	return nil
 }
 
+// remoteRestoreFenced reports whether the source must preserve consumer state
+// for an in-progress remote handoff. Consumer delivery and acknowledgements use
+// this shared fence so the checkpoint captures one stable boundary.
+func (mset *stream) remoteRestoreFenced() bool {
+	mset.mu.RLock()
+	fenced := mset.remoteRestore.fenced()
+	mset.mu.RUnlock()
+	return fenced
+}
+
+func (mset *stream) completeRemoteRestoreConsumers() error {
+	mset.mu.RLock()
+	consumers := make([]*consumer, 0, len(mset.consumers))
+	for _, o := range mset.consumers {
+		consumers = append(consumers, o)
+	}
+	mset.mu.RUnlock()
+	for _, o := range consumers {
+		if err := o.completeRestore(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (mset *stream) completeRestore() error {
 	mset.mu.Lock()
 	if !mset.restoring {

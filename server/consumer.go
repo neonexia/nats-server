@@ -1054,7 +1054,11 @@ func (mset *stream) addConsumerWithAssignmentAndMode(config *ConsumerConfig, ona
 
 	mset.mu.RLock()
 	s, js, jsa, cfg, acc, lseq := mset.srv, mset.js, mset.jsa, mset.cfg, mset.acc, mset.lseq
+	fenced := mset.remoteRestore.fenced()
 	mset.mu.RUnlock()
+	if fenced && !restoring {
+		return nil, NewJSConsumerCreateError(errS3TierRemoteRestoreFenced, Unless(errS3TierRemoteRestoreFenced))
+	}
 
 	// If we do not have the consumer currently assigned to us in cluster mode we will proceed but warn.
 	// This can happen on startup with restored state where on meta replay we still do not have
@@ -2611,6 +2615,9 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 	if o.closed || o.mset == nil {
 		return NewJSConsumerDoesNotExistError()
 	}
+	if o.mset.remoteRestoreFenced() {
+		return NewJSConsumerCreateError(errS3TierRemoteRestoreFenced, Unless(errS3TierRemoteRestoreFenced))
+	}
 
 	if err := o.acc.checkNewConsumerConfig(&o.cfg, cfg); err != nil {
 		return err
@@ -2838,6 +2845,10 @@ func (o *consumer) pushAck(_ *subscription, c *client, _ *Account, subject, repl
 // Processes a message for the ack reply subject delivered with a message.
 func (o *consumer) processAck(subject, reply string, hdr int, rmsg []byte) {
 	defer atomic.AddInt64(&o.awl, -1)
+
+	if o.mset == nil || o.mset.remoteRestoreFenced() {
+		return
+	}
 
 	var msg []byte
 	if hdr > 0 {
@@ -4971,6 +4982,9 @@ var (
 func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 	if o.mset == nil || o.mset.store == nil {
 		return nil, 0, errBadConsumer
+	}
+	if o.mset.remoteRestoreFenced() {
+		return nil, 0, ErrStoreEOF
 	}
 	// Process redelivered messages before looking at possibly "skip list" (deliver last per subject)
 	if o.hasRedeliveries() {

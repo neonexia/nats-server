@@ -4469,6 +4469,27 @@ func (s *Server) jsStreamRemoteRestoreStatusRequest(_ *subscription, c *client, 
 	s.jsStreamRemoteRestoreRequest(c, subject, reply, rmsg, s3TierRemoteRestoreStatus)
 }
 
+func remoteRestoreConsumers(mset *stream) ([]SnapshotConsumerState, error) {
+	mset.mu.RLock()
+	stores := make([]ConsumerStore, 0, len(mset.consumers))
+	for store := range mset.store.Consumers() {
+		stores = append(stores, store)
+	}
+	mset.mu.RUnlock()
+
+	consumers := make([]SnapshotConsumerState, 0, len(stores))
+	for _, store := range stores {
+		config := store.GetConfig()
+		state, err := store.State()
+		if err != nil {
+			return nil, fmt.Errorf("could not snapshot consumer %q: %w", config.Name, err)
+		}
+		configCopy := *config
+		consumers = append(consumers, SnapshotConsumerState{ConsumerConfig: &configCopy, ConsumerState: state})
+	}
+	return consumers, nil
+}
+
 func remoteRestoreResponse(resp *JSApiStreamRemoteRestoreResponse, state *s3TierRemoteRestoreState) {
 	if state == nil {
 		return
@@ -4539,18 +4560,6 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 		s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 		return
 	}
-	if action == s3TierRemoteRestorePrepare {
-		mset.mu.RLock()
-		hasConsumers := len(mset.consumers) > 0
-		mset.mu.RUnlock()
-		if hasConsumers {
-			prepareErr := errors.New("remote restore prepare requires a stream without consumers")
-			resp.Error = NewJSStreamGeneralError(prepareErr, Unless(prepareErr))
-			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
-			return
-		}
-	}
-
 	// A prepare, checkpoint, or abort must wait for any inflight publish before
 	// recording state. Holding isolateMu also makes newly queued publishes see
 	// the persisted fence before they reach the file store.
@@ -4591,6 +4600,11 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 		mset.mu.RLock()
 		streamConfig, created := mset.cfg, mset.created
 		mset.mu.RUnlock()
+		consumers, snapshotErr := remoteRestoreConsumers(mset)
+		if snapshotErr != nil {
+			err = snapshotErr
+			break
+		}
 		messageCheckpointCopy := *messageCheckpoint
 		state, err = fs.tier.checkpointRemoteRestore(req.OperationID, &s3TierRemoteRestoreCheckpoint{
 			Epoch:             checkpoint.Epoch,
@@ -4598,6 +4612,7 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 			StreamConfig:      streamConfig,
 			StreamState:       streamState,
 			MessageCheckpoint: messageCheckpointCopy,
+			Consumers:         consumers,
 		})
 	}
 	if err != nil {
@@ -4674,6 +4689,9 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 			activation := fs.tier.remoteRestoreActivation()
 			if activation != nil && activation.OperationID == req.OperationID && activation.Epoch == req.ExpectedEpoch && activation.TargetID == req.TargetID {
 				if err := existing.completeRestore(); err == nil {
+					err = existing.completeRemoteRestoreConsumers()
+				}
+				if err == nil {
 					resp.Success, resp.OperationID, resp.Epoch, resp.State = true, activation.OperationID, activation.Epoch, "active"
 					resp.CheckpointKey, resp.TargetID = activation.CheckpointKey, activation.TargetID
 					s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
@@ -4764,6 +4782,27 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	for _, snapshot := range material.checkpoint.Consumers {
+		if snapshot.ConsumerConfig == nil || snapshot.ConsumerState == nil {
+			mset.stop(true, false)
+			err := errors.New("remote restore checkpoint contains an invalid consumer")
+			resp.Error = NewJSStreamGeneralError(err, Unless(err))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
+		o, addErr := mset.addConsumerForRestore(snapshot.ConsumerConfig)
+		if addErr == nil {
+			o.mu.Lock()
+			addErr = o.setStoreState(snapshot.ConsumerState)
+			o.mu.Unlock()
+		}
+		if addErr != nil {
+			mset.stop(true, false)
+			resp.Error = NewJSStreamGeneralError(fmt.Errorf("failed to restore consumer %q: %w", snapshot.ConsumerConfig.Name, addErr), Unless(addErr))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
+	}
 	checkpointKey := tier.remoteRestoreCheckpointKey(req.OperationID)
 	activation, err := fs.tier.claimRemoteRestoreActivation(req.OperationID, req.ExpectedEpoch, req.TargetID, checkpointKey)
 	if err != nil {
@@ -4781,6 +4820,9 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		return
 	}
 	err = mset.completeRestore()
+	if err == nil {
+		err = mset.completeRemoteRestoreConsumers()
+	}
 	if err != nil {
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))

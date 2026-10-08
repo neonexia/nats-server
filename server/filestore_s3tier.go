@@ -319,13 +319,14 @@ type s3TierRemoteRestoreState struct {
 // intentionally does not create a writable target; activation needs a
 // coordinator-owned lease and is implemented separately.
 type s3TierRemoteRestoreCheckpoint struct {
-	Version           uint8            `json:"version"`
-	OperationID       string           `json:"operation_id"`
-	Epoch             uint64           `json:"epoch"`
-	Created           time.Time        `json:"created"`
-	StreamConfig      StreamConfig     `json:"stream_config"`
-	StreamState       StreamState      `json:"stream_state"`
-	MessageCheckpoint s3TierCheckpoint `json:"message_checkpoint"`
+	Version           uint8                   `json:"version"`
+	OperationID       string                  `json:"operation_id"`
+	Epoch             uint64                  `json:"epoch"`
+	Created           time.Time               `json:"created"`
+	StreamConfig      StreamConfig            `json:"stream_config"`
+	StreamState       StreamState             `json:"stream_state"`
+	MessageCheckpoint s3TierCheckpoint        `json:"message_checkpoint"`
+	Consumers         []SnapshotConsumerState `json:"consumers,omitempty"`
 }
 
 // s3TierRemoteRestoreActivation is a conditionally-created remote receipt for

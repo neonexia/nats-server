@@ -803,7 +803,7 @@ func TestJetStreamS3TierRemoteRestoreAbortResumesSource(t *testing.T) {
 	sendStreamMsg(t, nc, "abort.events", "accepted-after-abort")
 }
 
-func TestJetStreamS3TierRemoteRestorePrepareRejectsConsumers(t *testing.T) {
+func TestJetStreamS3TierRemoteRestoreCheckpointsConsumers(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -822,17 +822,36 @@ func TestJetStreamS3TierRemoteRestorePrepareRejectsConsumers(t *testing.T) {
 	}
 	nc := clientConnectToServer(t, s)
 	defer nc.Close()
-	body, _ := json.Marshal(JSApiStreamRemoteRestoreRequest{OperationID: "consumers_1"})
-	msg, err := nc.Request(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "CONSUMERS"), body, 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
+	sendStreamMsg(t, nc, "consumers.events", "one")
+	request := func(subject string) JSApiStreamRemoteRestoreResponse {
+		t.Helper()
+		body, _ := json.Marshal(JSApiStreamRemoteRestoreRequest{OperationID: "consumers_1"})
+		msg, err := nc.Request(subject, body, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resp JSApiStreamRemoteRestoreResponse
+		if err := json.Unmarshal(msg.Data, &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
 	}
-	var resp JSApiStreamRemoteRestoreResponse
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		t.Fatal(err)
-	}
-	if resp.Error == nil || !strings.Contains(resp.Error.Description, "without consumers") {
+	if resp := request(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "CONSUMERS")); resp.Error != nil || resp.State != s3TierRemoteRestorePrepared {
 		t.Fatalf("prepare with consumer response: %+v", resp)
+	}
+	checkpoint := request(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "CONSUMERS"))
+	if checkpoint.Error != nil || checkpoint.State != s3TierRemoteRestoreCheckpointed {
+		t.Fatalf("checkpoint response: %+v", checkpoint)
+	}
+	store.mu.Lock()
+	data := append([]byte(nil), store.objects[checkpoint.CheckpointKey]...)
+	store.mu.Unlock()
+	var remote s3TierRemoteRestoreCheckpoint
+	if err := json.Unmarshal(data, &remote); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.Consumers) != 1 || remote.Consumers[0].ConsumerConfig.Durable != "C" || remote.Consumers[0].ConsumerState == nil {
+		t.Fatalf("checkpoint consumers: %+v", remote.Consumers)
 	}
 }
 
@@ -908,7 +927,11 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	defer source.Shutdown()
 	cfg := &StreamConfig{Name: "MOVE", Subjects: []string{"move.target"}, Storage: FileStorage,
 		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
-	if _, err := source.GlobalAccount().addStream(cfg); err != nil {
+	sourceMset, err := source.GlobalAccount().addStream(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceMset.addConsumer(&ConsumerConfig{Durable: "C", AckPolicy: AckExplicit}); err != nil {
 		t.Fatal(err)
 	}
 	sourceNC := clientConnectToServer(t, source)
@@ -958,6 +981,9 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if consumer := mset.lookupConsumer("C"); consumer == nil {
+		t.Fatal("target did not restore durable consumer")
+	}
 	stored, err := mset.getMsg(10)
 	if err != nil || string(stored.Data) != "source-9" {
 		t.Fatalf("target recovered message = (%+v, %v)", stored, err)
@@ -979,7 +1005,7 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 		t.Fatalf("restore retry response: %+v", retried)
 	}
 	// A completed source remains readable but cannot become a second writer.
-	sourceMset, err := source.GlobalAccount().lookupStream("MOVE")
+	sourceMset, err = source.GlobalAccount().lookupStream("MOVE")
 	if err != nil {
 		t.Fatal(err)
 	}
