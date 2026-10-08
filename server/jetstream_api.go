@@ -613,18 +613,21 @@ type JSApiStreamRestoreRemoteRequest struct {
 	TargetID      string `json:"target_id"`
 }
 
-// JSApiStreamRemoteRestoreResponse reports source-side fencing and checkpoint
-// state. CheckpointKey is opaque S3 metadata; credentials stay in server
-// configuration and are never returned by this API.
+// JSApiStreamRemoteRestoreResponse reports source-side fencing or target activation
+// state. Status responses include the stream's consumer count and S3-tier
+// counters so a coordinator can monitor and retry without S3 credentials.
+// CheckpointKey is opaque S3 metadata; credentials stay in server configuration.
 type JSApiStreamRemoteRestoreResponse struct {
 	ApiResponse
-	Success          bool   `json:"success,omitempty"`
-	OperationID      string `json:"operation_id,omitempty"`
-	Epoch            uint64 `json:"epoch,omitempty"`
-	State            string `json:"state,omitempty"`
-	CheckpointKey    string `json:"checkpoint_key,omitempty"`
-	CheckpointSHA256 string `json:"checkpoint_sha256,omitempty"`
-	TargetID         string `json:"target_id,omitempty"`
+	Success          bool         `json:"success,omitempty"`
+	OperationID      string       `json:"operation_id,omitempty"`
+	Epoch            uint64       `json:"epoch,omitempty"`
+	State            string       `json:"state,omitempty"`
+	CheckpointKey    string       `json:"checkpoint_key,omitempty"`
+	CheckpointSHA256 string       `json:"checkpoint_sha256,omitempty"`
+	TargetID         string       `json:"target_id,omitempty"`
+	Consumers        int          `json:"consumers,omitempty"`
+	S3Tier           *S3TierStats `json:"s3_tier,omitempty"`
 }
 
 const JSApiStreamRemoteRestoreResponseType = "io.nats.jetstream.api.v1.stream_remote_restore_response"
@@ -4556,6 +4559,15 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 
 	if action == s3TierRemoteRestoreStatus {
 		remoteRestoreResponse(&resp, fs.tier.remoteRestoreState())
+		if activation := fs.tier.remoteRestoreActivation(); activation != nil {
+			resp.OperationID, resp.Epoch, resp.State = activation.OperationID, activation.Epoch, "active"
+			resp.CheckpointKey, resp.TargetID = activation.CheckpointKey, activation.TargetID
+		}
+		mset.mu.RLock()
+		resp.Consumers = len(mset.consumers)
+		mset.mu.RUnlock()
+		stats := fs.S3TierStats()
+		resp.S3Tier = stats
 		resp.Success = true
 		s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 		return
@@ -4616,10 +4628,21 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 		})
 	}
 	if err != nil {
+		fs.tier.stats.restoreErrors.Add(1)
+		s.Warnf("S3 tier remote restore %s for stream %q failed: %v", req.OperationID, stream, err)
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	switch action {
+	case s3TierRemoteRestorePrepare:
+		fs.tier.stats.restorePrepares.Add(1)
+	case s3TierRemoteRestoreCheckpointAction:
+		fs.tier.stats.restoreCheckpoints.Add(1)
+	case s3TierRemoteRestoreAbort:
+		fs.tier.stats.restoreAborts.Add(1)
+	}
+	s.Noticef("S3 tier remote restore %s for stream %q is %s at epoch %d", req.OperationID, stream, state.State, state.Epoch)
 	mset.mu.Lock()
 	mset.remoteRestore = state
 	mset.mu.Unlock()
@@ -4828,6 +4851,8 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	fs.tier.stats.restoreActivations.Add(1)
+	s.Noticef("S3 tier remote restore %s activated stream %q on target %q at epoch %d", req.OperationID, stream, req.TargetID, req.ExpectedEpoch)
 	resp.Success, resp.OperationID, resp.Epoch, resp.State = true, activation.OperationID, activation.Epoch, "active"
 	resp.CheckpointKey, resp.TargetID = activation.CheckpointKey, activation.TargetID
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))

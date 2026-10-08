@@ -764,6 +764,56 @@ func TestJetStreamS3TierRemoteRestoreSourceAPI(t *testing.T) {
 	if status.Error != nil || status.State != s3TierRemoteRestoreCheckpointed || status.OperationID != "move_1" {
 		t.Fatalf("status response: %+v", status)
 	}
+	if status.S3Tier == nil || status.S3Tier.RestorePrepares == 0 || status.S3Tier.RestoreCheckpoints == 0 {
+		t.Fatalf("status is missing remote restore metrics: %+v", status)
+	}
+}
+
+func TestJetStreamS3TierRemoteRestoreCheckpointFailureRetries(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	cfg := &StreamConfig{Name: "RETRY", Subjects: []string{"retry.events"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	fcfg := &FileStoreConfig{BlockSize: 16 * 1024, S3Tier: &S3TierConfig{
+		Store: store, Prefix: "test/remote-restore-retry", LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29,
+		RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
+	}}
+	if _, err := s.GlobalAccount().addStreamWithStore(cfg, fcfg); err != nil {
+		t.Fatal(err)
+	}
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+	sendStreamMsg(t, nc, "retry.events", "one")
+	request := func(subject string) JSApiStreamRemoteRestoreResponse {
+		t.Helper()
+		body, _ := json.Marshal(JSApiStreamRemoteRestoreRequest{OperationID: "retry_1"})
+		msg, err := nc.Request(subject, body, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resp JSApiStreamRemoteRestoreResponse
+		if err := json.Unmarshal(msg.Data, &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	if resp := request(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "RETRY")); resp.Error != nil || resp.State != s3TierRemoteRestorePrepared {
+		t.Fatalf("prepare response: %+v", resp)
+	}
+	store.failPut = true
+	if resp := request(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "RETRY")); resp.Error == nil {
+		t.Fatal("expected checkpoint failure")
+	}
+	// The durable source fence survives a remote outage. It keeps writers out
+	// while the coordinator retries the same operation ID after recovery.
+	if resp := request(fmt.Sprintf(JSApiStreamRemoteRestoreStatusT, "RETRY")); resp.State != s3TierRemoteRestorePrepared || resp.S3Tier == nil || resp.S3Tier.RestoreErrors == 0 {
+		t.Fatalf("status after failed checkpoint: %+v", resp)
+	}
+	store.failPut = false
+	if resp := request(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "RETRY")); resp.Error != nil || resp.State != s3TierRemoteRestoreCheckpointed {
+		t.Fatalf("checkpoint retry response: %+v", resp)
+	}
 }
 
 func TestJetStreamS3TierRemoteRestoreAbortResumesSource(t *testing.T) {
@@ -966,7 +1016,25 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	targetNC := clientConnectToServer(t, target)
 	defer targetNC.Close()
 	restoreRequest, _ := json.Marshal(JSApiStreamRestoreRemoteRequest{OperationID: "handoff_1", ExpectedEpoch: checkpoint.Epoch, TargetID: "node-b"})
+	// A failed target download must leave no partial, inactive stream behind.
+	// The coordinator can retry the same immutable checkpoint once S3 recovers.
+	store.failGet = true
 	msg, err := targetNC.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE"), restoreRequest, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failedRestore JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(msg.Data, &failedRestore); err != nil {
+		t.Fatal(err)
+	}
+	if failedRestore.Error == nil {
+		t.Fatalf("restore during S3 outage response: %+v", failedRestore)
+	}
+	if _, err := target.GlobalAccount().lookupStream("MOVE"); err == nil {
+		t.Fatal("failed target restore retained a stream")
+	}
+	store.failGet = false
+	msg, err = targetNC.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE"), restoreRequest, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -983,6 +1051,17 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	}
 	if consumer := mset.lookupConsumer("C"); consumer == nil {
 		t.Fatal("target did not restore durable consumer")
+	}
+	statusMsg, err := targetNC.Request(fmt.Sprintf(JSApiStreamRemoteRestoreStatusT, "MOVE"), nil, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var targetStatus JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(statusMsg.Data, &targetStatus); err != nil {
+		t.Fatal(err)
+	}
+	if targetStatus.Error != nil || targetStatus.State != "active" || targetStatus.TargetID != "node-b" || targetStatus.Consumers != 1 || targetStatus.S3Tier == nil || targetStatus.S3Tier.RestoreActivations == 0 {
+		t.Fatalf("target restore status: %+v", targetStatus)
 	}
 	stored, err := mset.getMsg(10)
 	if err != nil || string(stored.Data) != "source-9" {

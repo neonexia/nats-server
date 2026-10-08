@@ -88,24 +88,29 @@ type S3TierServerConfig struct {
 // S3TierStats reports physical tier activity separately from the stream's
 // logical retention counters. Values are exposed in the JetStream monitor view.
 type S3TierStats struct {
-	LocalBytes     uint64 `json:"local_bytes"`
-	RemoteBytes    uint64 `json:"remote_bytes"`
-	RemoteBlocks   uint64 `json:"remote_blocks"`
-	Fetches        uint64 `json:"fetches"`
-	FetchErrors    uint64 `json:"fetch_errors"`
-	CacheHits      uint64 `json:"cache_hits"`
-	Uploads        uint64 `json:"uploads"`
-	UploadErrors   uint64 `json:"upload_errors"`
-	Evictions      uint64 `json:"evictions"`
-	CapacityErrors uint64 `json:"capacity_errors"`
-	HighWatermark  uint64 `json:"high_watermark"`
-	LowWatermark   uint64 `json:"low_watermark"`
-	RemoteHigh     uint64 `json:"remote_high_watermark"`
-	RemoteLow      uint64 `json:"remote_low_watermark"`
-	CheckpointSeq  uint64 `json:"checkpoint_sequence"`
-	BacklogBytes   uint64 `json:"backlog_bytes"`
-	BacklogBlocks  uint64 `json:"backlog_blocks"`
-	RetryAttempts  uint64 `json:"retry_attempts"`
+	LocalBytes         uint64 `json:"local_bytes"`
+	RemoteBytes        uint64 `json:"remote_bytes"`
+	RemoteBlocks       uint64 `json:"remote_blocks"`
+	Fetches            uint64 `json:"fetches"`
+	FetchErrors        uint64 `json:"fetch_errors"`
+	CacheHits          uint64 `json:"cache_hits"`
+	Uploads            uint64 `json:"uploads"`
+	UploadErrors       uint64 `json:"upload_errors"`
+	Evictions          uint64 `json:"evictions"`
+	CapacityErrors     uint64 `json:"capacity_errors"`
+	HighWatermark      uint64 `json:"high_watermark"`
+	LowWatermark       uint64 `json:"low_watermark"`
+	RemoteHigh         uint64 `json:"remote_high_watermark"`
+	RemoteLow          uint64 `json:"remote_low_watermark"`
+	CheckpointSeq      uint64 `json:"checkpoint_sequence"`
+	BacklogBytes       uint64 `json:"backlog_bytes"`
+	BacklogBlocks      uint64 `json:"backlog_blocks"`
+	RetryAttempts      uint64 `json:"retry_attempts"`
+	RestorePrepares    uint64 `json:"restore_prepares"`
+	RestoreCheckpoints uint64 `json:"restore_checkpoints"`
+	RestoreAborts      uint64 `json:"restore_aborts"`
+	RestoreActivations uint64 `json:"restore_activations"`
+	RestoreErrors      uint64 `json:"restore_errors"`
 }
 
 // S3TierObjectStore makes the block protocol testable with fault injection.
@@ -362,6 +367,7 @@ type fileS3Tier struct {
 
 type s3TierCounters struct {
 	fetches, fetchErrors, cacheHits, uploads, uploadErrors, evictions, capacityErrors, retryAttempts atomic.Uint64
+	restorePrepares, restoreCheckpoints, restoreAborts, restoreActivations, restoreErrors            atomic.Uint64
 }
 
 type s3TierFetch struct {
@@ -1405,6 +1411,9 @@ func (t *fileS3Tier) statsSnapshot() S3TierStats {
 		CapacityErrors: t.stats.capacityErrors.Load(), HighWatermark: t.cfg.LocalHighBytes, LowWatermark: t.cfg.LocalLowBytes,
 		RemoteHigh: t.cfg.RemoteHighBytes, RemoteLow: t.cfg.RemoteLowBytes, CheckpointSeq: checkpointSeq,
 		BacklogBytes: backlogBytes, BacklogBlocks: backlogBlocks, RetryAttempts: t.stats.retryAttempts.Load(),
+		RestorePrepares: t.stats.restorePrepares.Load(), RestoreCheckpoints: t.stats.restoreCheckpoints.Load(),
+		RestoreAborts: t.stats.restoreAborts.Load(), RestoreActivations: t.stats.restoreActivations.Load(),
+		RestoreErrors: t.stats.restoreErrors.Load(),
 	}
 }
 
