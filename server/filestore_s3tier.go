@@ -781,12 +781,18 @@ func (t *fileS3Tier) prepareRemoteRestore(operationID string) (*s3TierRemoteRest
 
 func (t *fileS3Tier) abortRemoteRestore(operationID string) (*s3TierRemoteRestoreState, error) {
 	t.mu.Lock()
-	if t.restore == nil || t.restore.OperationID != operationID || t.restore.State != s3TierRemoteRestorePrepared {
+	if t.restore == nil || t.restore.OperationID != operationID {
 		t.mu.Unlock()
 		return nil, errors.New("remote restore operation is not prepared")
 	}
 	state := *t.restore
 	t.mu.Unlock()
+	if state.State == s3TierRemoteRestoreAborted {
+		return &state, nil
+	}
+	if state.State != s3TierRemoteRestorePrepared {
+		return nil, errors.New("remote restore operation is not prepared")
+	}
 	state.State, state.Updated = s3TierRemoteRestoreAborted, time.Now().UTC()
 	if buf, found, err := t.getImmutableIfPresent(t.remoteRestoreAbortKey(operationID)); err != nil {
 		return nil, err

@@ -31,6 +31,8 @@ type testS3BlockStore struct {
 	failDescriptor bool
 	failManifest   bool
 	failCheckpoint bool
+	failActivation bool
+	failRetirement bool
 	failGet        bool
 	blockPut       bool
 }
@@ -125,7 +127,7 @@ func (s *blockingS3BlockStore) blockGetCount() int {
 func (s *testS3BlockStore) Put(_ context.Context, key string, buf []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.failPut || (s.failDescriptor && strings.Contains(key, "/descriptors/")) || (s.failManifest && strings.Contains(key, "/manifests/")) || (s.failCheckpoint && strings.Contains(key, "/checkpoints/")) {
+	if s.failPut || (s.failDescriptor && strings.Contains(key, "/descriptors/")) || (s.failManifest && strings.Contains(key, "/manifests/")) || (s.failCheckpoint && strings.Contains(key, "/checkpoints/") || (s.failActivation && strings.Contains(key, "/activation.json")) || (s.failRetirement && strings.Contains(key, "/retirement.json"))) {
 		return errors.New("injected PUT failure")
 	}
 	s.objects[key] = append([]byte(nil), buf...)
@@ -155,7 +157,7 @@ func (s *testS3BlockStore) PutIfAbsent(ctx context.Context, key string, buf []by
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if s.failPut || (s.failDescriptor && strings.Contains(key, "/descriptors/")) || (s.failManifest && strings.Contains(key, "/manifests/")) || (s.failCheckpoint && strings.Contains(key, "/checkpoints/")) {
+	if s.failPut || (s.failDescriptor && strings.Contains(key, "/descriptors/")) || (s.failManifest && strings.Contains(key, "/manifests/")) || (s.failCheckpoint && strings.Contains(key, "/checkpoints/") || (s.failActivation && strings.Contains(key, "/activation.json")) || (s.failRetirement && strings.Contains(key, "/retirement.json"))) {
 		return false, errors.New("injected PUT failure")
 	}
 	s.objects[key] = append([]byte(nil), buf...)
@@ -764,7 +766,7 @@ func TestJetStreamS3TierRemoteRestoreSourceAPI(t *testing.T) {
 	if err := json.Unmarshal(statusMsg.Data, &status); err != nil {
 		t.Fatal(err)
 	}
-	if status.Error != nil || status.State != s3TierRemoteRestoreCheckpointed || status.OperationID != "move_1" {
+	if status.Error != nil || status.State != s3TierRemoteRestoreCheckpointed || status.OperationID != "move_1" || status.NextAction != "restore_remote" {
 		t.Fatalf("status response: %+v", status)
 	}
 	if status.S3Tier == nil || status.S3Tier.RestorePrepares == 0 || status.S3Tier.RestoreCheckpoints == 0 {
@@ -801,8 +803,13 @@ func TestJetStreamS3TierRemoteRestoreCheckpointFailureRetries(t *testing.T) {
 		}
 		return resp
 	}
+	store.failPut = true
+	if resp := request(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "RETRY")); resp.Error == nil {
+		t.Fatalf("prepare during S3 write failure response: %+v", resp)
+	}
+	store.failPut = false
 	if resp := request(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "RETRY")); resp.Error != nil || resp.State != s3TierRemoteRestorePrepared {
-		t.Fatalf("prepare response: %+v", resp)
+		t.Fatalf("prepare retry response: %+v", resp)
 	}
 	store.failPut = true
 	if resp := request(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "RETRY")); resp.Error == nil {
@@ -850,8 +857,11 @@ func TestJetStreamS3TierRemoteRestoreAbortResumesSource(t *testing.T) {
 	if resp := call(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "ABORT")); resp.Error != nil || resp.State != s3TierRemoteRestorePrepared {
 		t.Fatalf("prepare response: %+v", resp)
 	}
-	if resp := call(fmt.Sprintf(JSApiStreamAbortRemoteRestoreT, "ABORT")); resp.Error != nil || resp.State != s3TierRemoteRestoreAborted {
+	if resp := call(fmt.Sprintf(JSApiStreamAbortRemoteRestoreT, "ABORT")); resp.Error != nil || resp.State != s3TierRemoteRestoreAborted || resp.NextAction != "prepare_remote_restore" {
 		t.Fatalf("abort response: %+v", resp)
+	}
+	if resp := call(fmt.Sprintf(JSApiStreamAbortRemoteRestoreT, "ABORT")); resp.Error != nil || resp.State != s3TierRemoteRestoreAborted {
+		t.Fatalf("idempotent abort response: %+v", resp)
 	}
 	sendStreamMsg(t, nc, "abort.events", "accepted-after-abort")
 }
@@ -1037,6 +1047,22 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 		t.Fatal("failed target restore retained a stream")
 	}
 	store.failGet = false
+	store.failActivation = true
+	msg, err = targetNC.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE"), restoreRequest, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var activationWriteFailure JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(msg.Data, &activationWriteFailure); err != nil {
+		t.Fatal(err)
+	}
+	if activationWriteFailure.Error == nil {
+		t.Fatalf("restore during activation write failure response: %+v", activationWriteFailure)
+	}
+	if _, err := target.GlobalAccount().lookupStream("MOVE"); err == nil {
+		t.Fatal("activation write failure retained a stream")
+	}
+	store.failActivation = false
 	msg, err = targetNC.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE"), restoreRequest, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -1063,7 +1089,7 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	if err := json.Unmarshal(statusMsg.Data, &targetStatus); err != nil {
 		t.Fatal(err)
 	}
-	if targetStatus.Error != nil || targetStatus.State != "active" || targetStatus.TargetID != "node-b" || targetStatus.Consumers != 1 || targetStatus.S3Tier == nil || targetStatus.S3Tier.RestoreActivations == 0 {
+	if targetStatus.Error != nil || targetStatus.State != "active" || targetStatus.TargetID != "node-b" || targetStatus.Consumers != 1 || targetStatus.S3Tier == nil || targetStatus.S3Tier.RestoreActivations == 0 || targetStatus.NextAction != "retire_remote_source" {
 		t.Fatalf("target restore status: %+v", targetStatus)
 	}
 	stored, err := mset.getMsg(10)
@@ -1109,8 +1135,16 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	// Retirement requires the durable target activation receipt. It removes only
 	// source-local resources; the immutable S3 checkpoint stays available for
 	// later audit or restore work.
+	store.failRetirement = true
+	if failedRetire := requestSource(fmt.Sprintf(JSApiStreamRetireRemoteSourceT, "MOVE")); failedRetire.Error == nil {
+		t.Fatalf("retire during receipt write failure response: %+v", failedRetire)
+	}
+	if _, err := source.GlobalAccount().lookupStream("MOVE"); err != nil {
+		t.Fatalf("source disappeared after failed retirement receipt: %v", err)
+	}
+	store.failRetirement = false
 	retire := requestSource(fmt.Sprintf(JSApiStreamRetireRemoteSourceT, "MOVE"))
-	if retire.Error != nil || !retire.Success || retire.State != s3TierRemoteRestoreRetired || retire.TargetID != "node-b" {
+	if retire.Error != nil || !retire.Success || retire.State != s3TierRemoteRestoreRetired || retire.TargetID != "node-b" || retire.NextAction != "none" {
 		t.Fatalf("retire response: %+v", retire)
 	}
 	if _, err := source.GlobalAccount().lookupStream("MOVE"); err == nil {
@@ -1125,6 +1159,9 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	// A lost retirement response is idempotent after source-local removal.
 	if retry := requestSource(fmt.Sprintf(JSApiStreamRetireRemoteSourceT, "MOVE")); retry.Error != nil || !retry.Success || retry.State != s3TierRemoteRestoreRetired {
 		t.Fatalf("retire retry response: %+v", retry)
+	}
+	if status := requestSource(fmt.Sprintf(JSApiStreamRemoteRestoreStatusT, "MOVE")); status.Error != nil || status.State != s3TierRemoteRestoreRetired || status.NextAction != "none" {
+		t.Fatalf("retired source status response: %+v", status)
 	}
 	otherOpts := newOptions(t.TempDir())
 	otherTarget := RunServer(&otherOpts)

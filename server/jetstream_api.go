@@ -630,6 +630,7 @@ type JSApiStreamRemoteRestoreResponse struct {
 	TargetID         string       `json:"target_id,omitempty"`
 	Consumers        int          `json:"consumers,omitempty"`
 	S3Tier           *S3TierStats `json:"s3_tier,omitempty"`
+	NextAction       string       `json:"next_action,omitempty"`
 }
 
 const JSApiStreamRemoteRestoreResponseType = "io.nats.jetstream.api.v1.stream_remote_restore_response"
@@ -4525,6 +4526,7 @@ func (s *Server) jsStreamRetireRemoteSourceRequest(_ *subscription, c *client, _
 			if retired, retiredErr := tier.remoteRestoreRetirement(req.OperationID); retiredErr == nil && retired != nil {
 				resp.Success, resp.OperationID, resp.Epoch, resp.State = true, retired.OperationID, retired.Epoch, s3TierRemoteRestoreRetired
 				resp.CheckpointKey, resp.TargetID = retired.CheckpointKey, retired.TargetID
+				resp.NextAction = remoteRestoreNextAction(resp.State)
 				s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 				return
 			}
@@ -4578,6 +4580,7 @@ func (s *Server) jsStreamRetireRemoteSourceRequest(_ *subscription, c *client, _
 	s.Noticef("S3 tier remote source retirement %s released stream %q at epoch %d", req.OperationID, stream, retired.Epoch)
 	resp.Success, resp.OperationID, resp.Epoch, resp.State = true, retired.OperationID, retired.Epoch, s3TierRemoteRestoreRetired
 	resp.CheckpointKey, resp.TargetID = retired.CheckpointKey, retired.TargetID
+	resp.NextAction = remoteRestoreNextAction(resp.State)
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 }
 
@@ -4600,6 +4603,23 @@ func remoteRestoreConsumers(mset *stream) ([]SnapshotConsumerState, error) {
 		consumers = append(consumers, SnapshotConsumerState{ConsumerConfig: &configCopy, ConsumerState: state})
 	}
 	return consumers, nil
+}
+
+func remoteRestoreNextAction(state string) string {
+	switch state {
+	case s3TierRemoteRestorePrepared:
+		return "checkpoint_remote_restore"
+	case s3TierRemoteRestoreCheckpointed:
+		return "restore_remote"
+	case "active":
+		return "retire_remote_source"
+	case s3TierRemoteRestoreAborted:
+		return "prepare_remote_restore"
+	case s3TierRemoteRestoreRetired:
+		return "none"
+	default:
+		return "prepare_remote_restore"
+	}
 }
 
 func remoteRestoreResponse(resp *JSApiStreamRemoteRestoreResponse, state *s3TierRemoteRestoreState) {
@@ -4641,9 +4661,31 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	var req JSApiStreamRemoteRestoreRequest
+	if action != s3TierRemoteRestoreStatus || len(msg) > 0 {
+		if err := json.Unmarshal(msg, &req); err != nil {
+			resp.Error = NewJSStreamGeneralError(fmt.Errorf("invalid remote restore request: %w", err), Unless(err))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
+	}
 	stream := streamNameFromSubject(subject)
 	mset, err := acc.lookupStream(stream)
 	if err != nil {
+		// Status remains queryable after retirement when the caller supplies
+		// its stable operation ID. This is needed after local source cleanup.
+		if action == s3TierRemoteRestoreStatus && validS3TierRemoteRestoreOperationID(req.OperationID) {
+			if cfg := s.s3TierConfigForRemoteRestore(acc, stream); cfg != nil && cfg.Store != nil {
+				tier := &fileS3Tier{cfg: *cfg}
+				if retired, retiredErr := tier.remoteRestoreRetirement(req.OperationID); retiredErr == nil && retired != nil {
+					resp.Success, resp.OperationID, resp.Epoch, resp.State = true, retired.OperationID, retired.Epoch, s3TierRemoteRestoreRetired
+					resp.CheckpointKey, resp.TargetID = retired.CheckpointKey, retired.TargetID
+					resp.NextAction = remoteRestoreNextAction(resp.State)
+					s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
+					return
+				}
+			}
+		}
 		resp.Error = NewJSStreamNotFoundError(Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
@@ -4657,15 +4699,6 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 		return
 	}
 
-	var req JSApiStreamRemoteRestoreRequest
-	if action != s3TierRemoteRestoreStatus {
-		if err := json.Unmarshal(msg, &req); err != nil {
-			resp.Error = NewJSStreamGeneralError(fmt.Errorf("invalid remote restore request: %w", err), Unless(err))
-			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
-			return
-		}
-	}
-
 	if action == s3TierRemoteRestoreStatus {
 		remoteRestoreResponse(&resp, fs.tier.remoteRestoreState())
 		if activation := fs.tier.remoteRestoreActivation(); activation != nil {
@@ -4677,6 +4710,7 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 		mset.mu.RUnlock()
 		stats := fs.S3TierStats()
 		resp.S3Tier = stats
+		resp.NextAction = remoteRestoreNextAction(resp.State)
 		resp.Success = true
 		s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 		return
@@ -4756,8 +4790,24 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 	mset.remoteRestore = state
 	mset.mu.Unlock()
 	remoteRestoreResponse(&resp, state)
+	resp.NextAction = remoteRestoreNextAction(resp.State)
 	resp.Success = true
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
+}
+
+// cleanupRemoteRestoreTarget removes a failed, inactive restore before a retry.
+// fileStore.Delete intentionally rejects generic S3-tier deletion so regular
+// stream deletion cannot erase remote history; this recovery-only path has
+// already rejected target activation and removes local staging only.
+func cleanupRemoteRestoreTarget(mset *stream) {
+	mset.mu.RLock()
+	fs, _ := mset.store.(*fileStore)
+	mset.mu.RUnlock()
+	_ = mset.stop(true, false)
+	if fs != nil {
+		_ = fs.Stop()
+		_ = removeAllWithRetry(fs.dios, fs.fcfg.StoreDir)
+	}
 }
 
 func (s *Server) s3TierConfigForRemoteRestore(acc *Account, stream string) *S3TierConfig {
@@ -4826,6 +4876,7 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 				if err == nil {
 					resp.Success, resp.OperationID, resp.Epoch, resp.State = true, activation.OperationID, activation.Epoch, "active"
 					resp.CheckpointKey, resp.TargetID = activation.CheckpointKey, activation.TargetID
+					resp.NextAction = remoteRestoreNextAction(resp.State)
 					s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 					return
 				}
@@ -4901,7 +4952,7 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 	state := mset.state()
 	expected := material.checkpoint.StreamState
 	if state.FirstSeq != expected.FirstSeq || state.LastSeq != expected.LastSeq || state.Msgs != expected.Msgs {
-		mset.stop(true, false)
+		cleanupRemoteRestoreTarget(mset)
 		err := errors.New("remote restore recovered stream state does not match checkpoint")
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
@@ -4909,14 +4960,14 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 	}
 	fs, ok := mset.store.(*fileStore)
 	if !ok || fs.tier == nil {
-		mset.stop(true, false)
+		cleanupRemoteRestoreTarget(mset)
 		resp.Error = NewJSStreamGeneralError(errS3TierNotEnabled, Unless(errS3TierNotEnabled))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	for _, snapshot := range material.checkpoint.Consumers {
 		if snapshot.ConsumerConfig == nil || snapshot.ConsumerState == nil {
-			mset.stop(true, false)
+			cleanupRemoteRestoreTarget(mset)
 			err := errors.New("remote restore checkpoint contains an invalid consumer")
 			resp.Error = NewJSStreamGeneralError(err, Unless(err))
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
@@ -4929,7 +4980,7 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 			o.mu.Unlock()
 		}
 		if addErr != nil {
-			mset.stop(true, false)
+			cleanupRemoteRestoreTarget(mset)
 			resp.Error = NewJSStreamGeneralError(fmt.Errorf("failed to restore consumer %q: %w", snapshot.ConsumerConfig.Name, addErr), Unless(addErr))
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
@@ -4938,7 +4989,7 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 	checkpointKey := tier.remoteRestoreCheckpointKey(req.OperationID)
 	activation, err := fs.tier.claimRemoteRestoreActivation(req.OperationID, req.ExpectedEpoch, req.TargetID, checkpointKey)
 	if err != nil {
-		mset.stop(true, false)
+		cleanupRemoteRestoreTarget(mset)
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
@@ -4946,7 +4997,7 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 	if err = fs.tier.writeRemoteRestoreActivation(activation); err != nil {
 		// The remote receipt is intentionally retained. A retry by the same
 		// target identity can rebuild the private directory and adopt it.
-		mset.stop(true, false)
+		cleanupRemoteRestoreTarget(mset)
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
@@ -4964,6 +5015,7 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 	s.Noticef("S3 tier remote restore %s activated stream %q on target %q at epoch %d", req.OperationID, stream, req.TargetID, req.ExpectedEpoch)
 	resp.Success, resp.OperationID, resp.Epoch, resp.State = true, activation.OperationID, activation.Epoch, "active"
 	resp.CheckpointKey, resp.TargetID = activation.CheckpointKey, activation.TargetID
+	resp.NextAction = remoteRestoreNextAction(resp.State)
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 }
 
