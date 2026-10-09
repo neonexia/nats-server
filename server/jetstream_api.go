@@ -98,6 +98,8 @@ const (
 	JSApiStreamRemoteRestoreStatusT     = "$JS.API.STREAM.REMOTE_RESTORE_STATUS.%s"
 	JSApiStreamRestoreRemote            = "$JS.API.STREAM.RESTORE_REMOTE.*"
 	JSApiStreamRestoreRemoteT           = "$JS.API.STREAM.RESTORE_REMOTE.%s"
+	JSApiStreamRetireRemoteSource       = "$JS.API.STREAM.RETIRE_REMOTE_SOURCE.*"
+	JSApiStreamRetireRemoteSourceT      = "$JS.API.STREAM.RETIRE_REMOTE_SOURCE.%s"
 
 	// JSApiStreamSnapshot is the endpoint to snapshot streams.
 	// Will return a stream of chunks with a nil chunk as EOF to
@@ -1200,6 +1202,7 @@ func (s *Server) setJetStreamExportSubs() error {
 		{JSApiStreamCheckpointRemoteRestore, s.jsStreamCheckpointRemoteRestoreRequest},
 		{JSApiStreamAbortRemoteRestore, s.jsStreamAbortRemoteRestoreRequest},
 		{JSApiStreamRemoteRestoreStatus, s.jsStreamRemoteRestoreStatusRequest},
+		{JSApiStreamRetireRemoteSource, s.jsStreamRetireRemoteSourceRequest},
 		{JSApiStreamRestoreRemote, s.jsStreamRestoreRemoteRequest},
 		{JSApiStreamSnapshot, s.jsStreamSnapshotRequest},
 		{JSApiStreamRestore, s.jsStreamRestoreRequest},
@@ -4470,6 +4473,112 @@ func (s *Server) jsStreamAbortRemoteRestoreRequest(_ *subscription, c *client, _
 
 func (s *Server) jsStreamRemoteRestoreStatusRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	s.jsStreamRemoteRestoreRequest(c, subject, reply, rmsg, s3TierRemoteRestoreStatus)
+}
+
+// jsStreamRetireRemoteSourceRequest retires an already-activated source. The
+// remote retirement receipt is durable before local resources are released, so
+// a retry after a lost response or a process exit is safe.
+func (s *Server) jsStreamRetireRemoteSourceRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	if c == nil || !s.JetStreamEnabled() {
+		return
+	}
+	ci, acc, hdr, msg, err := s.getRequestInfo(c, rmsg)
+	if err != nil {
+		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+	resp := JSApiStreamRemoteRestoreResponse{ApiResponse: ApiResponse{Type: JSApiStreamRemoteRestoreResponseType}}
+	if errorOnRequiredApiLevel(hdr) {
+		resp.Error = NewJSRequiredApiLevelError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if hasJS, doErr := acc.checkJetStream(); !hasJS {
+		if doErr {
+			resp.Error = NewJSNotEnabledForAccountError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+	if s.JetStreamIsClustered() {
+		resp.Error = NewJSStreamGeneralError(errS3TierClusteredDrain, Unless(errS3TierClusteredDrain))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	var req JSApiStreamRemoteRestoreRequest
+	if err := json.Unmarshal(msg, &req); err != nil || !validS3TierRemoteRestoreOperationID(req.OperationID) {
+		if err == nil {
+			err = errors.New("remote source retirement requires an operation_id")
+		}
+		resp.Error = NewJSStreamGeneralError(fmt.Errorf("invalid remote source retirement request: %w", err), Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	stream := streamNameFromSubject(subject)
+	mset, lookupErr := acc.lookupStream(stream)
+	if lookupErr != nil {
+		// A response can be lost after local cleanup. The immutable receipt is
+		// sufficient to make the coordinator's retry succeed without reviving
+		// a source stream or requiring object-store credentials from Nodus.
+		if cfg := s.s3TierConfigForRemoteRestore(acc, stream); cfg != nil && cfg.Store != nil {
+			tier := &fileS3Tier{cfg: *cfg}
+			if retired, retiredErr := tier.remoteRestoreRetirement(req.OperationID); retiredErr == nil && retired != nil {
+				resp.Success, resp.OperationID, resp.Epoch, resp.State = true, retired.OperationID, retired.Epoch, s3TierRemoteRestoreRetired
+				resp.CheckpointKey, resp.TargetID = retired.CheckpointKey, retired.TargetID
+				s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
+				return
+			}
+		}
+		resp.Error = NewJSStreamNotFoundError(Unless(lookupErr))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	mset.mu.RLock()
+	fs, ok := mset.store.(*fileStore)
+	state := mset.remoteRestore
+	streamConfig := mset.cfg
+	mset.mu.RUnlock()
+	if !ok || fs.tier == nil {
+		resp.Error = NewJSStreamGeneralError(errS3TierNotEnabled, Unless(errS3TierNotEnabled))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if state == nil || state.OperationID != req.OperationID || state.State != s3TierRemoteRestoreCheckpointed {
+		err = errors.New("remote source retirement requires a checkpointed operation")
+		fs.tier.stats.restoreErrors.Add(1)
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	retired, err := fs.tier.retireRemoteRestoreSource(state)
+	if err != nil {
+		fs.tier.stats.restoreErrors.Add(1)
+		s.Warnf("S3 tier remote source retirement %s for stream %q failed: %v", req.OperationID, stream, err)
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	// The receipt is the commit point. From here the source must never return
+	// to service, even if removal is interrupted; its existing restore fence
+	// keeps a restarted process read-only until cleanup resumes.
+	if err = mset.stop(false, false); err != nil {
+		fs.tier.stats.restoreErrors.Add(1)
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if err = removeAllWithRetry(fs.dios, fs.fcfg.StoreDir); err != nil {
+		fs.tier.stats.restoreErrors.Add(1)
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	s.getJetStream().releaseStreamResources(&streamConfig)
+	fs.tier.stats.restoreRetirements.Add(1)
+	s.Noticef("S3 tier remote source retirement %s released stream %q at epoch %d", req.OperationID, stream, retired.Epoch)
+	resp.Success, resp.OperationID, resp.Epoch, resp.State = true, retired.OperationID, retired.Epoch, s3TierRemoteRestoreRetired
+	resp.CheckpointKey, resp.TargetID = retired.CheckpointKey, retired.TargetID
+	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 }
 
 func remoteRestoreConsumers(mset *stream) ([]SnapshotConsumerState, error) {

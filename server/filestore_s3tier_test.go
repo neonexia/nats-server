@@ -753,6 +753,9 @@ func TestJetStreamS3TierRemoteRestoreSourceAPI(t *testing.T) {
 	if remoteCheckpoint.StreamConfig.Name != "MOVE" || remoteCheckpoint.StreamState.LastSeq != 10 {
 		t.Fatalf("remote checkpoint stream metadata: %+v", remoteCheckpoint)
 	}
+	if retired := request(fmt.Sprintf(JSApiStreamRetireRemoteSourceT, "MOVE")); retired.Error == nil || !strings.Contains(retired.Error.Description, "requires target activation") {
+		t.Fatalf("retire before target activation response: %+v", retired)
+	}
 	statusMsg, err := nc.Request(fmt.Sprintf(JSApiStreamRemoteRestoreStatusT, "MOVE"), nil, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -1102,6 +1105,26 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	}
 	if sourceAck.Error == nil || !strings.Contains(sourceAck.Error.Description, "fenced for remote restore") {
 		t.Fatalf("source publish after activation response: %+v", sourceAck)
+	}
+	// Retirement requires the durable target activation receipt. It removes only
+	// source-local resources; the immutable S3 checkpoint stays available for
+	// later audit or restore work.
+	retire := requestSource(fmt.Sprintf(JSApiStreamRetireRemoteSourceT, "MOVE"))
+	if retire.Error != nil || !retire.Success || retire.State != s3TierRemoteRestoreRetired || retire.TargetID != "node-b" {
+		t.Fatalf("retire response: %+v", retire)
+	}
+	if _, err := source.GlobalAccount().lookupStream("MOVE"); err == nil {
+		t.Fatal("retired source still has a stream")
+	}
+	store.mu.Lock()
+	_, checkpointRetained := store.objects[checkpoint.CheckpointKey]
+	store.mu.Unlock()
+	if !checkpointRetained {
+		t.Fatal("source retirement deleted the remote checkpoint")
+	}
+	// A lost retirement response is idempotent after source-local removal.
+	if retry := requestSource(fmt.Sprintf(JSApiStreamRetireRemoteSourceT, "MOVE")); retry.Error != nil || !retry.Success || retry.State != s3TierRemoteRestoreRetired {
+		t.Fatalf("retire retry response: %+v", retry)
 	}
 	otherOpts := newOptions(t.TempDir())
 	otherTarget := RunServer(&otherOpts)

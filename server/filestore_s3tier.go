@@ -110,6 +110,7 @@ type S3TierStats struct {
 	RestoreCheckpoints uint64 `json:"restore_checkpoints"`
 	RestoreAborts      uint64 `json:"restore_aborts"`
 	RestoreActivations uint64 `json:"restore_activations"`
+	RestoreRetirements uint64 `json:"restore_retirements"`
 	RestoreErrors      uint64 `json:"restore_errors"`
 }
 
@@ -301,6 +302,7 @@ const (
 	s3TierRemoteRestorePrepared     = "prepared"
 	s3TierRemoteRestoreCheckpointed = "checkpointed"
 	s3TierRemoteRestoreAborted      = "aborted"
+	s3TierRemoteRestoreRetired      = "retired"
 )
 
 // s3TierRemoteRestoreState is the durable source-side fence for a remote
@@ -346,6 +348,17 @@ type s3TierRemoteRestoreActivation struct {
 	Activated     time.Time `json:"activated"`
 }
 
+// s3TierRemoteRestoreRetirement is the immutable commit record that permits
+// source cleanup only after a matching target activation has been verified.
+type s3TierRemoteRestoreRetirement struct {
+	Version       uint8     `json:"version"`
+	OperationID   string    `json:"operation_id"`
+	Epoch         uint64    `json:"epoch"`
+	TargetID      string    `json:"target_id"`
+	CheckpointKey string    `json:"checkpoint_key"`
+	Retired       time.Time `json:"retired"`
+}
+
 type fileS3Tier struct {
 	fs             *fileStore
 	cfg            S3TierConfig
@@ -366,8 +379,8 @@ type fileS3Tier struct {
 }
 
 type s3TierCounters struct {
-	fetches, fetchErrors, cacheHits, uploads, uploadErrors, evictions, capacityErrors, retryAttempts atomic.Uint64
-	restorePrepares, restoreCheckpoints, restoreAborts, restoreActivations, restoreErrors            atomic.Uint64
+	fetches, fetchErrors, cacheHits, uploads, uploadErrors, evictions, capacityErrors, retryAttempts          atomic.Uint64
+	restorePrepares, restoreCheckpoints, restoreAborts, restoreActivations, restoreRetirements, restoreErrors atomic.Uint64
 }
 
 type s3TierFetch struct {
@@ -477,6 +490,10 @@ func (t *fileS3Tier) remoteRestoreCheckpointKey(operationID string) string {
 
 func (t *fileS3Tier) remoteRestoreActivationKey(operationID string) string {
 	return t.remoteRestorePrefix(operationID) + "/activation.json"
+}
+
+func (t *fileS3Tier) remoteRestoreRetirementKey(operationID string) string {
+	return t.remoteRestorePrefix(operationID) + "/retirement.json"
 }
 
 func (t *fileS3Tier) remoteRestoreActivationFile() string {
@@ -919,6 +936,64 @@ func (t *fileS3Tier) claimRemoteRestoreActivation(operationID string, epoch uint
 		return nil, fmt.Errorf("S3 tier remote restore activation verification failed: %w", err)
 	}
 	return activation, nil
+}
+
+func validS3TierRemoteRestoreRetirement(retirement *s3TierRemoteRestoreRetirement) bool {
+	return retirement != nil && retirement.Version == 1 && validS3TierRemoteRestoreOperationID(retirement.OperationID) &&
+		retirement.Epoch > 0 && retirement.TargetID != "" && retirement.CheckpointKey != "" && !retirement.Retired.IsZero()
+}
+
+func (t *fileS3Tier) remoteRestoreRetirement(operationID string) (*s3TierRemoteRestoreRetirement, error) {
+	buf, found, err := t.getImmutableIfPresent(t.remoteRestoreRetirementKey(operationID))
+	if err != nil || !found {
+		return nil, err
+	}
+	var retirement s3TierRemoteRestoreRetirement
+	if err := json.Unmarshal(buf, &retirement); err != nil || !validS3TierRemoteRestoreRetirement(&retirement) || retirement.OperationID != operationID {
+		return nil, errors.New("remote restore retirement is invalid")
+	}
+	return &retirement, nil
+}
+
+// retireRemoteRestoreSource first verifies a durable target activation, then
+// persists an immutable retirement receipt. The receipt makes local cleanup
+// retryable after a source crash without ever deleting remote recovery data.
+func (t *fileS3Tier) retireRemoteRestoreSource(state *s3TierRemoteRestoreState) (*s3TierRemoteRestoreRetirement, error) {
+	if state == nil || state.State != s3TierRemoteRestoreCheckpointed || state.CheckpointKey == "" {
+		return nil, errors.New("remote source retirement requires a checkpointed operation")
+	}
+	if existing, err := t.remoteRestoreRetirement(state.OperationID); err != nil {
+		return nil, err
+	} else if existing != nil {
+		if existing.Epoch != state.Epoch || existing.CheckpointKey != state.CheckpointKey {
+			return nil, errors.New("remote restore retirement conflicts with checkpoint")
+		}
+		return existing, nil
+	}
+	buf, found, err := t.getImmutableIfPresent(t.remoteRestoreActivationKey(state.OperationID))
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, errors.New("remote source retirement requires target activation")
+	}
+	var activation s3TierRemoteRestoreActivation
+	if err := json.Unmarshal(buf, &activation); err != nil || !validS3TierRemoteRestoreActivation(&activation) ||
+		activation.OperationID != state.OperationID || activation.Epoch != state.Epoch || activation.CheckpointKey != state.CheckpointKey {
+		return nil, errors.New("remote source retirement activation conflicts with checkpoint")
+	}
+	retirement := &s3TierRemoteRestoreRetirement{
+		Version: 1, OperationID: state.OperationID, Epoch: state.Epoch, TargetID: activation.TargetID,
+		CheckpointKey: state.CheckpointKey, Retired: time.Now().UTC(),
+	}
+	data, err := json.Marshal(retirement)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.putImmutable(t.remoteRestoreRetirementKey(state.OperationID), data); err != nil {
+		return nil, fmt.Errorf("S3 tier remote source retirement verification failed: %w", err)
+	}
+	return retirement, nil
 }
 
 func (t *fileS3Tier) ensureStreamRecord() (*s3TierStreamRecord, error) {
@@ -1413,7 +1488,7 @@ func (t *fileS3Tier) statsSnapshot() S3TierStats {
 		BacklogBytes: backlogBytes, BacklogBlocks: backlogBlocks, RetryAttempts: t.stats.retryAttempts.Load(),
 		RestorePrepares: t.stats.restorePrepares.Load(), RestoreCheckpoints: t.stats.restoreCheckpoints.Load(),
 		RestoreAborts: t.stats.restoreAborts.Load(), RestoreActivations: t.stats.restoreActivations.Load(),
-		RestoreErrors: t.stats.restoreErrors.Load(),
+		RestoreRetirements: t.stats.restoreRetirements.Load(), RestoreErrors: t.stats.restoreErrors.Load(),
 	}
 }
 
