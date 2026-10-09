@@ -1717,3 +1717,109 @@ func TestJetStreamS3TierServerRestart(t *testing.T) {
 		}
 	}
 }
+
+// TestJetStreamS3TierRemoteRestoreCompatibleEndpoint runs the complete
+// single-replica handoff through a real S3-compatible endpoint. Unit tests use
+// a fault-injecting store for deterministic failure boundaries; this test is
+// the separate compatibility gate for request signing, immutable writes,
+// listing, and cold restoration over the network.
+func TestJetStreamS3TierRemoteRestoreCompatibleEndpoint(t *testing.T) {
+	endpoint := os.Getenv("TEST_S3_TIER_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set TEST_S3_TIER_ENDPOINT to an S3-compatible endpoint")
+	}
+	store, err := NewS3TierMinIOStore(endpoint, "testaccess", "testsecret123", "tier-test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.client.MakeBucket(context.Background(), store.bucket, minio.MakeBucketOptions{}); err != nil {
+		if exists, existsErr := store.client.BucketExists(context.Background(), store.bucket); existsErr != nil || !exists {
+			t.Fatal(err)
+		}
+	}
+	prefix := fmt.Sprintf("integration/remote-restore/%d", time.Now().UnixNano())
+	newOptions := func(dir string) Options {
+		opts := DefaultTestOptions
+		opts.Port = -1
+		opts.JetStream = true
+		opts.StoreDir = dir
+		opts.JetStreamS3Tiers = map[string]*S3TierConfig{"$G/MOVE": {
+			Store: store, Prefix: prefix, BlockSize: 16 * 1024, LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29,
+			RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
+		}}
+		return opts
+	}
+	sourceOpts := newOptions(t.TempDir())
+	source := RunServer(&sourceOpts)
+	defer source.Shutdown()
+	cfg := &StreamConfig{Name: "MOVE", Subjects: []string{"move.integration"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	mset, err := source.GlobalAccount().addStream(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mset.addConsumer(&ConsumerConfig{Durable: "C", AckPolicy: AckExplicit}); err != nil {
+		t.Fatal(err)
+	}
+	sourceNC := clientConnectToServer(t, source)
+	defer sourceNC.Close()
+	for i := 0; i < 50; i++ {
+		sendStreamMsg(t, sourceNC, "move.integration", strings.Repeat(fmt.Sprintf("%02d", i), 512))
+	}
+	operation, _ := json.Marshal(JSApiStreamRemoteRestoreRequest{OperationID: "rustfs_handoff_1"})
+	requestSource := func(subject string) JSApiStreamRemoteRestoreResponse {
+		t.Helper()
+		msg, err := sourceNC.Request(subject, operation, 15*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response JSApiStreamRemoteRestoreResponse
+		if err := json.Unmarshal(msg.Data, &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	prepared := requestSource(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "MOVE"))
+	if prepared.Error != nil || prepared.State != s3TierRemoteRestorePrepared {
+		t.Fatalf("prepare response: %+v", prepared)
+	}
+	checkpoint := requestSource(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "MOVE"))
+	if checkpoint.Error != nil || checkpoint.State != s3TierRemoteRestoreCheckpointed {
+		t.Fatalf("checkpoint response: %+v", checkpoint)
+	}
+
+	targetOpts := newOptions(t.TempDir())
+	target := RunServer(&targetOpts)
+	defer target.Shutdown()
+	targetNC := clientConnectToServer(t, target)
+	defer targetNC.Close()
+	restoreRequest, _ := json.Marshal(JSApiStreamRestoreRemoteRequest{OperationID: "rustfs_handoff_1", ExpectedEpoch: checkpoint.Epoch, TargetID: "rustfs-target"})
+	msg, err := targetNC.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE"), restoreRequest, 15*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(msg.Data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Error != nil || !restored.Success || restored.State != "active" {
+		t.Fatalf("restore response: %+v", restored)
+	}
+	targetMset, err := target.GlobalAccount().lookupStream("MOVE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := targetMset.state(); state.Msgs != 50 || state.LastSeq != 50 {
+		t.Fatalf("target state: %+v", state)
+	}
+	if targetMset.lookupConsumer("C") == nil {
+		t.Fatal("target did not restore durable consumer")
+	}
+	retired := requestSource(fmt.Sprintf(JSApiStreamRetireRemoteSourceT, "MOVE"))
+	if retired.Error != nil || !retired.Success || retired.State != s3TierRemoteRestoreRetired {
+		t.Fatalf("retire response: %+v", retired)
+	}
+	if _, err := source.GlobalAccount().lookupStream("MOVE"); err == nil {
+		t.Fatal("source stream remains after retirement")
+	}
+}

@@ -4522,7 +4522,7 @@ func (s *Server) jsStreamRetireRemoteSourceRequest(_ *subscription, c *client, _
 		// sufficient to make the coordinator's retry succeed without reviving
 		// a source stream or requiring object-store credentials from Nodus.
 		if cfg := s.s3TierConfigForRemoteRestore(acc, stream); cfg != nil && cfg.Store != nil {
-			tier := &fileS3Tier{cfg: *cfg}
+			tier := newFileS3Tier(nil, *cfg)
 			if retired, retiredErr := tier.remoteRestoreRetirement(req.OperationID); retiredErr == nil && retired != nil {
 				resp.Success, resp.OperationID, resp.Epoch, resp.State = true, retired.OperationID, retired.Epoch, s3TierRemoteRestoreRetired
 				resp.CheckpointKey, resp.TargetID = retired.CheckpointKey, retired.TargetID
@@ -4676,7 +4676,7 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 		// its stable operation ID. This is needed after local source cleanup.
 		if action == s3TierRemoteRestoreStatus && validS3TierRemoteRestoreOperationID(req.OperationID) {
 			if cfg := s.s3TierConfigForRemoteRestore(acc, stream); cfg != nil && cfg.Store != nil {
-				tier := &fileS3Tier{cfg: *cfg}
+				tier := newFileS3Tier(nil, *cfg)
 				if retired, retiredErr := tier.remoteRestoreRetirement(req.OperationID); retiredErr == nil && retired != nil {
 					resp.Success, resp.OperationID, resp.Epoch, resp.State = true, retired.OperationID, retired.Epoch, s3TierRemoteRestoreRetired
 					resp.CheckpointKey, resp.TargetID = retired.CheckpointKey, retired.TargetID
@@ -4892,7 +4892,7 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
-	tier := &fileS3Tier{cfg: *tierConfig}
+	tier := newFileS3Tier(nil, *tierConfig)
 	material, err := tier.loadRemoteRestoreMaterial(req.OperationID, req.ExpectedEpoch)
 	if err != nil {
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))

@@ -103,17 +103,19 @@ func (p *process) stop() {
 	_ = p.log.Close()
 }
 
-func startDockerMinIO(name, hostPort, dataDir string) (*process, error) {
+func startDockerRustFS(name, hostPort, dataDir string) (*process, error) {
 	args := []string{
-		"run", "-d", "--rm", "--name", name,
+		"run", "-d", "--name", name,
 		"-p", fmt.Sprintf("127.0.0.1:%s:9000", hostPort),
 		"-v", dataDir + ":/data",
-		"-e", "MINIO_ROOT_USER=" + accessKey,
-		"-e", "MINIO_ROOT_PASSWORD=" + secretKey,
-		"minio/minio:RELEASE.2024-10-13T13-34-11Z", "server", "/data",
+		"-e", "RUSTFS_ACCESS_KEY=" + accessKey,
+		"-e", "RUSTFS_SECRET_KEY=" + secretKey,
+		"-e", "RUSTFS_ADDRESS=:9000",
+		"-e", "RUSTFS_CONSOLE_ENABLE=false",
+		"rustfs/rustfs:latest", "/data",
 	}
 	if output, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("start MinIO container: %w: %s", err, output)
+		return nil, fmt.Errorf("start RustFS container: %w: %s", err, output)
 	}
 	return &process{stopFn: func() { _ = exec.Command("docker", "rm", "-f", name).Run() }}, nil
 }
@@ -201,51 +203,67 @@ func consumeAndAck(js nats.JetStreamContext, durable string, expected int) error
 }
 
 func main() {
-	var natsServer, minioServer, minioMode string
+	var natsServer, objectStoreServer, objectStoreMode string
 	var publishers, messagesPerPublisher int
 	flag.StringVar(&natsServer, "nats-server", "./nats-server", "path to the forked nats-server binary")
-	flag.StringVar(&minioServer, "minio", "minio", "path to the MinIO binary when -minio-mode=process")
-	flag.StringVar(&minioMode, "minio-mode", "process", "MinIO runtime: docker or process")
+	flag.StringVar(&objectStoreServer, "object-store", "rustfs", "path to the RustFS binary when -object-store-mode=process")
+	flag.StringVar(&objectStoreMode, "object-store-mode", "docker", "object-store runtime: docker or process")
 	flag.IntVar(&publishers, "publishers", 3, "concurrent publisher count")
 	flag.IntVar(&messagesPerPublisher, "messages", 100, "messages per publisher")
 	flag.Parse()
 
-	root, err := os.MkdirTemp("", "s3-tier-reference-")
+	// Docker Desktop can mount /tmp reliably; the per-user temporary directory
+	// may be private to the host process and unreadable by the VM.
+	root, err := os.MkdirTemp("/tmp", "s3-tier-reference-")
 	if err != nil {
 		panic(err)
 	}
 	defer os.RemoveAll(root)
 	fmt.Printf("reference run directory: %s\n", root)
 
-	minioPort, _ := reservePort()
+	objectStorePort, _ := reservePort()
 	sourcePort, _ := reservePort()
 	targetPort, _ := reservePort()
-	minioData := filepath.Join(root, "minio")
+	objectStoreData := filepath.Join(root, "object-store")
 	logs := filepath.Join(root, "logs")
+	// Docker runs RustFS under its container user. The parent temporary directory
+	// is mode 0700 on macOS, so make only the bind-mounted data directory writable.
+	if err := os.MkdirAll(objectStoreData, 0o777); err != nil {
+		panic(err)
+	}
+	if err := os.Chmod(objectStoreData, 0o777); err != nil {
+		panic(err)
+	}
 	if err := os.MkdirAll(logs, 0o755); err != nil {
 		panic(err)
 	}
-	minioEnv := []string{"MINIO_ROOT_USER=" + accessKey, "MINIO_ROOT_PASSWORD=" + secretKey}
-	startMinIO := func(name string) (*process, error) {
-		switch minioMode {
+	objectStoreEnv := []string{
+		"RUSTFS_ACCESS_KEY=" + accessKey,
+		"RUSTFS_SECRET_KEY=" + secretKey,
+		fmt.Sprintf("RUSTFS_ADDRESS=127.0.0.1:%d", objectStorePort),
+		"RUSTFS_CONSOLE_ENABLE=false",
+	}
+	startObjectStore := func(name string) (*process, error) {
+		switch objectStoreMode {
 		case "docker":
-			return startDockerMinIO("s3-tier-reference-"+fmt.Sprint(minioPort), fmt.Sprint(minioPort), minioData)
+			return startDockerRustFS("s3-tier-reference-"+fmt.Sprint(objectStorePort), fmt.Sprint(objectStorePort), objectStoreData)
 		case "process":
-			return start(name, minioServer, []string{"server", "--address", fmt.Sprintf("127.0.0.1:%d", minioPort), minioData}, minioEnv, logs)
+			return start(name, objectStoreServer, []string{objectStoreData}, objectStoreEnv, logs)
 		default:
-			return nil, fmt.Errorf("unknown MinIO mode %q", minioMode)
+			return nil, fmt.Errorf("unknown object-store mode %q", objectStoreMode)
 		}
 	}
-	minioProcess, err := startMinIO("minio")
+	objectStoreProcess, err := startObjectStore("rustfs")
 	if err != nil {
 		panic(err)
 	}
-	defer func() { minioProcess.stop() }()
-	minioHealth := fmt.Sprintf("http://127.0.0.1:%d/minio/health/live", minioPort)
-	if err := waitFor(minioHealth, 15*time.Second); err != nil {
-		panic(err)
+	defer func() { objectStoreProcess.stop() }()
+	objectStoreHealth := fmt.Sprintf("http://127.0.0.1:%d/health", objectStorePort)
+	if err := waitFor(objectStoreHealth, 45*time.Second); err != nil {
+		logs, _ := exec.Command("docker", "logs", "s3-tier-reference-"+fmt.Sprint(objectStorePort)).CombinedOutput()
+		panic(fmt.Errorf("%w; RustFS logs: %s", err, logs))
 	}
-	endpoint := fmt.Sprintf("127.0.0.1:%d", minioPort)
+	endpoint := fmt.Sprintf("127.0.0.1:%d", objectStorePort)
 	client, err := minio.New(endpoint, &minio.Options{Creds: credentials.NewStaticV4(accessKey, secretKey, ""), Secure: false})
 	if err != nil {
 		panic(err)
@@ -273,7 +291,11 @@ jetstream {
     timeout: "2s"
     retry_min: "50ms"
     retry_max: "250ms"
-    credentials { provider: "env" access_key_env: "NATS_S3_TIER_ACCESS" secret_key_env: "NATS_S3_TIER_SECRET" }
+    credentials {
+      provider: "env"
+      access_key_env: "NATS_S3_TIER_ACCESS"
+      secret_key_env: "NATS_S3_TIER_SECRET"
+    }
   }
 }
 `, port, store, endpoint)
@@ -294,7 +316,8 @@ jetstream {
 	defer func() { source.stop() }()
 	sourceURL := fmt.Sprintf("nats://127.0.0.1:%d", sourcePort)
 	if err := waitForNATS(sourceURL, 15*time.Second); err != nil {
-		panic(err)
+		output, _ := os.ReadFile(filepath.Join(logs, "source.log"))
+		panic(fmt.Errorf("%w; source log: %s", err, output))
 	}
 	nc, err := nats.Connect(sourceURL)
 	if err != nil {
@@ -305,8 +328,13 @@ jetstream {
 	if err != nil {
 		panic(err)
 	}
-	if _, err := js.AddStream(&nats.StreamConfig{Name: streamName, Subjects: []string{subject}, Storage: nats.FileStorage, Retention: nats.LimitsPolicy}); err != nil {
-		panic(err)
+	if _, err := js.AddStream(&nats.StreamConfig{
+		Name: streamName, Subjects: []string{subject}, Storage: nats.FileStorage,
+		Retention: nats.LimitsPolicy, Discard: nats.DiscardNew,
+		DenyDelete: true, DenyPurge: true,
+	}); err != nil {
+		output, _ := os.ReadFile(filepath.Join(logs, "source.log"))
+		panic(fmt.Errorf("create source stream: %w; source log: %s", err, output))
 	}
 	for _, durable := range []string{"audit-a", "audit-b"} {
 		if _, err := js.AddConsumer(streamName, &nats.ConsumerConfig{Durable: durable, AckPolicy: nats.AckExplicitPolicy, DeliverPolicy: nats.DeliverAllPolicy}); err != nil {
@@ -384,22 +412,38 @@ jetstream {
 	defer targetNC.Close()
 
 	// An object-store outage produces a retryable restore error and leaves no
-	// active target. Restart MinIO, then use the same operation and target IDs.
-	minioProcess.stop()
+	// active target. Restart RustFS, then use the same operation and target IDs.
+	objectStoreProcess.stop()
 	failed, err := request(targetNC, "$JS.API.STREAM.RESTORE_REMOTE."+streamName, targetRequest{operation, checkpoint.Epoch, targetID})
 	if err != nil || failed.Error == nil {
-		panic(fmt.Errorf("expected target restore failure during MinIO outage: %v %+v", err, failed))
+		panic(fmt.Errorf("expected target restore failure during object-store outage: %v %+v", err, failed))
 	}
-	minioProcess, err = startMinIO("minio-restarted")
+	objectStoreProcess, err = startObjectStore("rustfs-restarted")
 	if err != nil {
 		panic(err)
 	}
-	if err := waitFor(minioHealth, 15*time.Second); err != nil {
+	if err := waitFor(objectStoreHealth, 45*time.Second); err != nil {
 		panic(err)
 	}
-	restored, err := request(targetNC, "$JS.API.STREAM.RESTORE_REMOTE."+streamName, targetRequest{operation, checkpoint.Epoch, targetID})
+	var restored restoreResponse
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		restored, err = request(targetNC, "$JS.API.STREAM.RESTORE_REMOTE."+streamName, targetRequest{operation, checkpoint.Epoch, targetID})
+		if err == nil && restored.Error == nil && restored.State == "active" && restored.NextAction == "retire_remote_source" {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if err != nil || mustActive(restored, "active") != nil || restored.NextAction != "retire_remote_source" {
-		panic(fmt.Errorf("restore: %v %+v", err, restored))
+		output, _ := os.ReadFile(filepath.Join(logs, "target.log"))
+		description := ""
+		if restored.Error != nil {
+			description = restored.Error.Description
+		}
+		panic(fmt.Errorf("restore: %v %+v (%s); target log: %s", err, restored, description, output))
 	}
 	targetJS, err := targetNC.JetStream()
 	if err != nil {
@@ -424,5 +468,5 @@ jetstream {
 	if err != nil || mustActive(status, "retired") != nil || status.NextAction != "none" {
 		panic(fmt.Errorf("retired status: %v %+v", err, status))
 	}
-	fmt.Printf("PASS: %d messages, %d publishers, two restored durable consumers; source restart and MinIO outage recovered. Logs: %s\n", total, publishers, logs)
+	fmt.Printf("PASS: %d messages, %d publishers, two restored durable consumers; source restart and object-store outage recovered. Logs: %s\n", total, publishers, logs)
 }
