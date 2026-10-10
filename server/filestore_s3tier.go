@@ -605,6 +605,58 @@ func (fs *fileStore) prepareS3Tier() error {
 	return nil
 }
 
+// recoverS3TierBlocks makes locally persisted descriptors part of file-store
+// recovery without contacting S3. A crash may leave the normal full-state file
+// behind an already committed remote block, because reclaim removes that block
+// from local disk. Tiered streams are append-only, so descriptor sequence ranges
+// are sufficient to restore the logical boundaries; payloads remain cold until
+// a reader selects their block and the usual hydration path fetches it.
+func (fs *fileStore) recoverS3TierBlocks() error {
+	if fs.tier == nil {
+		return nil
+	}
+	fs.tier.mu.Lock()
+	descriptors := make([]s3BlockDescriptor, 0, len(fs.tier.desc))
+	for _, d := range fs.tier.desc {
+		descriptors = append(descriptors, d)
+	}
+	fs.tier.mu.Unlock()
+	if len(descriptors) == 0 {
+		return nil
+	}
+	sort.Slice(descriptors, func(i, j int) bool { return descriptors[i].Index < descriptors[j].Index })
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	for _, d := range descriptors {
+		mb := fs.bim[d.Index]
+		if mb == nil {
+			mb = fs.initMsgBlock(d.Index)
+			fs.bim[d.Index] = mb
+			fs.blks = append(fs.blks, mb)
+		}
+		mb.mu.Lock()
+		atomic.StoreUint64(&mb.first.seq, d.FirstSeq)
+		atomic.StoreUint64(&mb.last.seq, d.LastSeq)
+		mb.msgs = d.LastSeq - d.FirstSeq + 1
+		mb.rbytes = uint64(d.Size)
+		mb.closed = true
+		mb.mu.Unlock()
+	}
+	sort.Slice(fs.blks, func(i, j int) bool { return fs.blks[i].index < fs.blks[j].index })
+
+	// The experimental tier forbids deletes, purges, expiry, and rollups. All
+	// sequence ranges therefore represent live messages and can repair a stale
+	// full-state snapshot after an unclean restart without reading remote data.
+	first, last := atomic.LoadUint64(&fs.blks[0].first.seq), atomic.LoadUint64(&fs.blks[len(fs.blks)-1].last.seq)
+	if first == 0 || last < first {
+		return errors.New("S3 tier descriptors do not form a valid stream range")
+	}
+	fs.state.FirstSeq, fs.state.LastSeq = first, last
+	fs.state.Msgs = last - first + 1
+	return nil
+}
+
 func validS3BlockDescriptor(d s3BlockDescriptor) bool {
 	return (d.Version == 1 || d.Version == 2) &&
 		d.Index != 0 && d.FirstSeq != 0 && d.LastSeq >= d.FirstSeq && d.Size > 0 &&

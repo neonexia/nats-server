@@ -4953,7 +4953,8 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 	expected := material.checkpoint.StreamState
 	if state.FirstSeq != expected.FirstSeq || state.LastSeq != expected.LastSeq || state.Msgs != expected.Msgs {
 		cleanupRemoteRestoreTarget(mset)
-		err := errors.New("remote restore recovered stream state does not match checkpoint")
+		err := fmt.Errorf("remote restore recovered stream state does not match checkpoint: got first=%d last=%d messages=%d, expected first=%d last=%d messages=%d",
+			state.FirstSeq, state.LastSeq, state.Msgs, expected.FirstSeq, expected.LastSeq, expected.Msgs)
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return

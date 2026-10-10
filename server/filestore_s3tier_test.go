@@ -1718,6 +1718,38 @@ func TestJetStreamS3TierServerRestart(t *testing.T) {
 	}
 }
 
+func TestFileStoreS3TierRepairsStaleStateFromDescriptors(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	cfg := StreamConfig{Name: "RECOVER", Storage: FileStorage, Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 16 * 1024, S3Tier: &S3TierConfig{
+		Store: store, Prefix: "test/recover-stale-state", LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29,
+		RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
+	}}
+	fs, err := newFileStore(fcfg, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Stop()
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("recover.events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := fs.DrainS3Tier(); err != nil {
+		t.Fatal(err)
+	}
+	fs.mu.Lock()
+	fs.state.Msgs = 1
+	fs.state.FirstSeq, fs.state.LastSeq = 1, 100
+	fs.mu.Unlock()
+	if err := fs.recoverS3TierBlocks(); err != nil {
+		t.Fatal(err)
+	}
+	if state := fs.State(); state.Msgs != 100 || state.FirstSeq != 1 || state.LastSeq != 100 {
+		t.Fatalf("recovered state: %+v", state)
+	}
+}
+
 // TestJetStreamS3TierRemoteRestoreCompatibleEndpoint runs the complete
 // single-replica handoff through a real S3-compatible endpoint. Unit tests use
 // a fault-injecting store for deterministic failure boundaries; this test is

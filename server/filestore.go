@@ -570,6 +570,9 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 		fs.dirty++
 		fs.mu.Unlock()
 	}
+	if err := fs.recoverS3TierBlocks(); err != nil {
+		return nil, err
+	}
 
 	// Lock during the remainder of the recovery.
 	fs.mu.Lock()

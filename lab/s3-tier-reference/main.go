@@ -25,12 +25,13 @@ import (
 )
 
 const (
-	streamName = "EVENTS"
-	subject    = "events.raw"
-	operation  = "reference-handoff-1"
-	targetID   = "reference-target"
-	accessKey  = "reference-access"
-	secretKey  = "reference-secret"
+	streamName  = "EVENTS"
+	subject     = "events.raw"
+	operation   = "reference-handoff-1"
+	targetID    = "reference-target"
+	accessKey   = "reference-access"
+	secretKey   = "reference-secret"
+	rustFSImage = "rustfs/rustfs@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c"
 )
 
 type restoreResponse struct {
@@ -112,7 +113,7 @@ func startDockerRustFS(name, hostPort, dataDir string) (*process, error) {
 		"-e", "RUSTFS_SECRET_KEY=" + secretKey,
 		"-e", "RUSTFS_ADDRESS=:9000",
 		"-e", "RUSTFS_CONSOLE_ENABLE=false",
-		"rustfs/rustfs:latest", "/data",
+		rustFSImage, "/data",
 	}
 	if output, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("start RustFS container: %w: %s", err, output)
@@ -391,6 +392,16 @@ jetstream {
 		panic(err)
 	}
 	defer nc.Close()
+	// A source crash must retain its logical block map even when old local blocks
+	// were reclaimed. This read exercises precise cold hydration before the
+	// checkpoint moves ownership to the target.
+	sourceJS, err := nc.JetStream()
+	if err != nil {
+		panic(err)
+	}
+	if _, err := sourceJS.GetMsg(streamName, 1); err != nil {
+		panic(fmt.Errorf("source cold read after restart: %w", err))
+	}
 	checkpoint, err := request(nc, "$JS.API.STREAM.CHECKPOINT_REMOTE_RESTORE."+streamName, sourceRequest{operation})
 	if err != nil || mustActive(checkpoint, "checkpointed") != nil || checkpoint.NextAction != "restore_remote" {
 		panic(fmt.Errorf("checkpoint: %v %+v", err, checkpoint))

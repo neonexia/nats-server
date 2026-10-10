@@ -25,7 +25,7 @@ The executable accepts `-publishers` and `-messages` to increase the concurrent
 load. It creates an isolated temporary directory and prints the retained process
 logs path. A successful run ends with `PASS`.
 
-By default the harness starts the official RustFS Docker image. This is a local
+By default the harness starts a pinned official RustFS Docker image. This is a local
 S3-compatible functional qualification, not an authentication test. Use
 `-object-store-mode process -object-store /path/to/rustfs` to start a standalone server
 process instead.
