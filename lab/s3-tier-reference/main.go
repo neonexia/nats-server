@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -342,6 +343,43 @@ jetstream {
 			panic(err)
 		}
 	}
+	// A remote outage must apply bounded backpressure once local residency is
+	// exhausted, then resume draining after RustFS returns. Keep this separate
+	// from the handoff stream so its intentionally rejected publishes do not
+	// affect the recovery sequence assertions below.
+	if _, err := js.AddStream(&nats.StreamConfig{
+		Name: "PRESSURE", Subjects: []string{"pressure.raw"}, Storage: nats.FileStorage,
+		Retention: nats.LimitsPolicy, Discard: nats.DiscardNew,
+		DenyDelete: true, DenyPurge: true,
+	}); err != nil {
+		panic(err)
+	}
+	objectStoreProcess.stop()
+	accepted := 0
+	for i := 0; i < 512; i++ {
+		if _, err := js.Publish("pressure.raw", []byte(strings.Repeat("p", 4096))); err != nil {
+			break
+		}
+		accepted++
+	}
+	if accepted == 0 || accepted == 512 {
+		panic(fmt.Errorf("upload outage did not apply bounded local pressure: accepted=%d", accepted))
+	}
+	objectStoreProcess, err = startObjectStore("rustfs-upload-recovered")
+	if err != nil {
+		panic(err)
+	}
+	if err := waitFor(objectStoreHealth, 45*time.Second); err != nil {
+		panic(err)
+	}
+	drain, err := request(nc, "$JS.API.STREAM.DRAIN_REMOTE.PRESSURE", nil)
+	if err != nil || !drain.Success || drain.Error != nil {
+		panic(fmt.Errorf("drain after upload outage: %v %+v", err, drain))
+	}
+	pressureInfo, err := js.StreamInfo("PRESSURE")
+	if err != nil || int(pressureInfo.State.Msgs) != accepted {
+		panic(fmt.Errorf("pressure stream state: %v %+v", err, pressureInfo))
+	}
 
 	total := publishers * messagesPerPublisher
 	published := make([]string, 0, total)
@@ -479,5 +517,5 @@ jetstream {
 	if err != nil || mustActive(status, "retired") != nil || status.NextAction != "none" {
 		panic(fmt.Errorf("retired status: %v %+v", err, status))
 	}
-	fmt.Printf("PASS: %d messages, %d publishers, two restored durable consumers; source restart and object-store outage recovered. Logs: %s\n", total, publishers, logs)
+	fmt.Printf("PASS: %d messages, %d publishers, bounded upload pressure, two restored durable consumers; source restart and object-store outages recovered. Logs: %s\n", total, publishers, logs)
 }

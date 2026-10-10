@@ -9,6 +9,7 @@ The run exercises:
 
 - concurrent raw-message publishers;
 - two durable pull consumers with different acknowledged positions;
+- a RustFS upload outage that reaches bounded local pressure, followed by remote drain;
 - `prepare`, a source-process restart, and `checkpoint`;
 - a RustFS outage during target restore followed by the same-operation retry;
 - restored consumer delivery and acknowledgement state;
