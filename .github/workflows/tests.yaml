@@ -116,6 +116,54 @@ jobs:
       - name: Run unit tests
         run: ./scripts/runTestsOnTravis.sh store_tests
 
+  s3-tier:
+    name: Test S3 Tier (RustFS)
+    needs: [build-latest, build-supported, lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Start RustFS
+        run: |
+          docker run -d --rm --name nats-s3-tier-rustfs \
+            -p 127.0.0.1:19000:9000 \
+            -e RUSTFS_ACCESS_KEY=testaccess \
+            -e RUSTFS_SECRET_KEY=testsecret123 \
+            -e RUSTFS_ADDRESS=:9000 \
+            -e RUSTFS_CONSOLE_ENABLE=false \
+            rustfs/rustfs@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c /data
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:19000/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs nats-s3-tier-rustfs
+          exit 1
+
+      - name: Run S3-tier integration tests
+        env:
+          TEST_S3_TIER_ENDPOINT: 127.0.0.1:19000
+        run: >-
+          go test ./server
+          -run 'Test(FileStoreS3TierCompatibleEndpoint|JetStreamS3TierRemoteRestoreCompatibleEndpoint)'
+          -count=1
+
+      - name: Show RustFS logs on failure
+        if: failure()
+        run: docker logs nats-s3-tier-rustfs
+
+      - name: Stop RustFS
+        if: always()
+        run: docker rm -f nats-s3-tier-rustfs || true
+
   js-no-cluster:
     name: Test JetStream
     needs: [build-latest, build-supported, lint]
