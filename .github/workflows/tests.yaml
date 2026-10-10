@@ -156,6 +156,14 @@ jobs:
           -run 'Test(FileStoreS3TierCompatibleEndpoint|JetStreamS3TierRemoteRestoreCompatibleEndpoint)'
           -count=1
 
+      - name: Run S3-tier recovery reference simulation
+        run: |
+          go build -o /tmp/nats-server-s3-tier-reference .
+          go run ./lab/s3-tier-reference \
+            -nats-server /tmp/nats-server-s3-tier-reference \
+            -publishers 8 \
+            -messages 250
+
       - name: Show RustFS logs on failure
         if: failure()
         run: docker logs nats-s3-tier-rustfs
