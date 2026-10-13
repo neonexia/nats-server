@@ -493,6 +493,24 @@ jetstream {
 		}
 		panic(fmt.Errorf("restore: %v %+v (%s); target log: %s", err, restored, description, output))
 	}
+	// Activation is durable before the source can be retired. Prove the target
+	// can recover that active state after losing its process at this boundary.
+	targetNC.Close()
+	target.stop()
+	target, err = start("target-restarted", natsServer, []string{"-c", targetConfig}, env, logs)
+	if err != nil {
+		panic(err)
+	}
+	defer target.stop()
+	targetURL := fmt.Sprintf("nats://127.0.0.1:%d", targetPort)
+	if err := waitForNATS(targetURL, 15*time.Second); err != nil {
+		panic(err)
+	}
+	targetNC, err = nats.Connect(targetURL)
+	if err != nil {
+		panic(err)
+	}
+	defer targetNC.Close()
 	targetJS, err := targetNC.JetStream()
 	if err != nil {
 		panic(err)
@@ -538,6 +556,27 @@ jetstream {
 		panic(fmt.Errorf("target stream state after live reconnect: %v %+v", err, info))
 	}
 
+	// The source must retain its checkpoint and retirement record even if it
+	// fails after target activation and before local resources are released.
+	nc.Close()
+	source.stop()
+	source, err = start("source-after-checkpoint-restarted", natsServer, []string{"-c", sourceConfig}, env, logs)
+	if err != nil {
+		panic(err)
+	}
+	defer source.stop()
+	if err := waitForNATS(sourceURL, 15*time.Second); err != nil {
+		panic(err)
+	}
+	nc, err = nats.Connect(sourceURL)
+	if err != nil {
+		panic(err)
+	}
+	defer nc.Close()
+	checkpointed, err := request(nc, "$JS.API.STREAM.REMOTE_RESTORE_STATUS."+streamName, sourceRequest{operation})
+	if err != nil || mustActive(checkpointed, "checkpointed") != nil || checkpointed.NextAction != "restore_remote" {
+		panic(fmt.Errorf("source state after checkpoint restart: %v %+v", err, checkpointed))
+	}
 	retired, err := request(nc, "$JS.API.STREAM.RETIRE_REMOTE_SOURCE."+streamName, sourceRequest{operation})
 	if err != nil || mustActive(retired, "retired") != nil || retired.NextAction != "none" {
 		panic(fmt.Errorf("retire: %v %+v", err, retired))
