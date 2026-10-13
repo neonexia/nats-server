@@ -84,6 +84,10 @@ func (s *countingS3BlockStore) List(ctx context.Context, prefix string) ([]strin
 	return s.store.List(ctx, prefix)
 }
 
+func (s *countingS3BlockStore) Delete(ctx context.Context, key string) error {
+	return s.store.(s3TierObjectDeleter).Delete(ctx, key)
+}
+
 func (s *countingS3BlockStore) counts() (lists, descriptorGets, blockGets int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -211,6 +215,13 @@ func (s *testS3BlockStore) List(_ context.Context, prefix string) ([]string, err
 	return keys, nil
 }
 
+func (s *testS3BlockStore) Delete(_ context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.objects, key)
+	return nil
+}
+
 func testTieredFileStore(t *testing.T, store S3TierObjectStore, dir, prefix string) (*fileStore, FileStoreConfig, StreamConfig) {
 	t.Helper()
 	fcfg := FileStoreConfig{StoreDir: dir, BlockSize: 16 * 1024, S3Tier: &S3TierConfig{
@@ -246,6 +257,7 @@ jetstream {
     timeout: "2s"
     retry_min: "10ms"
     retry_max: "100ms"
+	gc_grace: "2h"
     credentials {
       provider: "env"
       access_key_env: "NATS_S3_TIER_ACCESS"
@@ -262,7 +274,7 @@ jetstream {
 	if tier == nil || tier.Endpoint != "minio.internal:9000" || tier.Bucket != "nodus-history" || tier.store == nil {
 		t.Fatalf("tier config = %#v", tier)
 	}
-	if tier.BlockSize != 1_000_000 || tier.LocalHighBytes != 8_000_000 || tier.RemoteLowBytes != 1_000_000 || tier.Timeout != 2*time.Second || tier.RetryMax != 100*time.Millisecond {
+	if tier.BlockSize != 1_000_000 || tier.LocalHighBytes != 8_000_000 || tier.RemoteLowBytes != 1_000_000 || tier.Timeout != 2*time.Second || tier.RetryMax != 100*time.Millisecond || tier.GCGrace != 2*time.Hour {
 		t.Fatalf("unexpected tier settings: %#v", tier)
 	}
 	streamTier := tier.streamConfig("$G", "TEST")
@@ -312,7 +324,7 @@ jetstream {
 		t.Fatal(err)
 	}
 	tier := opts.jetStreamS3Tier
-	if tier == nil || tier.BlockSize != defaultS3TierBlockSize || tier.LocalHighBytes != defaultS3TierLocalHigh || tier.RemoteLowBytes != defaultS3TierRemoteLow || tier.Timeout != defaultS3TierTimeout || tier.RetryMax != defaultS3TierRetryMax {
+	if tier == nil || tier.BlockSize != defaultS3TierBlockSize || tier.LocalHighBytes != defaultS3TierLocalHigh || tier.RemoteLowBytes != defaultS3TierRemoteLow || tier.Timeout != defaultS3TierTimeout || tier.RetryMax != defaultS3TierRetryMax || tier.GCGrace != defaultS3TierGCGrace {
 		t.Fatalf("tier defaults = %#v", tier)
 	}
 	badConfig := createConfFile(t, []byte(`
@@ -705,6 +717,62 @@ func TestJetStreamS3TierDrainRemoteAPI(t *testing.T) {
 	}
 }
 
+func TestJetStreamS3TierCollectRemoteGarbageAPIIsDryRunByDefault(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	fcfg := &FileStoreConfig{BlockSize: 16 * 1024, S3Tier: &S3TierConfig{
+		Store: store, Prefix: "test/gc-api", LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29,
+		RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
+	}}
+	mset, err := s.GlobalAccount().addStreamWithStore(&StreamConfig{Name: "GC", Subjects: []string{"gc.events"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}, fcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := mset.store.(*fileStore)
+	key := "test/gc-api/blocks/0000000001-orphan.blk"
+	store.objects[key] = []byte("orphan")
+	fs.tier.mu.Lock()
+	fs.tier.gc = []s3TierGCCandidate{{Version: 1, Key: key, Created: time.Now().Add(-2 * defaultS3TierGCGrace)}}
+	if err := fs.tier.writeGCJournalLocked(); err != nil {
+		fs.tier.mu.Unlock()
+		t.Fatal(err)
+	}
+	fs.tier.mu.Unlock()
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+	request := func(body []byte) JSApiStreamCollectRemoteGarbageResponse {
+		msg, err := nc.Request(fmt.Sprintf(JSApiStreamCollectRemoteGarbageT, "GC"), body, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response JSApiStreamCollectRemoteGarbageResponse
+		if err := json.Unmarshal(msg.Data, &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	if response := request(nil); response.Error != nil || !response.Success || response.Result.Eligible != 1 || response.Result.Deleted != 0 {
+		t.Fatalf("dry-run response=%+v", response)
+	}
+	store.mu.Lock()
+	_, present := store.objects[key]
+	store.mu.Unlock()
+	if !present {
+		t.Fatal("default API request deleted payload")
+	}
+	if response := request([]byte(`{"execute":true}`)); response.Error != nil || !response.Success || response.Result.Deleted != 1 {
+		t.Fatalf("execute response=%+v", response)
+	}
+	store.mu.Lock()
+	_, present = store.objects[key]
+	store.mu.Unlock()
+	if present {
+		t.Fatal("execute API did not delete journaled payload")
+	}
+}
+
 func TestJetStreamS3TierRemoteRestoreSourceAPI(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	s := RunBasicJetStreamServer(t)
@@ -825,15 +893,21 @@ func TestJetStreamS3TierRemoteRestoreCheckpointFailureRetries(t *testing.T) {
 		}
 		return resp
 	}
+	store.mu.Lock()
 	store.failPut = true
+	store.mu.Unlock()
 	if resp := request(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "RETRY")); resp.Error == nil {
 		t.Fatalf("prepare during S3 write failure response: %+v", resp)
 	}
+	store.mu.Lock()
 	store.failPut = false
+	store.mu.Unlock()
 	if resp := request(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "RETRY")); resp.Error != nil || resp.State != s3TierRemoteRestorePrepared {
 		t.Fatalf("prepare retry response: %+v", resp)
 	}
+	store.mu.Lock()
 	store.failPut = true
+	store.mu.Unlock()
 	if resp := request(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "RETRY")); resp.Error == nil {
 		t.Fatal("expected checkpoint failure")
 	}
@@ -842,7 +916,9 @@ func TestJetStreamS3TierRemoteRestoreCheckpointFailureRetries(t *testing.T) {
 	if resp := request(fmt.Sprintf(JSApiStreamRemoteRestoreStatusT, "RETRY")); resp.State != s3TierRemoteRestorePrepared || resp.S3Tier == nil || resp.S3Tier.RestoreErrors == 0 {
 		t.Fatalf("status after failed checkpoint: %+v", resp)
 	}
+	store.mu.Lock()
 	store.failPut = false
+	store.mu.Unlock()
 	if resp := request(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "RETRY")); resp.Error != nil || resp.State != s3TierRemoteRestoreCheckpointed {
 		t.Fatalf("checkpoint retry response: %+v", resp)
 	}
@@ -1053,7 +1129,9 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	restoreRequest, _ := json.Marshal(JSApiStreamRestoreRemoteRequest{OperationID: "handoff_1", ExpectedEpoch: checkpoint.Epoch, TargetID: "node-b"})
 	// A failed target download must leave no partial, inactive stream behind.
 	// The coordinator can retry the same immutable checkpoint once S3 recovers.
+	store.mu.Lock()
 	store.failGet = true
+	store.mu.Unlock()
 	msg, err := targetNC.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE"), restoreRequest, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -1068,8 +1146,10 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	if _, err := target.GlobalAccount().lookupStream("MOVE"); err == nil {
 		t.Fatal("failed target restore retained a stream")
 	}
+	store.mu.Lock()
 	store.failGet = false
 	store.failActivation = true
+	store.mu.Unlock()
 	msg, err = targetNC.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE"), restoreRequest, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -1084,7 +1164,9 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	if _, err := target.GlobalAccount().lookupStream("MOVE"); err == nil {
 		t.Fatal("activation write failure retained a stream")
 	}
+	store.mu.Lock()
 	store.failActivation = false
+	store.mu.Unlock()
 	msg, err = targetNC.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE"), restoreRequest, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -1157,14 +1239,18 @@ func TestJetStreamS3TierRemoteRestoreActivatesTarget(t *testing.T) {
 	// Retirement requires the durable target activation receipt. It removes only
 	// source-local resources; the immutable S3 checkpoint stays available for
 	// later audit or restore work.
+	store.mu.Lock()
 	store.failRetirement = true
+	store.mu.Unlock()
 	if failedRetire := requestSource(fmt.Sprintf(JSApiStreamRetireRemoteSourceT, "MOVE")); failedRetire.Error == nil {
 		t.Fatalf("retire during receipt write failure response: %+v", failedRetire)
 	}
 	if _, err := source.GlobalAccount().lookupStream("MOVE"); err != nil {
 		t.Fatalf("source disappeared after failed retirement receipt: %v", err)
 	}
+	store.mu.Lock()
 	store.failRetirement = false
+	store.mu.Unlock()
 	retire := requestSource(fmt.Sprintf(JSApiStreamRetireRemoteSourceT, "MOVE"))
 	if retire.Error != nil || !retire.Success || retire.State != s3TierRemoteRestoreRetired || retire.TargetID != "node-b" || retire.NextAction != "none" {
 		t.Fatalf("retire response: %+v", retire)
@@ -1284,6 +1370,100 @@ func TestFileStoreS3TierFailureKeepsLocalCopy(t *testing.T) {
 				t.Fatalf("local block lost after remote failure: %v", err)
 			}
 		})
+	}
+}
+
+func TestFileStoreS3TierCollectsOnlyJournaledPayloadDebris(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte), failDescriptor: true}
+	fs, fcfg, _ := testTieredFileStore(t, store, t.TempDir(), "test/gc")
+	defer fs.Stop()
+	fs.tier.stop()
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 32*1024, 16*1024
+	if err := fs.tier.evictToBudget(); err == nil {
+		t.Fatal("expected descriptor failure")
+	}
+	if _, err := os.Stat(filepath.Join(fcfg.StoreDir, msgDir, "1.blk")); err != nil {
+		t.Fatalf("descriptor failure removed local payload: %v", err)
+	}
+	fs.tier.mu.Lock()
+	if len(fs.tier.gc) != 1 {
+		fs.tier.mu.Unlock()
+		t.Fatalf("garbage candidates=%d, want 1", len(fs.tier.gc))
+	}
+	candidate := fs.tier.gc[0]
+	fs.tier.gc[0].Created = time.Now().Add(-2 * defaultS3TierGCGrace)
+	if err := fs.tier.writeGCJournalLocked(); err != nil {
+		fs.tier.mu.Unlock()
+		t.Fatal(err)
+	}
+	fs.tier.mu.Unlock()
+	if !strings.Contains(candidate.Key, "/blocks/") {
+		t.Fatalf("candidate key=%q", candidate.Key)
+	}
+	if result, err := fs.CollectS3TierGarbage(false); err != nil || result.Scanned != 1 || result.Eligible != 1 || result.Deleted != 0 {
+		t.Fatalf("dry-run result=%+v err=%v", result, err)
+	}
+	store.mu.Lock()
+	_, stillRemote := store.objects[candidate.Key]
+	store.mu.Unlock()
+	if !stillRemote {
+		t.Fatal("dry run deleted payload")
+	}
+	if result, err := fs.CollectS3TierGarbage(true); err != nil || result.Deleted != 1 {
+		t.Fatalf("execute result=%+v err=%v", result, err)
+	}
+	store.mu.Lock()
+	_, stillRemote = store.objects[candidate.Key]
+	store.mu.Unlock()
+	if stillRemote {
+		t.Fatal("execute did not remove journaled orphan payload")
+	}
+	if _, err := os.Stat(filepath.Join(fcfg.StoreDir, msgDir, "1.blk")); err != nil {
+		t.Fatalf("GC removed local payload: %v", err)
+	}
+	if stats := fs.tier.statsSnapshot(); stats.GCDeletes != 1 || stats.GCPending != 0 {
+		t.Fatalf("GC stats=%+v", stats)
+	}
+}
+
+func TestFileStoreS3TierGarbageSkipsPayloadReferencedByDescriptor(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/gc-referenced")
+	defer fs.Stop()
+	fs.tier.stop()
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	fs.tier.mu.Lock()
+	var descriptor s3BlockDescriptor
+	for _, descriptor = range fs.tier.desc {
+		break
+	}
+	fs.tier.gc = []s3TierGCCandidate{{Version: 1, Key: descriptor.Key, Created: time.Now().Add(-2 * defaultS3TierGCGrace)}}
+	if err := fs.tier.writeGCJournalLocked(); err != nil {
+		fs.tier.mu.Unlock()
+		t.Fatal(err)
+	}
+	fs.tier.mu.Unlock()
+	if result, err := fs.CollectS3TierGarbage(true); err != nil || result.Deleted != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	store.mu.Lock()
+	_, present := store.objects[descriptor.Key]
+	store.mu.Unlock()
+	if !present {
+		t.Fatal("GC deleted descriptor-referenced payload")
 	}
 }
 
@@ -1673,6 +1853,44 @@ func TestFileStoreS3TierCompatibleEndpoint(t *testing.T) {
 	defer fs.Stop()
 	if state := fs.State(); state.Msgs != 100 || state.FirstSeq != 1 {
 		t.Fatalf("S3 recovered state: %+v", state)
+	}
+}
+
+func TestFileStoreS3TierGarbageCompatibleEndpoint(t *testing.T) {
+	endpoint := os.Getenv("TEST_S3_TIER_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set TEST_S3_TIER_ENDPOINT to an S3-compatible endpoint")
+	}
+	store, err := NewS3TierMinIOStore(endpoint, "testaccess", "testsecret123", "tier-test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.client.MakeBucket(context.Background(), store.bucket, minio.MakeBucketOptions{}); err != nil {
+		if exists, existsErr := store.client.BucketExists(context.Background(), store.bucket); existsErr != nil || !exists {
+			t.Fatal(err)
+		}
+	}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), fmt.Sprintf("integration/gc/%d", time.Now().UnixNano()))
+	defer fs.Stop()
+	key := strings.Trim(fs.tier.cfg.Prefix, "/") + "/blocks/0000000001-orphan.blk"
+	if created, err := store.PutIfAbsent(context.Background(), key, []byte("orphan")); err != nil || !created {
+		t.Fatalf("create orphan payload = (%v, %v)", created, err)
+	}
+	if err := fs.tier.recordGCCandidate(key); err != nil {
+		t.Fatal(err)
+	}
+	fs.tier.mu.Lock()
+	fs.tier.gc[0].Created = time.Now().Add(-2 * defaultS3TierGCGrace)
+	if err := fs.tier.writeGCJournalLocked(); err != nil {
+		fs.tier.mu.Unlock()
+		t.Fatal(err)
+	}
+	fs.tier.mu.Unlock()
+	if result, err := fs.CollectS3TierGarbage(true); err != nil || result.Deleted != 1 {
+		t.Fatalf("GC result=%+v err=%v", result, err)
+	}
+	if _, err := store.Get(context.Background(), key); err == nil {
+		t.Fatal("S3-compatible GC did not delete orphan payload")
 	}
 }
 

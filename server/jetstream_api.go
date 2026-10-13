@@ -85,6 +85,11 @@ const (
 	JSApiStreamDrainRemote  = "$JS.API.STREAM.DRAIN_REMOTE.*"
 	JSApiStreamDrainRemoteT = "$JS.API.STREAM.DRAIN_REMOTE.%s"
 
+	// JSApiStreamCollectRemoteGarbage removes only explicitly journaled S3 tier
+	// payload debris. It never deletes stream history or retired stream objects.
+	JSApiStreamCollectRemoteGarbage  = "$JS.API.STREAM.COLLECT_REMOTE_GARBAGE.*"
+	JSApiStreamCollectRemoteGarbageT = "$JS.API.STREAM.COLLECT_REMOTE_GARBAGE.%s"
+
 	// Remote restore operations create an immutable source checkpoint. They are
 	// deliberately separate so a retried control request can resume a durable
 	// state transition instead of relying on one long-lived client connection.
@@ -598,6 +603,20 @@ type JSApiStreamDrainRemoteResponse struct {
 }
 
 const JSApiStreamDrainRemoteResponseType = "io.nats.jetstream.api.v1.stream_drain_remote_response"
+
+type JSApiStreamCollectRemoteGarbageRequest struct {
+	// Execute must be true to delete eligible debris. An omitted request is a
+	// dry run so a lifecycle service can inspect the effect before mutation.
+	Execute bool `json:"execute,omitempty"`
+}
+
+type JSApiStreamCollectRemoteGarbageResponse struct {
+	ApiResponse
+	Success bool           `json:"success,omitempty"`
+	Result  S3TierGCResult `json:"result,omitempty"`
+}
+
+const JSApiStreamCollectRemoteGarbageResponseType = "io.nats.jetstream.api.v1.stream_collect_remote_garbage_response"
 
 // JSApiStreamRemoteRestoreRequest identifies one durable remote restore
 // operation. Callers must retain and retry the same operation ID after a lost
@@ -1199,6 +1218,7 @@ func (s *Server) setJetStreamExportSubs() error {
 		{JSApiStreamDelete, s.jsStreamDeleteRequest},
 		{JSApiStreamPurge, s.jsStreamPurgeRequest},
 		{JSApiStreamDrainRemote, s.jsStreamDrainRemoteRequest},
+		{JSApiStreamCollectRemoteGarbage, s.jsStreamCollectRemoteGarbageRequest},
 		{JSApiStreamPrepareRemoteRestore, s.jsStreamPrepareRemoteRestoreRequest},
 		{JSApiStreamCheckpointRemoteRestore, s.jsStreamCheckpointRemoteRestoreRequest},
 		{JSApiStreamAbortRemoteRestore, s.jsStreamAbortRemoteRestoreRequest},
@@ -4444,6 +4464,64 @@ func (s *Server) jsStreamDrainRemoteRequest(_ *subscription, c *client, _ *Accou
 		return
 	}
 	if resp.Drained, err = drain.DrainS3Tier(); err != nil {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+	} else {
+		resp.Success = true
+	}
+	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
+}
+
+// jsStreamCollectRemoteGarbageRequest is intentionally explicit and defaults
+// to a dry run. Its authority is limited to a stream's local failed-upload
+// journal, never arbitrary objects under an S3 prefix.
+func (s *Server) jsStreamCollectRemoteGarbageRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	if c == nil || !s.JetStreamEnabled() {
+		return
+	}
+	ci, acc, hdr, msg, err := s.getRequestInfo(c, rmsg)
+	if err != nil {
+		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+	resp := JSApiStreamCollectRemoteGarbageResponse{ApiResponse: ApiResponse{Type: JSApiStreamCollectRemoteGarbageResponseType}}
+	if errorOnRequiredApiLevel(hdr) {
+		resp.Error = NewJSRequiredApiLevelError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if hasJS, doErr := acc.checkJetStream(); !hasJS {
+		if doErr {
+			resp.Error = NewJSNotEnabledForAccountError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+	if s.JetStreamIsClustered() {
+		resp.Error = NewJSStreamGeneralError(errS3TierClusteredDrain, Unless(errS3TierClusteredDrain))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	var req JSApiStreamCollectRemoteGarbageRequest
+	if err := s.unmarshalRequest(c, acc, subject, msg, &req); err != nil {
+		resp.Error = NewJSInvalidJSONError(err)
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	mset, err := acc.lookupStream(streamNameFromSubject(subject))
+	if err != nil {
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	collector, ok := mset.store.(interface {
+		CollectS3TierGarbage(bool) (S3TierGCResult, error)
+	})
+	if !ok {
+		resp.Error = NewJSStreamGeneralError(errS3TierNotEnabled, Unless(errS3TierNotEnabled))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if resp.Result, err = collector.CollectS3TierGarbage(req.Execute); err != nil {
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 	} else {
 		resp.Success = true

@@ -2886,7 +2886,7 @@ func parseJetStreamS3Tier(tk token, v any, opts *Options, errors *[]error, warni
 			case "remote_low_bytes":
 				tier.RemoteLowBytes = uint64(size)
 			}
-		case "timeout", "retry_min", "retry_max":
+		case "timeout", "retry_min", "retry_max", "gc_grace":
 			duration := parseDuration(key, fieldToken, value, errors, warnings)
 			if duration <= 0 {
 				continue
@@ -2898,6 +2898,8 @@ func parseJetStreamS3Tier(tk token, v any, opts *Options, errors *[]error, warni
 				tier.RetryMin = duration
 			case "retry_max":
 				tier.RetryMax = duration
+			case "gc_grace":
+				tier.GCGrace = duration
 			}
 		case "credentials":
 			if err := parseJetStreamS3TierCredentials(fieldToken, value, tier); err != nil {

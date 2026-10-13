@@ -5945,6 +5945,16 @@ func (fs *fileStore) DrainS3Tier() (uint64, error) {
 	return fs.tier.drain(coveredThrough)
 }
 
+// CollectS3TierGarbage removes only payloads recorded after a descriptor
+// commit failure. It never enumerates or deletes stream history, which keeps
+// archival retention independent from this protocol-debris cleanup.
+func (fs *fileStore) CollectS3TierGarbage(execute bool) (S3TierGCResult, error) {
+	if fs.tier == nil {
+		return S3TierGCResult{}, errS3TierNotEnabled
+	}
+	return fs.tier.collectGarbage(execute)
+}
+
 // Lock should be held.
 func (fs *fileStore) rebuildFirst() error {
 	if len(fs.blks) == 0 {

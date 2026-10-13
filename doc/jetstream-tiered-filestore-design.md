@@ -9,6 +9,7 @@ Status: experimental fork implementation, 2026-10-04. The first runnable slice i
 - Each eviction uploads block bytes, reads them back and compares bytes, uploads a JSON descriptor, reads it back and compares bytes, writes and verifies an immutable manifest generation, syncs local descriptor and manifest sidecars, then unlinks the local `.blk` under file-store and block locks. The S3 prefix is opaque to NATS; Nodus supplies its stream identity and a separate history service can later interpret its own namespace.
 - Restart uses local descriptor sidecars to retain remote-only block metadata without listing or reading S3. A cold reader selects one missing block, releases the normal file-store and block locks, coalesces a fetch for that block, verifies it, and retries the native read. Missing tier configuration still fails startup. Corrupt or unavailable remote data fails the read rather than being treated as missing history.
 - `$JS.API.STREAM.DRAIN_REMOTE.<stream>` is a synchronous, account-scoped operation for an external lifecycle manager. It flushes and rolls a non-empty active block, then verifies remote coverage for every sealed block without reclaiming local payloads. Normal NATS publish permission on that API subject authorizes the caller; the endpoint does not expose S3 credentials. Clustered streams are rejected because the experiment does not implement leader forwarding for this operation.
+- `$JS.API.STREAM.COLLECT_REMOTE_GARBAGE.<stream>` performs conservative protocol-debris cleanup. It defaults to a dry run and can delete only a payload key durably journaled after that payload was written but its descriptor could not be committed. It never lists broadly for deletion and never deletes a stream record, descriptor, manifest, checkpoint, restore record, or payload referenced by a descriptor. `gc_grace` defaults to 24 hours.
 - Native durable pull consumers and direct get use the existing JetStream storage methods. Cold reads hydrate a missing block. Direct get returns `503 Storage Unavailable` on remote fetch failure instead of `404`. The normal `nats.go` request helper maps a 503 status to its `ErrNoResponders` error; raw headers distinguish the storage failure.
 - The experiment rejects config changes that would enable retention expiry, automatic old-message discard, per-subject limits, rollups, multiple replicas, compression, sources/mirrors, and asynchronous persist. Explicit delete, erase, purge, compact, truncate, stream deletion, and snapshots are rejected for tiered stores. These restrictions protect immutable remote block assumptions; they are not a complete durability or lifecycle design.
 
@@ -41,6 +42,7 @@ jetstream {
     timeout: 30s
     retry_min: 1s
     retry_max: 30s
+    gc_grace: 24h
   }
 }
 ```
@@ -161,8 +163,12 @@ audit work. Stream deletion currently must leave remote objects in place.
 Remote GC means only removal of safe protocol debris such as a payload written
 before its descriptor failed, or a manifest/checkpoint generation made
 unreachable by a future format. It must never be coupled to stream deletion or
-used to remove remotely covered workspace history. This slice implements no
-remote-object deletion.
+used to remove remotely covered workspace history. This slice implements the
+first case only: an explicit, grace-delayed, journal-backed removal of a known
+payload whose descriptor commit failed. It cannot delete remotely covered data
+and intentionally leaves unknown or historical artifacts untouched. A future
+retention-aware collector needs Nodus's authoritative active-prefix and
+archival-retention inventory before it can address any broader object set.
 
 Snapshot and restore are separate future features. A JetStream snapshot is a
 point-in-time export sufficient to recreate a stream elsewhere; it must include

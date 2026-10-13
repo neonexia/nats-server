@@ -45,6 +45,10 @@ type S3TierConfig struct {
 	Timeout         time.Duration
 	RetryMin        time.Duration
 	RetryMax        time.Duration
+	// GCGrace delays deletion of a known failed payload upload. This is only
+	// for protocol debris recorded before a descriptor was committed; it never
+	// applies to stream history.
+	GCGrace time.Duration
 }
 
 const (
@@ -56,6 +60,7 @@ const (
 	defaultS3TierTimeout    = 30 * time.Second
 	defaultS3TierRetryMin   = time.Second
 	defaultS3TierRetryMax   = 30 * time.Second
+	defaultS3TierGCGrace    = 24 * time.Hour
 )
 
 // S3TierServerConfig is parsed from the server's JetStream configuration.
@@ -81,6 +86,7 @@ type S3TierServerConfig struct {
 	Timeout         time.Duration
 	RetryMin        time.Duration
 	RetryMax        time.Duration
+	GCGrace         time.Duration
 
 	store S3TierObjectStore
 }
@@ -106,6 +112,9 @@ type S3TierStats struct {
 	BacklogBytes       uint64 `json:"backlog_bytes"`
 	BacklogBlocks      uint64 `json:"backlog_blocks"`
 	RetryAttempts      uint64 `json:"retry_attempts"`
+	GCPending          uint64 `json:"gc_pending"`
+	GCDeletes          uint64 `json:"gc_deletes"`
+	GCErrors           uint64 `json:"gc_errors"`
 	RestorePrepares    uint64 `json:"restore_prepares"`
 	RestoreCheckpoints uint64 `json:"restore_checkpoints"`
 	RestoreAborts      uint64 `json:"restore_aborts"`
@@ -124,6 +133,13 @@ type S3TierObjectStore interface {
 	List(context.Context, string) ([]string, error)
 }
 
+// s3TierObjectDeleter is optional so existing read/write test stores retain
+// their original contract. An execute request fails closed when the configured
+// store cannot provide idempotent deletion.
+type s3TierObjectDeleter interface {
+	Delete(context.Context, string) error
+}
+
 func newS3TierServerConfig() *S3TierServerConfig {
 	return &S3TierServerConfig{
 		BlockSize:       defaultS3TierBlockSize,
@@ -134,6 +150,7 @@ func newS3TierServerConfig() *S3TierServerConfig {
 		Timeout:         defaultS3TierTimeout,
 		RetryMin:        defaultS3TierRetryMin,
 		RetryMax:        defaultS3TierRetryMax,
+		GCGrace:         defaultS3TierGCGrace,
 	}
 }
 
@@ -178,6 +195,7 @@ func (c *S3TierServerConfig) streamConfig(account, stream string) *S3TierConfig 
 		LocalHighBytes: c.LocalHighBytes, LocalLowBytes: c.LocalLowBytes,
 		RemoteHighBytes: c.RemoteHighBytes, RemoteLowBytes: c.RemoteLowBytes,
 		Timeout: c.Timeout, RetryMin: c.RetryMin, RetryMax: c.RetryMax,
+		GCGrace: c.GCGrace,
 	}
 }
 
@@ -188,7 +206,7 @@ func (c *S3TierServerConfig) equal(other *S3TierServerConfig) bool {
 	return c.Endpoint == other.Endpoint && c.Bucket == other.Bucket && c.Region == other.Region && c.TLS == other.TLS && c.Prefix == other.Prefix &&
 		c.CredentialProvider == other.CredentialProvider && c.AccessKeyEnv == other.AccessKeyEnv && c.SecretKeyEnv == other.SecretKeyEnv && c.SessionTokenEnv == other.SessionTokenEnv &&
 		c.BlockSize == other.BlockSize && c.LocalHighBytes == other.LocalHighBytes && c.LocalLowBytes == other.LocalLowBytes && c.RemoteHighBytes == other.RemoteHighBytes && c.RemoteLowBytes == other.RemoteLowBytes &&
-		c.Timeout == other.Timeout && c.RetryMin == other.RetryMin && c.RetryMax == other.RetryMax
+		c.Timeout == other.Timeout && c.RetryMin == other.RetryMin && c.RetryMax == other.RetryMax && c.GCGrace == other.GCGrace
 }
 
 // S3TierMinIOStore works with AWS S3 and S3-compatible endpoints such as MinIO.
@@ -239,6 +257,14 @@ func (s *S3TierMinIOStore) Get(ctx context.Context, key string) ([]byte, error) 
 	}
 	defer obj.Close()
 	return io.ReadAll(obj)
+}
+
+func (s *S3TierMinIOStore) Delete(ctx context.Context, key string) error {
+	err := s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
+	if minio.ToErrorResponse(err).Code == "NoSuchKey" {
+		return nil
+	}
+	return err
 }
 
 func (s *S3TierMinIOStore) List(ctx context.Context, prefix string) ([]string, error) {
@@ -359,6 +385,25 @@ type s3TierRemoteRestoreRetirement struct {
 	Retired       time.Time `json:"retired"`
 }
 
+// s3TierGCCandidate is written only after an immutable payload write succeeds
+// but its descriptor cannot be committed. A descriptor is the first durable
+// reachability edge to a payload, so these candidates are the only objects
+// this implementation is permitted to delete.
+type s3TierGCCandidate struct {
+	Version uint8     `json:"version"`
+	Key     string    `json:"key"`
+	Created time.Time `json:"created"`
+}
+
+// S3TierGCResult reports a bounded, idempotent cleanup pass. Pending includes
+// candidates still within the grace interval; it never counts stream history.
+type S3TierGCResult struct {
+	Scanned  uint64 `json:"scanned"`
+	Pending  uint64 `json:"pending"`
+	Eligible uint64 `json:"eligible"`
+	Deleted  uint64 `json:"deleted"`
+}
+
 type fileS3Tier struct {
 	fs             *fileStore
 	cfg            S3TierConfig
@@ -372,6 +417,7 @@ type fileS3Tier struct {
 	checkpoint     *s3TierCheckpoint
 	restore        *s3TierRemoteRestoreState
 	activation     *s3TierRemoteRestoreActivation
+	gc             []s3TierGCCandidate
 	stats          s3TierCounters
 	wake           chan struct{}
 	quit           chan struct{}
@@ -380,6 +426,7 @@ type fileS3Tier struct {
 
 type s3TierCounters struct {
 	fetches, fetchErrors, cacheHits, uploads, uploadErrors, evictions, capacityErrors, retryAttempts          atomic.Uint64
+	gcDeletes, gcErrors                                                                                       atomic.Uint64
 	restorePrepares, restoreCheckpoints, restoreAborts, restoreActivations, restoreRetirements, restoreErrors atomic.Uint64
 }
 
@@ -397,6 +444,9 @@ func newFileS3Tier(fs *fileStore, cfg S3TierConfig) *fileS3Tier {
 	}
 	if cfg.RetryMax == 0 {
 		cfg.RetryMax = defaultS3TierRetryMax
+	}
+	if cfg.GCGrace == 0 {
+		cfg.GCGrace = defaultS3TierGCGrace
 	}
 	if cfg.RemoteHighBytes == 0 {
 		cfg.RemoteHighBytes, cfg.RemoteLowBytes = cfg.LocalHighBytes, cfg.LocalLowBytes
@@ -500,6 +550,10 @@ func (t *fileS3Tier) remoteRestoreActivationFile() string {
 	return filepath.Join(t.fs.fcfg.StoreDir, msgDir, "s3-tier.remote-restore-target.json")
 }
 
+func (t *fileS3Tier) gcFile() string {
+	return filepath.Join(t.fs.fcfg.StoreDir, msgDir, "s3-tier.gc.json")
+}
+
 // prepareS3Tier runs before the normal file-store recovery. Descriptor sidecars
 // are durable local evidence that a missing payload belongs to the remote tier.
 // Startup must not list or fetch S3 objects: that would turn an object-store
@@ -576,6 +630,20 @@ func (fs *fileStore) prepareS3Tier() error {
 			return fmt.Errorf("invalid local S3 tier remote restore activation: %v", err)
 		}
 		t.activation = &activation
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if buf, err := os.ReadFile(t.gcFile()); err == nil {
+		var candidates []s3TierGCCandidate
+		if err := json.Unmarshal(buf, &candidates); err != nil {
+			return fmt.Errorf("invalid local S3 tier garbage journal: %v", err)
+		}
+		for _, candidate := range candidates {
+			if !t.validGCCandidate(candidate) {
+				return errors.New("invalid local S3 tier garbage journal candidate")
+			}
+		}
+		t.gc = candidates
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -686,6 +754,115 @@ func (t *fileS3Tier) validCheckpoint(checkpoint *s3TierCheckpoint) bool {
 	digest, err := t.configSHA256()
 	return err == nil && checkpoint.ConfigSHA256 == digest &&
 		checkpoint.ManifestKey == t.manifestKey(checkpoint.ManifestGeneration)
+}
+
+func (t *fileS3Tier) validGCCandidate(candidate s3TierGCCandidate) bool {
+	prefix := strings.Trim(t.cfg.Prefix, "/") + "/blocks/"
+	return candidate.Version == 1 && candidate.Created.After(time.Unix(0, 0)) && strings.HasPrefix(candidate.Key, prefix) && strings.HasSuffix(candidate.Key, ".blk")
+}
+
+func (t *fileS3Tier) writeGCJournalLocked() error {
+	buf, err := json.Marshal(t.gc)
+	if err != nil {
+		return err
+	}
+	return writeAtomically(t.fs.dios, t.gcFile(), buf, defaultFilePerms, true)
+}
+
+// recordGCCandidate persists a failed payload's identity before returning an
+// error to the caller. A later successful descriptor commit removes it from
+// the journal, and GC will not inspect or delete any other remote object.
+func (t *fileS3Tier) recordGCCandidate(key string) error {
+	candidate := s3TierGCCandidate{Version: 1, Key: key, Created: time.Now().UTC()}
+	if !t.validGCCandidate(candidate) {
+		return errors.New("invalid S3 tier garbage candidate")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, existing := range t.gc {
+		if existing.Key == key {
+			return nil
+		}
+	}
+	t.gc = append(t.gc, candidate)
+	if err := t.writeGCJournalLocked(); err != nil {
+		t.gc = t.gc[:len(t.gc)-1]
+		return err
+	}
+	return nil
+}
+
+func (t *fileS3Tier) removeGCCandidateLocked(key string) error {
+	for i, candidate := range t.gc {
+		if candidate.Key == key {
+			t.gc = append(t.gc[:i], t.gc[i+1:]...)
+			return t.writeGCJournalLocked()
+		}
+	}
+	return nil
+}
+
+// collectGarbage only deletes payload keys durably journaled when descriptor
+// creation failed. Stream records, descriptors, manifests, checkpoints, and
+// every payload reachable from a descriptor are deliberately outside its
+// authority. That makes stream deletion and history retention irrelevant to
+// this operation.
+func (t *fileS3Tier) collectGarbage(execute bool) (S3TierGCResult, error) {
+	t.runMu.Lock()
+	defer t.runMu.Unlock()
+
+	t.mu.Lock()
+	candidates := append([]s3TierGCCandidate(nil), t.gc...)
+	referenced := make(map[string]struct{}, len(t.desc))
+	for _, descriptor := range t.desc {
+		referenced[descriptor.Key] = struct{}{}
+	}
+	t.mu.Unlock()
+
+	var result S3TierGCResult
+	var deleter s3TierObjectDeleter
+	if execute {
+		var ok bool
+		if deleter, ok = t.cfg.Store.(s3TierObjectDeleter); !ok {
+			return result, errors.New("S3 tier store does not support garbage collection deletion")
+		}
+	}
+	for _, candidate := range candidates {
+		result.Scanned++
+		if _, ok := referenced[candidate.Key]; ok {
+			t.mu.Lock()
+			err := t.removeGCCandidateLocked(candidate.Key)
+			t.mu.Unlock()
+			if err != nil {
+				return result, err
+			}
+			continue
+		}
+		if time.Since(candidate.Created) < t.cfg.GCGrace {
+			result.Pending++
+			continue
+		}
+		result.Eligible++
+		if !execute {
+			continue
+		}
+		ctx, cancel := t.ctx()
+		err := deleter.Delete(ctx, candidate.Key)
+		cancel()
+		if err != nil {
+			t.stats.gcErrors.Add(1)
+			return result, fmt.Errorf("S3 tier garbage collection delete %q: %w", candidate.Key, err)
+		}
+		t.mu.Lock()
+		err = t.removeGCCandidateLocked(candidate.Key)
+		t.mu.Unlock()
+		if err != nil {
+			return result, err
+		}
+		t.stats.gcDeletes.Add(1)
+		result.Deleted++
+	}
+	return result, nil
 }
 
 func validS3TierRemoteRestoreOperationID(operationID string) bool {
@@ -1535,6 +1712,7 @@ func (t *fileS3Tier) statsSnapshot() S3TierStats {
 	if t.checkpoint != nil {
 		checkpointSeq = t.checkpoint.CoveredThrough
 	}
+	gcPending := uint64(len(t.gc))
 	t.mu.Unlock()
 	backlogBytes, backlogBlocks := t.backlog()
 	return S3TierStats{
@@ -1544,6 +1722,7 @@ func (t *fileS3Tier) statsSnapshot() S3TierStats {
 		CapacityErrors: t.stats.capacityErrors.Load(), HighWatermark: t.cfg.LocalHighBytes, LowWatermark: t.cfg.LocalLowBytes,
 		RemoteHigh: t.cfg.RemoteHighBytes, RemoteLow: t.cfg.RemoteLowBytes, CheckpointSeq: checkpointSeq,
 		BacklogBytes: backlogBytes, BacklogBlocks: backlogBlocks, RetryAttempts: t.stats.retryAttempts.Load(),
+		GCPending: gcPending, GCDeletes: t.stats.gcDeletes.Load(), GCErrors: t.stats.gcErrors.Load(),
 		RestorePrepares: t.stats.restorePrepares.Load(), RestoreCheckpoints: t.stats.restoreCheckpoints.Load(),
 		RestoreAborts: t.stats.restoreAborts.Load(), RestoreActivations: t.stats.restoreActivations.Load(),
 		RestoreRetirements: t.stats.restoreRetirements.Load(), RestoreErrors: t.stats.restoreErrors.Load(),
@@ -1623,6 +1802,9 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool) (uint64, error) {
 	}
 	if err := t.putImmutable(t.descriptorKey(d.Index), buf); err != nil {
 		t.stats.uploadErrors.Add(1)
+		if journalErr := t.recordGCCandidate(d.Key); journalErr != nil {
+			return 0, fmt.Errorf("S3 tier descriptor write failed: %v; recording garbage candidate: %w", err, journalErr)
+		}
 		return 0, err
 	}
 	if err := t.commitManifest(&d); err != nil {
@@ -1637,6 +1819,12 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool) (uint64, error) {
 		return t.removeLocalBlock(mb, data, &d)
 	}
 	if err := t.recordRemoteBlock(mb, data, d); err != nil {
+		return 0, err
+	}
+	t.mu.Lock()
+	err = t.removeGCCandidateLocked(d.Key)
+	t.mu.Unlock()
+	if err != nil {
 		return 0, err
 	}
 	return uint64(len(data)), nil
