@@ -2846,7 +2846,13 @@ func (o *consumer) pushAck(_ *subscription, c *client, _ *Account, subject, repl
 func (o *consumer) processAck(subject, reply string, hdr int, rmsg []byte) {
 	defer atomic.AddInt64(&o.awl, -1)
 
-	if o.mset == nil || o.mset.remoteRestoreFenced() {
+	// ACK delivery is asynchronous. Shutdown clears mset while the queue may
+	// still be draining, so snapshot it under the consumer lock before using
+	// the stream's restore fence.
+	o.mu.RLock()
+	mset := o.mset
+	o.mu.RUnlock()
+	if mset == nil || mset.remoteRestoreFenced() {
 		return
 	}
 
