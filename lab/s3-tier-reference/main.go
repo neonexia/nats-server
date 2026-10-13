@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -382,8 +381,6 @@ jetstream {
 	}
 
 	total := publishers * messagesPerPublisher
-	published := make([]string, 0, total)
-	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for publisher := 0; publisher < publishers; publisher++ {
 		publisher := publisher
@@ -395,14 +392,10 @@ jetstream {
 				if _, err := js.Publish(subject, []byte(payload)); err != nil {
 					panic(err)
 				}
-				mu.Lock()
-				published = append(published, payload)
-				mu.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
-	sort.Strings(published)
 	if err := consumeAndAck(js, "audit-a", total/3); err != nil {
 		panic(err)
 	}
@@ -413,6 +406,12 @@ jetstream {
 	prepare, err := request(nc, "$JS.API.STREAM.PREPARE_REMOTE_RESTORE."+streamName, sourceRequest{operation})
 	if err != nil || mustActive(prepare, "prepared") != nil || prepare.NextAction != "checkpoint_remote_restore" {
 		panic(fmt.Errorf("prepare: %v %+v", err, prepare))
+	}
+	// A live publisher must stop accepting source acknowledgements once the
+	// handoff fence is durable. Its reconnect below publishes to the activated
+	// target, so the test covers the application's ownership-switch behavior.
+	if _, err := js.Publish(subject, []byte("must-be-rejected-while-fenced")); err == nil {
+		panic("source accepted a live publish after remote-restore prepare")
 	}
 	// Simulate source-process loss after the durable fence. The restarted source
 	// must continue at checkpointing, with writers still fenced.
@@ -509,6 +508,36 @@ jetstream {
 		panic(err)
 	}
 
+	// Reconnect live application workers to the target after activation. The
+	// source process was deliberately stopped above, so clients cannot retain a
+	// transport session across the handoff; durable names preserve their cursor.
+	const tailMessagesPerPublisher = 25
+	tailTotal := publishers * tailMessagesPerPublisher
+	wg = sync.WaitGroup{}
+	for publisher := 0; publisher < publishers; publisher++ {
+		publisher := publisher
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for seq := 0; seq < tailMessagesPerPublisher; seq++ {
+				payload := fmt.Sprintf("post-handoff publisher=%d sequence=%d", publisher, seq)
+				if _, err := targetJS.Publish(subject, []byte(payload)); err != nil {
+					panic(err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if err := consumeAndAck(targetJS, "audit-a", tailTotal); err != nil {
+		panic(err)
+	}
+	if err := consumeAndAck(targetJS, "audit-b", tailTotal); err != nil {
+		panic(err)
+	}
+	if info, err := targetJS.StreamInfo(streamName); err != nil || int(info.State.Msgs) != total+tailTotal {
+		panic(fmt.Errorf("target stream state after live reconnect: %v %+v", err, info))
+	}
+
 	retired, err := request(nc, "$JS.API.STREAM.RETIRE_REMOTE_SOURCE."+streamName, sourceRequest{operation})
 	if err != nil || mustActive(retired, "retired") != nil || retired.NextAction != "none" {
 		panic(fmt.Errorf("retire: %v %+v", err, retired))
@@ -517,5 +546,5 @@ jetstream {
 	if err != nil || mustActive(status, "retired") != nil || status.NextAction != "none" {
 		panic(fmt.Errorf("retired status: %v %+v", err, status))
 	}
-	fmt.Printf("PASS: %d messages, %d publishers, bounded upload pressure, two restored durable consumers; source restart and object-store outages recovered. Logs: %s\n", total, publishers, logs)
+	fmt.Printf("PASS: %d pre-handoff and %d post-handoff messages from %d publishers; bounded upload pressure, two restored durable consumers, source restart, and object-store outages recovered. Logs: %s\n", total, tailTotal, publishers, logs)
 }

@@ -12,7 +12,8 @@ The run exercises:
 - a RustFS upload outage that reaches bounded local pressure, followed by remote drain;
 - `prepare`, a source-process restart, and `checkpoint`;
 - a RustFS outage during target restore followed by the same-operation retry;
-- restored consumer delivery and acknowledgement state;
+- source publishes rejected by the durable handoff fence, then live publisher reconnection to the target;
+- restored consumer delivery and acknowledgement state, including post-handoff messages;
 - source retirement and retired-state polling after local source removal.
 
 Build the forked server and run the harness:
