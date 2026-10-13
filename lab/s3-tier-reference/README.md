@@ -8,6 +8,7 @@ durable consumers, and the public remote-restore management subjects.
 The run exercises:
 
 - concurrent raw-message publishers;
+- ordinary source-node restart, with publishers and durable consumers reconnecting to the same server and local store;
 - two durable pull consumers with different acknowledged positions;
 - a RustFS upload outage that reaches bounded local pressure, followed by remote drain;
 - `prepare`, a source-process restart, and `checkpoint`;

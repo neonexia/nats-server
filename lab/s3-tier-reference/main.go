@@ -403,6 +403,58 @@ jetstream {
 		panic(err)
 	}
 
+	// First prove ordinary same-node recovery independently of handoff. Clients
+	// lose their transport connection when the server dies, reconnect to the
+	// same port and store directory, then resume their durable cursors.
+	nc.Close()
+	source.stop()
+	source, err = start("source-normal-restarted", natsServer, []string{"-c", sourceConfig}, env, logs)
+	if err != nil {
+		panic(err)
+	}
+	defer source.stop()
+	if err := waitForNATS(sourceURL, 15*time.Second); err != nil {
+		panic(err)
+	}
+	nc, err = nats.Connect(sourceURL)
+	if err != nil {
+		panic(err)
+	}
+	defer nc.Close()
+	js, err = nc.JetStream()
+	if err != nil {
+		panic(err)
+	}
+	const restartMessagesPerPublisher = 10
+	restartTotal := publishers * restartMessagesPerPublisher
+	wg = sync.WaitGroup{}
+	for publisher := 0; publisher < publishers; publisher++ {
+		publisher := publisher
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for seq := 0; seq < restartMessagesPerPublisher; seq++ {
+				payload := fmt.Sprintf("post-source-restart publisher=%d sequence=%d", publisher, seq)
+				if _, err := js.Publish(subject, []byte(payload)); err != nil {
+					panic(err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if info, err := js.StreamInfo(streamName); err != nil || int(info.State.Msgs) != total+restartTotal {
+		panic(fmt.Errorf("source stream state after ordinary restart: %v %+v", err, info))
+	}
+	const reconnectAcks = 10
+	if err := consumeAndAck(js, "audit-a", reconnectAcks); err != nil {
+		panic(fmt.Errorf("consumer audit-a after ordinary restart: %w", err))
+	}
+	if err := consumeAndAck(js, "audit-b", reconnectAcks); err != nil {
+		panic(fmt.Errorf("consumer audit-b after ordinary restart: %w", err))
+	}
+	sourceTotal := total + restartTotal
+	ackedA, ackedB := total/3+reconnectAcks, total/4+reconnectAcks
+
 	prepare, err := request(nc, "$JS.API.STREAM.PREPARE_REMOTE_RESTORE."+streamName, sourceRequest{operation})
 	if err != nil || mustActive(prepare, "prepared") != nil || prepare.NextAction != "checkpoint_remote_restore" {
 		panic(fmt.Errorf("prepare: %v %+v", err, prepare))
@@ -516,13 +568,13 @@ jetstream {
 		panic(err)
 	}
 	info, err := targetJS.StreamInfo(streamName)
-	if err != nil || int(info.State.Msgs) != total {
+	if err != nil || int(info.State.Msgs) != sourceTotal {
 		panic(fmt.Errorf("target stream state: %v %+v", err, info))
 	}
-	if err := consumeAndAck(targetJS, "audit-a", total-total/3); err != nil {
+	if err := consumeAndAck(targetJS, "audit-a", sourceTotal-ackedA); err != nil {
 		panic(err)
 	}
-	if err := consumeAndAck(targetJS, "audit-b", total-total/4); err != nil {
+	if err := consumeAndAck(targetJS, "audit-b", sourceTotal-ackedB); err != nil {
 		panic(err)
 	}
 
@@ -552,7 +604,7 @@ jetstream {
 	if err := consumeAndAck(targetJS, "audit-b", tailTotal); err != nil {
 		panic(err)
 	}
-	if info, err := targetJS.StreamInfo(streamName); err != nil || int(info.State.Msgs) != total+tailTotal {
+	if info, err := targetJS.StreamInfo(streamName); err != nil || int(info.State.Msgs) != sourceTotal+tailTotal {
 		panic(fmt.Errorf("target stream state after live reconnect: %v %+v", err, info))
 	}
 
