@@ -4788,6 +4788,7 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 	s.Noticef("S3 tier remote restore %s for stream %q is %s at epoch %d", req.OperationID, stream, state.State, state.Epoch)
 	mset.mu.Lock()
 	mset.remoteRestore = state
+	mset.remoteRestoreFence.Store(state.fenced())
 	mset.mu.Unlock()
 	remoteRestoreResponse(&resp, state)
 	resp.NextAction = remoteRestoreNextAction(resp.State)

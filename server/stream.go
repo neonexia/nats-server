@@ -606,6 +606,10 @@ type stream struct {
 	// recovery checkpoint is prepared. The file-store reloads it before stream
 	// subscriptions accept publishes after a process restart.
 	remoteRestore *s3TierRemoteRestoreState
+	// remoteRestoreFence mirrors remoteRestore.fenced() for consumer paths. Those
+	// paths hold consumer locks while stream interest processing holds mset.mu, so
+	// consulting remoteRestore through mset.mu would invert the lock order.
+	remoteRestoreFence atomic.Bool
 
 	// Mirror
 	mirror              *sourceInfo
@@ -1508,10 +1512,7 @@ func (mset *stream) setLeader(isLeader bool, term uint64) error {
 // for an in-progress remote handoff. Consumer delivery and acknowledgements use
 // this shared fence so the checkpoint captures one stable boundary.
 func (mset *stream) remoteRestoreFenced() bool {
-	mset.mu.RLock()
-	fenced := mset.remoteRestore.fenced()
-	mset.mu.RUnlock()
-	return fenced
+	return mset.remoteRestoreFence.Load()
 }
 
 func (mset *stream) completeRemoteRestoreConsumers() error {
@@ -5549,6 +5550,7 @@ func (mset *stream) setupStore(fsCfg *FileStoreConfig, recovering bool) error {
 		mset.store = fs
 		if fs.tier != nil {
 			mset.remoteRestore = fs.tier.remoteRestoreState()
+			mset.remoteRestoreFence.Store(mset.remoteRestore.fenced())
 		}
 	}
 	// This will fire the callback but we do not require the lock since md will be 0 here.

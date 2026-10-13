@@ -24,6 +24,28 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+func TestJetStreamS3TierRemoteRestoreFenceReadDoesNotLockStream(t *testing.T) {
+	var mset stream
+	mset.remoteRestoreFence.Store(true)
+
+	// Consumer delivery holds its lock while querying this fence. Interest
+	// retention holds the stream lock while querying consumers, so this read
+	// must not acquire mset.mu.
+	mset.mu.Lock()
+	defer mset.mu.Unlock()
+
+	result := make(chan bool, 1)
+	go func() { result <- mset.remoteRestoreFenced() }()
+	select {
+	case fenced := <-result:
+		if !fenced {
+			t.Fatal("expected remote restore fence")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote restore fence read blocked on stream lock")
+	}
+}
+
 type testS3BlockStore struct {
 	mu             sync.Mutex
 	objects        map[string][]byte
