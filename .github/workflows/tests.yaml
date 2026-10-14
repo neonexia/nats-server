@@ -160,6 +160,11 @@ jobs:
           -run 'Test(FileStoreS3TierCompatibleEndpoint|FileStoreS3TierGarbageCompatibleEndpoint|JetStreamS3TierRemoteRestoreCompatibleEndpoint)$'
           -count=1
 
+      - name: Run S3-tier disk-full integration test
+        env:
+          TEST_S3_TIER_DISK_FULL: 1
+        run: go test ./lab/s3-tier-disk-full -count=1 -timeout=10m
+
       - name: Run S3-tier recovery reference simulation
         run: |
           go build -o /tmp/nats-server-s3-tier-reference .

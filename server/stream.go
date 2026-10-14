@@ -7424,11 +7424,18 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			s.RateLimitDebugf("JetStream failed to store a msg on stream '%s > %s': %v", accName, name, err)
 		case ErrStoreClosed:
 		default:
-			// We don't want to respond back to the user, and definitely not up CLFS either.
-			// This was likely an IO issue, so only log and return the error. This will stop
-			// the stream if it was replicated.
+			// Do not advance CLFS for an I/O failure: a clustered leader must preserve
+			// its replicated sequence boundary. A standalone stream can still tell the
+			// requesting publisher that its message was not acknowledged, rather than
+			// making it wait for a request timeout after a local write error.
 			s.RateLimitErrorf("JetStream failed to store a msg on stream '%s > %s': %v", accName, name, err)
 			mset.setWriteErrLocked(err)
+			if canRespond && !isClustered {
+				resp.PubAck = &PubAck{Stream: name}
+				resp.Error = NewJSStreamStoreFailedError(err, Unless(err))
+				response, _ = json.Marshal(resp)
+				outq.sendMsg(reply, response)
+			}
 			return err
 		}
 

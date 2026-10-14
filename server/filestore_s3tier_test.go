@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +44,51 @@ func TestJetStreamS3TierRemoteRestoreFenceReadDoesNotLockStream(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("remote restore fence read blocked on stream lock")
+	}
+}
+
+func TestJetStreamS3TierRespondsToCriticalLocalWriteError(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	opts := DefaultTestOptions
+	opts.Port = -1
+	opts.JetStream = true
+	opts.StoreDir = t.TempDir()
+	opts.JetStreamS3Tiers = map[string]*S3TierConfig{"$G/DISK": {
+		Store: store, Prefix: "test/disk-write-error", BlockSize: 16 * 1024,
+		LocalHighBytes: 32 * 1024, LocalLowBytes: 16 * 1024,
+	}}
+	s := RunServer(&opts)
+	defer s.Shutdown()
+
+	mset, err := s.GlobalAccount().addStream(&StreamConfig{
+		Name: "DISK", Subjects: []string{"disk.events"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mset.delete()
+
+	fs := mset.store.(*fileStore)
+	fs.mu.Lock()
+	fs.werr = io.ErrShortWrite
+	fs.mu.Unlock()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+	resp, err := nc.Request("disk.events", []byte("must-not-be-acknowledged"), time.Second)
+	if err != nil {
+		t.Fatalf("critical local write error should return a publish response: %v", err)
+	}
+	ack := getPubAckResponse(resp.Data)
+	if ack == nil || ack.Error == nil || ack.Stream != "DISK" {
+		t.Fatalf("critical local write response: %q", resp.Data)
+	}
+	if ack.Error.ErrCode != uint16(JSStreamStoreFailedF) {
+		t.Fatalf("critical local write error: %+v", ack.Error)
+	}
+	if state := mset.state(); state.Msgs != 0 || state.LastSeq != 0 {
+		t.Fatalf("failed publish changed stream state: %+v", state)
 	}
 }
 

@@ -64,8 +64,8 @@ belong in the file or persisted stream metadata.
 ## Observed results
 
 - Focused Go tests cover block eviction, readback, remote-only file-store restart while the object store rejects reads, full server restart, 100-message native durable pull replay, exact single-block cold reads, coalesced concurrent cold reads, cache re-eviction, manifest commit failure, pressure-driven write rejection, remote tail draining through the file store and NATS API, `server.conf` parsing/defaults, and bounded upload retry after injected outages and request timeouts. PUT, descriptor, and manifest failures leave the local block present. A blocked cold GET does not hold a local `StoreMsg` in the retry path. An injected GET failure leaves the consumer sequence at 1, and direct get returns the storage-specific 503 header.
-- The S3 adapter passed the same eviction, cold-read, and restart test against a local Moto S3 endpoint. A local MinIO AIStor server reached its health endpoint but denied `MakeBucket` and S3 operations without a license. Docker pulls from the historical MinIO registries were unavailable in this environment. A licensed MinIO or AWS endpoint and network-partition tests remain unverified.
-- `go test -race` passed the focused tier tests. These are correctness spikes, not latency or throughput benchmarks.
+- The S3 adapter passed its compatible-endpoint suite against RustFS, including immutable writes, listing, garbage collection, cold reads, and remote restore. The CI job starts RustFS before that suite.
+- A Docker integration test gives JetStream a 12 MiB Linux `tmpfs`, makes the configured S3 endpoint unavailable, and fills the local store. The rejected publish returns `JSStreamStoreFailed` (10077), the server logs `ENOSPC`, and an earlier acknowledged message remains readable. `go test -race` also passed the focused tier tests. These are correctness spikes, not latency or throughput benchmarks.
 
 ## Revised assessment and remaining gaps
 

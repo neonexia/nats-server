@@ -63,3 +63,13 @@ The publish workflow creates the GHCR image when this work reaches `main`; until
 S3-compatible functional qualification, not an authentication test. Use
 `-object-store-mode process -object-store /path/to/rustfs` to start a standalone server
 process instead.
+
+## Disk-full integration gate
+
+This Docker test gives JetStream a 12 MiB Linux `tmpfs` volume, keeps S3
+unavailable, and verifies that a real `ENOSPC` returns a JetStream publish
+error while acknowledged data remains readable.
+
+```sh
+TEST_S3_TIER_DISK_FULL=1 go test ./lab/s3-tier-disk-full -count=1 -timeout=10m
+```
