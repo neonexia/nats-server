@@ -26,8 +26,9 @@ go run ./lab/s3-tier-reference -nats-server ./nats-server-reference
 ```
 
 The executable accepts `-publishers` and `-messages` to increase the concurrent
-load. It creates an isolated temporary directory and prints the retained process
-logs path. A successful run ends with `PASS`.
+load. It creates an isolated temporary directory and prints the process-log path.
+Failed runs retain that directory for diagnosis; use `-keep` to retain it after a
+successful run. A successful run ends with `PASS`.
 
 ## Real object-store test gate
 

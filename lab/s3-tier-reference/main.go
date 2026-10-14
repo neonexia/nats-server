@@ -35,16 +35,27 @@ const (
 )
 
 type restoreResponse struct {
-	Success     bool   `json:"success"`
-	OperationID string `json:"operation_id"`
-	Epoch       uint64 `json:"epoch"`
-	State       string `json:"state"`
-	TargetID    string `json:"target_id"`
-	NextAction  string `json:"next_action"`
-	Consumers   int    `json:"consumers"`
-	Error       *struct {
-		Description string `json:"description"`
-	} `json:"error,omitempty"`
+	Success     bool      `json:"success"`
+	OperationID string    `json:"operation_id"`
+	Epoch       uint64    `json:"epoch"`
+	State       string    `json:"state"`
+	TargetID    string    `json:"target_id"`
+	NextAction  string    `json:"next_action"`
+	Consumers   int       `json:"consumers"`
+	Error       *apiError `json:"error,omitempty"`
+}
+
+type apiError struct {
+	Code        int    `json:"code"`
+	ErrCode     uint16 `json:"err_code"`
+	Description string `json:"description"`
+}
+
+func (e *apiError) String() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s (http=%d, jetstream=%d)", e.Description, e.Code, e.ErrCode)
 }
 
 type sourceRequest struct {
@@ -227,11 +238,13 @@ func consumeAndAck(js nats.JetStreamContext, durable string, expected int) error
 func main() {
 	var natsServer, objectStoreServer, objectStoreMode string
 	var publishers, messagesPerPublisher int
+	var keep bool
 	flag.StringVar(&natsServer, "nats-server", "./nats-server", "path to the forked nats-server binary")
 	flag.StringVar(&objectStoreServer, "object-store", "rustfs", "path to the RustFS binary when -object-store-mode=process")
 	flag.StringVar(&objectStoreMode, "object-store-mode", "docker", "object-store runtime: docker or process")
 	flag.IntVar(&publishers, "publishers", 3, "concurrent publisher count")
 	flag.IntVar(&messagesPerPublisher, "messages", 100, "messages per publisher")
+	flag.BoolVar(&keep, "keep", false, "retain the isolated run directory after completion")
 	flag.Parse()
 
 	// Docker Desktop can mount /tmp reliably; the per-user temporary directory
@@ -240,7 +253,14 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer os.RemoveAll(root)
+	completed := false
+	defer func() {
+		if keep || !completed {
+			fmt.Printf("retained reference run directory: %s\n", root)
+			return
+		}
+		_ = os.RemoveAll(root)
+	}()
 	fmt.Printf("reference run directory: %s\n", root)
 
 	objectStorePort, _ := reservePort()
@@ -392,9 +412,13 @@ jetstream {
 	if err := waitFor(objectStoreHealth, 45*time.Second); err != nil {
 		panic(err)
 	}
+	if err := ensureBucket(ctx, client, "reference", 15*time.Second); err != nil {
+		panic(err)
+	}
 	drain, err := request(nc, "$JS.API.STREAM.DRAIN_REMOTE.PRESSURE", nil)
 	if err != nil || !drain.Success || drain.Error != nil {
-		panic(fmt.Errorf("drain after upload outage: %v %+v", err, drain))
+		output, _ := os.ReadFile(filepath.Join(logs, "source.log"))
+		panic(fmt.Errorf("drain after upload outage: %v %+v (%s); source log: %s", err, drain, drain.Error, output))
 	}
 	pressureInfo, err := js.StreamInfo("PRESSURE")
 	if err != nil || int(pressureInfo.State.Msgs) != accepted {
@@ -546,6 +570,9 @@ jetstream {
 	if err := waitFor(objectStoreHealth, 45*time.Second); err != nil {
 		panic(err)
 	}
+	if err := ensureBucket(ctx, client, "reference", 15*time.Second); err != nil {
+		panic(err)
+	}
 	var restored restoreResponse
 	deadline := time.Now().Add(15 * time.Second)
 	for {
@@ -658,5 +685,6 @@ jetstream {
 	if err != nil || mustActive(status, "retired") != nil || status.NextAction != "none" {
 		panic(fmt.Errorf("retired status: %v %+v", err, status))
 	}
+	completed = true
 	fmt.Printf("PASS: %d pre-handoff and %d post-handoff messages from %d publishers; bounded upload pressure, two restored durable consumers, source restart, and object-store outages recovered. Logs: %s\n", total, tailTotal, publishers, logs)
 }
