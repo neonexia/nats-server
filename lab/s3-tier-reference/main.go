@@ -149,6 +149,27 @@ func waitForNATS(url string, timeout time.Duration) error {
 	return fmt.Errorf("timed out waiting for %s", url)
 }
 
+func ensureBucket(ctx context.Context, client *minio.Client, bucket string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
+		if err == nil {
+			return nil
+		}
+		code := minio.ToErrorResponse(err).Code
+		if code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists" {
+			return nil
+		}
+		// RustFS can report healthy before its storage namespace accepts bucket
+		// creation. Retrying here keeps the fault workload from confusing that
+		// startup boundary with a JetStream recovery failure.
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("create bucket %q: %w", bucket, lastErr)
+}
+
 func request(nc *nats.Conn, subject string, value any) (restoreResponse, error) {
 	var response restoreResponse
 	var data []byte
@@ -270,7 +291,7 @@ func main() {
 		panic(err)
 	}
 	ctx := context.Background()
-	if err := client.MakeBucket(ctx, "reference", minio.MakeBucketOptions{}); err != nil && minio.ToErrorResponse(err).Code != "BucketAlreadyOwnedByYou" {
+	if err := ensureBucket(ctx, client, "reference", 15*time.Second); err != nil {
 		panic(err)
 	}
 
