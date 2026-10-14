@@ -29,6 +29,32 @@ The executable accepts `-publishers` and `-messages` to increase the concurrent
 load. It creates an isolated temporary directory and prints the retained process
 logs path. A successful run ends with `PASS`.
 
+## Real object-store test gate
+
+Run the compatible-endpoint tests against RustFS before relying on the reference
+simulation. This starts a pinned local object store, waits for it to be ready,
+runs the server tests through real S3 request signing and object operations, and
+removes the temporary container.
+
+```sh
+docker rm -f nats-s3-tier-rustfs 2>/dev/null || true
+docker run -d --rm --name nats-s3-tier-rustfs \
+  -p 127.0.0.1:19000:9000 \
+  -e RUSTFS_ACCESS_KEY=testaccess \
+  -e RUSTFS_SECRET_KEY=testsecret123 \
+  -e RUSTFS_ADDRESS=:9000 \
+  -e RUSTFS_CONSOLE_ENABLE=false \
+  rustfs/rustfs@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c /data
+
+until curl --fail --silent http://127.0.0.1:19000/health >/dev/null; do sleep 1; done
+
+TEST_S3_TIER_ENDPOINT=127.0.0.1:19000 go test ./server \
+  -run 'Test(FileStoreS3TierCompatibleEndpoint|FileStoreS3TierGarbageCompatibleEndpoint|JetStreamS3TierRemoteRestoreCompatibleEndpoint)$' \
+  -count=1 -timeout=10m -vet=off
+
+docker rm -f nats-s3-tier-rustfs
+```
+
 By default the harness starts a pinned official RustFS Docker image. This is a local
 S3-compatible functional qualification, not an authentication test. Use
 `-object-store-mode process -object-store /path/to/rustfs` to start a standalone server
