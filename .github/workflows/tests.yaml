@@ -138,7 +138,7 @@ jobs:
             -e RUSTFS_SECRET_KEY=testsecret123 \
             -e RUSTFS_ADDRESS=:9000 \
             -e RUSTFS_CONSOLE_ENABLE=false \
-            rustfs/rustfs@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c /data
+            ghcr.io/neonexia/nats-server-s3-tier-rustfs:latest
           for attempt in {1..60}; do
             if curl --fail --silent http://127.0.0.1:19000/health >/dev/null; then
               exit 0

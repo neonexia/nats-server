@@ -1,0 +1,42 @@
+name: Publish S3 Tier RustFS Test Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - lab/s3-tier-reference/Dockerfile.rustfs
+      - .github/workflows/s3-tier-rustfs-image.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag to publish from the selected ref
+        required: true
+        default: dev
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: lab/s3-tier-reference/Dockerfile.rustfs
+          push: true
+          tags: |
+            ghcr.io/neonexia/nats-server-s3-tier-rustfs:${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'latest' }}
+            ghcr.io/neonexia/nats-server-s3-tier-rustfs:sha-${{ github.sha }}

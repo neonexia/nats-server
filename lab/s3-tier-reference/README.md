@@ -32,7 +32,7 @@ logs path. A successful run ends with `PASS`.
 ## Real object-store test gate
 
 Run the compatible-endpoint tests against RustFS before relying on the reference
-simulation. This starts a pinned local object store, waits for it to be ready,
+simulation. This pulls the Neonexia-owned image, whose Dockerfile pins RustFS by digest, waits for it to be ready,
 runs the server tests through real S3 request signing and object operations, and
 removes the temporary container.
 
@@ -44,7 +44,7 @@ docker run -d --rm --name nats-s3-tier-rustfs \
   -e RUSTFS_SECRET_KEY=testsecret123 \
   -e RUSTFS_ADDRESS=:9000 \
   -e RUSTFS_CONSOLE_ENABLE=false \
-  rustfs/rustfs@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c /data
+  ghcr.io/neonexia/nats-server-s3-tier-rustfs:latest
 
 until curl --fail --silent http://127.0.0.1:19000/health >/dev/null; do sleep 1; done
 

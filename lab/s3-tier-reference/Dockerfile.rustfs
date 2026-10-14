@@ -1,0 +1,13 @@
+# This wrapper makes the integration-test object store reproducible from GHCR.
+# The RustFS runtime itself remains pinned by immutable digest.
+FROM rustfs/rustfs@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+
+LABEL org.opencontainers.image.source="https://github.com/neonexia/nats-server"
+LABEL org.opencontainers.image.description="RustFS test object store for NATS S3-tier integration tests"
+
+ENV RUSTFS_ADDRESS=:9000 \
+    RUSTFS_CONSOLE_ENABLE=false
+
+EXPOSE 9000
+VOLUME ["/data"]
+CMD ["/data"]
