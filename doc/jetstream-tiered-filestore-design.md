@@ -79,103 +79,113 @@ History serving remains outside this fork. A future service may consume the immu
 
 Remote coverage watermarks do not drain a quiet active block: it remains mutable and local-only until the next block roll. A lifecycle manager should call `DRAIN_REMOTE` when retiring a channel or when its own inactivity policy requires coverage of the tail. The operation creates a new empty local active block, so frequent use raises block-roll and manifest-write overhead.
 
-## Remote recovery foundation
+## External lifecycle API: drain and remote restore
 
-This implementation adds a recovery *boundary*, not snapshot or restore. A
-future restore implementation must be able to discover a complete immutable
-message set without relying on node-local descriptor sidecars. It must not
-infer a recoverable JetStream stream from block objects alone.
+The S3 tier exposes NATS request/reply management subjects so an external
+coordinator can perform a planned move without S3 credentials. The coordinator
+provides the stream name and its own stable operation and target identifiers;
+the source and target servers obtain S3 configuration and credentials from
+their own `server.conf`.
 
-### Immutable object layout
+This is an experimental, **single-replica** protocol for the restricted
+append-only tiered streams described above. It is a planned handoff protocol.
+It does not provide zero-loss recovery after an unexpected source-node loss:
+an active, unflushed block may not be in S3.
 
-```text
-{opaque-stream-prefix}/
-  stream-record.json
-  blocks/{index}-{sha256}.blk
-  descriptors/{index}.json
-  manifests/{generation}.json
-  checkpoints/{covered-through-sequence}.json
+### Common response
+
+Every restore-lifecycle response is JSON with the normal JetStream `error`
+object on failure and these fields on success:
+
+```json
+{
+  "success": true,
+  "operation_id": "move-2026-10-14-001",
+  "epoch": 7,
+  "state": "checkpointed",
+  "checkpoint_key": "opaque S3 metadata",
+  "checkpoint_sha256": "...",
+  "target_id": "node-b",
+  "consumers": 2,
+  "s3_tier": { "...": "counters" },
+  "next_action": "restore_remote"
+}
 ```
 
-`stream-record.json` is conditionally created once. It records a random stream
-incarnation ID, the opaque prefix, stream name and creation time, the stream
-configuration digest, and the S3-tier format version. It prevents a later
-stream using the same human-readable name from being confused with an earlier
-stream incarnation.
+Persist the `operation_id` before making the first call. It must be a stable,
+coordinator-generated ID for one move. Persist the `epoch` returned by
+`PREPARE`; the target must present it to `RESTORE`. A lost response is not a
+reason to create another operation: query `STATUS` and retry the same
+operation.
 
-The object-store adapter exposes an explicit conditional-create operation. The
-MinIO adapter implements it with `If-None-Match: *`; every immutable write is
-then read back and compared byte-for-byte. A collision is acceptable only when
-the existing bytes match exactly. This prevents a retry, a second writer, or a
-prefix mistake from replacing a block, descriptor, manifest, or checkpoint.
+### API reference
 
-Descriptors and manifests bind to that incarnation. Manifests remain immutable
-complete descriptor sets. A checkpoint is written only by a successful remote
-drain after the active block is sealed and all sealed blocks through its
-`covered_through_sequence` are represented in a verified manifest. Its object
-key is the covered-through sequence, making repeated drains at the same
-boundary idempotent.
+| Subject | Called on | Request | Result and use |
+| --- | --- | --- | --- |
+| `$JS.API.STREAM.DRAIN_REMOTE.<stream>` | owning server | empty | Seals a non-empty active block and synchronously verifies remote coverage for all sealed blocks. Returns `{success, drained}`. It retains local payloads and is safe to repeat. Use for coverage of an active stream, retirement preparation, or before a checkpoint. |
+| `$JS.API.STREAM.PREPARE_REMOTE_RESTORE.<stream>` | source | `{"operation_id":"..."}` | Persists a write fence at a precise message boundary. New publishes are rejected. Returns `state: "prepared"`, an epoch, and `next_action: "checkpoint_remote_restore"`. Same operation ID is idempotent. |
+| `$JS.API.STREAM.CHECKPOINT_REMOTE_RESTORE.<stream>` | source | `{"operation_id":"..."}` | Drains the source tail, writes an immutable checkpoint containing stream configuration, stream state, message checkpoint, and durable-consumer state. Returns `state: "checkpointed"` and `next_action: "restore_remote"`. Same operation ID is idempotent. |
+| `$JS.API.STREAM.RESTORE_REMOTE.<stream>` | target | `{"operation_id":"...","expected_epoch":7,"target_id":"node-b"}` | Reads and verifies the immutable checkpoint, stages a private file store, restores stream and consumers, claims the target activation receipt, then enables local ingress. Returns `state: "active"` and `next_action: "retire_remote_source"`. Same operation, epoch, and target ID are idempotent. |
+| `$JS.API.STREAM.RETIRE_REMOTE_SOURCE.<stream>` | source | `{"operation_id":"..."}` | Requires the source checkpointed state and the target activation receipt. Persists a retirement receipt before releasing source-local stream resources. Remote objects are retained. Returns `state: "retired"`, `next_action: "none"`. Same operation ID is idempotent, including after source cleanup. |
+| `$JS.API.STREAM.ABORT_REMOTE_RESTORE.<stream>` | source | `{"operation_id":"..."}` | Removes a prepared source fence before checkpoint/activation, restoring source writes. It returns `state: "aborted"` and `next_action: "prepare_remote_restore"`. Do not use after a target has activated. |
+| `$JS.API.STREAM.REMOTE_RESTORE_STATUS.<stream>` | source or target | empty, or `{"operation_id":"..."}` | Returns lifecycle state, next permitted action, consumer count, and S3-tier counters. Supply the operation ID after source retirement so status can resolve the remote retirement receipt. |
+| `$JS.API.STREAM.COLLECT_REMOTE_GARBAGE.<stream>` | owning server | `{}` for dry run; `{"execute":true}` to remove | Inspects or removes only grace-delayed, journaled orphan payloads from failed descriptor commits. It never removes covered stream data, checkpoints, descriptors, manifests, or a retired stream's objects. |
 
-Commit order for a drain is:
+Normal JetStream API permissions on these subjects authorize calls. None of the
+subjects returns S3 credentials.
 
-```text
-stream record → sealed block bytes → descriptor → manifest → checkpoint
+### Planned move flow
+
+```mermaid
+sequenceDiagram
+    participant C as Coordinator
+    participant S as Source server
+    participant T as Target server
+    C->>S: PREPARE(operation_id)
+    S-->>C: prepared, epoch, fence active
+    C->>S: CHECKPOINT(operation_id)
+    S-->>C: checkpointed, epoch
+    C->>T: RESTORE(operation_id, epoch, target_id)
+    T-->>C: active, activation receipt claimed
+    C->>S: RETIRE(operation_id)
+    S-->>C: retired; local resources released
 ```
 
-Each object is read back and checked before the next object is committed. The
-checkpoint is the durable statement that a future move or restore may use; an
-ordinary manifest created by background coverage is not such a statement.
+The source remains available for reads through `PREPARE` and `CHECKPOINT`.
+After `PREPARE`, it rejects writes; the coordinator must direct publishers to
+the target only after `RESTORE` reports `active`. Do not retire the source
+until target activation succeeds. If the coordinator loses state or receives a
+timeout, call `STATUS` on the appropriate server and follow `next_action`.
 
-### Scope boundary
+### Failure handling
 
-A checkpoint reserves references for future stream metadata, consumer state,
-and encryption-key metadata, but this slice does not create or restore those
-artifacts. It deliberately does not upload raw `index.db`: that is an internal
-file-store implementation detail and omits consumer acknowledgement state.
+- **Before checkpoint:** retry `PREPARE`, or use `ABORT` to resume source
+  writes. A source restart retains the fence and operation state.
+- **During checkpoint:** retry `CHECKPOINT` with the same operation ID. It
+  repeats drain and checkpoint verification without accepting source writes.
+- **Target S3 outage or target process failure:** retry `RESTORE` on the same
+  target with the same operation ID, epoch, and target ID after S3 recovers.
+  A failed inactive target staging area is removed before retry.
+- **After target activation but before source retirement:** target `RESTORE`
+  is repeatable and source `STATUS` remains checkpointed. Retry `RETIRE` only
+  after confirming target `active`.
+- **After source retirement or a lost retirement response:** retry `RETIRE` or
+  query source `STATUS` using the operation ID. The durable retirement receipt
+  returns `retired` even though the local source stream no longer exists.
 
-The normal same-disk restart path continues to use local sidecars and does not
-contact S3. A future disk-loss restore may list `checkpoints/`, select a valid
-checkpoint, read its manifest and descriptors, then combine them with an
-explicit future metadata checkpoint. Until that metadata format exists, a
-checkpoint proves message-block coverage only and cannot recreate a live
-JetStream stream.
+### Object and snapshot boundaries
 
-No checkpoint can include messages in a mutable active block after an
-unexpected disk loss. A planned move or archive obtains a bounded message set
-by calling `DRAIN_REMOTE`; zero-loss unplanned recovery requires a separate
-replication or synchronous-durability design.
+Remote data is immutable under an opaque per-stream prefix. Stream deletion
+and retirement deliberately leave those objects in place for a later history
+or audit service. Remote garbage collection is limited to journaled failed
+upload debris, never message history.
 
-### Recovery modes and lifecycle decisions
-
-The foundation deliberately separates three recovery cases:
-
-| Case | Current behavior | Future use of this foundation |
-| --- | --- | --- |
-| Same node and disk restart | Local descriptor, stream-record, manifest, and checkpoint sidecars recover without contacting S3. | No restore flow is needed. |
-| Planned workspace move or retirement | `DRAIN_REMOTE` seals the current tail and creates a verified checkpoint while retaining local payloads. | A future exporter/restore protocol can select the checkpoint after it captures stream and consumer metadata. |
-| Disk loss or node loss | Not supported as a live-stream restore. An unflushed active tail can be absent remotely. | A future restore can list checkpoints and reconstruct message blocks after it has a compatible metadata and consumer-state format. |
-
-`DRAIN_REMOTE` is an external lifecycle operation, not normal retention. It
-does not reclaim local data. Nodus can use it before retiring a workspace, then
-release node-local resources while leaving remote objects for future history or
-audit work. Stream deletion currently must leave remote objects in place.
-
-Remote GC means only removal of safe protocol debris such as a payload written
-before its descriptor failed, or a manifest/checkpoint generation made
-unreachable by a future format. It must never be coupled to stream deletion or
-used to remove remotely covered workspace history. This slice implements the
-first case only: an explicit, grace-delayed, journal-backed removal of a known
-payload whose descriptor commit failed. It cannot delete remotely covered data
-and intentionally leaves unknown or historical artifacts untouched. A future
-retention-aware collector needs Nodus's authoritative active-prefix and
-archival-retention inventory before it can address any broader object set.
-
-Snapshot and restore are separate future features. A JetStream snapshot is a
-point-in-time export sufficient to recreate a stream elsewhere; it must include
-stream configuration, stream state, consumer acknowledgement state, relevant
-key references, and the selected remote checkpoint. The current checkpoint is
-only the message-block part of that future export, so it cannot start live
-pub/sub on another node by itself.
+A standard JetStream snapshot remains a separate feature. The remote restore
+checkpoint is sufficient for this restricted planned handoff because it
+captures the stream configuration, stream state, message boundary, and
+consumer state. It is not a general replacement for a snapshot format,
+clustered recovery, arbitrary retention semantics, encryption-key recovery, or
+unplanned node-loss recovery.
 
 ## Target design and validation gates
 
