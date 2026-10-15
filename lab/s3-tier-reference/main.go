@@ -211,25 +211,84 @@ func mustActive(response restoreResponse, want string) error {
 	return nil
 }
 
-func consumeAndAck(js nats.JetStreamContext, durable string, expected int) error {
+type messageLedger struct {
+	mu    sync.Mutex
+	bySeq map[uint64]string
+}
+
+func (l *messageLedger) record(ack *nats.PubAck, payload string) error {
+	if ack == nil || ack.Sequence == 0 {
+		return fmt.Errorf("publish did not return a stream sequence")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.bySeq[ack.Sequence]; ok {
+		return fmt.Errorf("duplicate published stream sequence %d", ack.Sequence)
+	}
+	l.bySeq[ack.Sequence] = payload
+	return nil
+}
+
+type consumerAudit struct {
+	name string
+	seen map[uint64]string
+}
+
+func consumeAndAck(js nats.JetStreamContext, audit *consumerAudit, ledger *messageLedger, expected int) error {
+	durable := audit.name
 	sub, err := js.PullSubscribe("", durable, nats.BindStream(streamName))
 	if err != nil {
 		return err
 	}
-	seen := make(map[string]struct{}, expected)
-	for len(seen) < expected {
-		msgs, err := sub.Fetch(min(25, expected-len(seen)), nats.MaxWait(10*time.Second))
+	for received := 0; received < expected; {
+		msgs, err := sub.Fetch(min(25, expected-received), nats.MaxWait(10*time.Second))
 		if err != nil && !errors.Is(err, nats.ErrTimeout) {
 			return err
 		}
 		for _, msg := range msgs {
-			if _, ok := seen[string(msg.Data)]; ok {
-				return fmt.Errorf("consumer %s received duplicate payload %q", durable, msg.Data)
+			meta, err := msg.Metadata()
+			if err != nil {
+				return err
 			}
-			seen[string(msg.Data)] = struct{}{}
+			seq := meta.Sequence.Stream
+			payload := string(msg.Data)
+			ledger.mu.Lock()
+			want, known := ledger.bySeq[seq]
+			ledger.mu.Unlock()
+			if !known || want != payload {
+				return fmt.Errorf("consumer %s message %d = %q, want %q", durable, seq, payload, want)
+			}
+			if prior, ok := audit.seen[seq]; ok {
+				if prior != payload {
+					return fmt.Errorf("consumer %s duplicate sequence %d = %q, want %q", durable, seq, payload, prior)
+				}
+				// A process kill can replay an acknowledged message whose consumer
+				// state had not reached the next local persistence point. Re-ACK it,
+				// but do not count it as a new exact-sequence delivery.
+				if err := msg.AckSync(); err != nil {
+					return err
+				}
+				continue
+			}
+			audit.seen[seq] = payload
 			if err := msg.AckSync(); err != nil {
 				return err
 			}
+			received++
+		}
+	}
+	return nil
+}
+
+func assertConsumerComplete(audit *consumerAudit, ledger *messageLedger) error {
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if len(audit.seen) != len(ledger.bySeq) {
+		return fmt.Errorf("consumer %s saw %d messages, want %d", audit.name, len(audit.seen), len(ledger.bySeq))
+	}
+	for seq, want := range ledger.bySeq {
+		if got, ok := audit.seen[seq]; !ok || got != want {
+			return fmt.Errorf("consumer %s missing or corrupt sequence %d", audit.name, seq)
 		}
 	}
 	return nil
@@ -426,6 +485,9 @@ jetstream {
 	}
 
 	total := publishers * messagesPerPublisher
+	ledger := &messageLedger{bySeq: make(map[uint64]string)}
+	auditA := &consumerAudit{name: "audit-a", seen: make(map[uint64]string)}
+	auditB := &consumerAudit{name: "audit-b", seen: make(map[uint64]string)}
 	var wg sync.WaitGroup
 	for publisher := 0; publisher < publishers; publisher++ {
 		publisher := publisher
@@ -434,17 +496,21 @@ jetstream {
 			defer wg.Done()
 			for seq := 0; seq < messagesPerPublisher; seq++ {
 				payload := fmt.Sprintf("publisher=%d sequence=%d", publisher, seq)
-				if _, err := js.Publish(subject, []byte(payload)); err != nil {
+				ack, err := js.Publish(subject, []byte(payload))
+				if err != nil {
+					panic(err)
+				}
+				if err := ledger.record(ack, payload); err != nil {
 					panic(err)
 				}
 			}
 		}()
 	}
 	wg.Wait()
-	if err := consumeAndAck(js, "audit-a", total/3); err != nil {
+	if err := consumeAndAck(js, auditA, ledger, total/3); err != nil {
 		panic(err)
 	}
-	if err := consumeAndAck(js, "audit-b", total/4); err != nil {
+	if err := consumeAndAck(js, auditB, ledger, total/4); err != nil {
 		panic(err)
 	}
 
@@ -480,7 +546,11 @@ jetstream {
 			defer wg.Done()
 			for seq := 0; seq < restartMessagesPerPublisher; seq++ {
 				payload := fmt.Sprintf("post-source-restart publisher=%d sequence=%d", publisher, seq)
-				if _, err := js.Publish(subject, []byte(payload)); err != nil {
+				ack, err := js.Publish(subject, []byte(payload))
+				if err != nil {
+					panic(err)
+				}
+				if err := ledger.record(ack, payload); err != nil {
 					panic(err)
 				}
 			}
@@ -491,10 +561,10 @@ jetstream {
 		panic(fmt.Errorf("source stream state after ordinary restart: %v %+v", err, info))
 	}
 	const reconnectAcks = 10
-	if err := consumeAndAck(js, "audit-a", reconnectAcks); err != nil {
+	if err := consumeAndAck(js, auditA, ledger, reconnectAcks); err != nil {
 		panic(fmt.Errorf("consumer audit-a after ordinary restart: %w", err))
 	}
-	if err := consumeAndAck(js, "audit-b", reconnectAcks); err != nil {
+	if err := consumeAndAck(js, auditB, ledger, reconnectAcks); err != nil {
 		panic(fmt.Errorf("consumer audit-b after ordinary restart: %w", err))
 	}
 	sourceTotal := total + restartTotal
@@ -619,10 +689,16 @@ jetstream {
 	if err != nil || int(info.State.Msgs) != sourceTotal {
 		panic(fmt.Errorf("target stream state: %v %+v", err, info))
 	}
-	if err := consumeAndAck(targetJS, "audit-a", sourceTotal-ackedA); err != nil {
+	if err := consumeAndAck(targetJS, auditA, ledger, sourceTotal-ackedA); err != nil {
 		panic(err)
 	}
-	if err := consumeAndAck(targetJS, "audit-b", sourceTotal-ackedB); err != nil {
+	if err := consumeAndAck(targetJS, auditB, ledger, sourceTotal-ackedB); err != nil {
+		panic(err)
+	}
+	if err := assertConsumerComplete(auditA, ledger); err != nil {
+		panic(err)
+	}
+	if err := assertConsumerComplete(auditB, ledger); err != nil {
 		panic(err)
 	}
 
@@ -639,21 +715,31 @@ jetstream {
 			defer wg.Done()
 			for seq := 0; seq < tailMessagesPerPublisher; seq++ {
 				payload := fmt.Sprintf("post-handoff publisher=%d sequence=%d", publisher, seq)
-				if _, err := targetJS.Publish(subject, []byte(payload)); err != nil {
+				ack, err := targetJS.Publish(subject, []byte(payload))
+				if err != nil {
+					panic(err)
+				}
+				if err := ledger.record(ack, payload); err != nil {
 					panic(err)
 				}
 			}
 		}()
 	}
 	wg.Wait()
-	if err := consumeAndAck(targetJS, "audit-a", tailTotal); err != nil {
+	if err := consumeAndAck(targetJS, auditA, ledger, tailTotal); err != nil {
 		panic(err)
 	}
-	if err := consumeAndAck(targetJS, "audit-b", tailTotal); err != nil {
+	if err := consumeAndAck(targetJS, auditB, ledger, tailTotal); err != nil {
 		panic(err)
 	}
 	if info, err := targetJS.StreamInfo(streamName); err != nil || int(info.State.Msgs) != sourceTotal+tailTotal {
 		panic(fmt.Errorf("target stream state after live reconnect: %v %+v", err, info))
+	}
+	if err := assertConsumerComplete(auditA, ledger); err != nil {
+		panic(err)
+	}
+	if err := assertConsumerComplete(auditB, ledger); err != nil {
+		panic(err)
 	}
 
 	// The source must retain its checkpoint and retirement record even if it
