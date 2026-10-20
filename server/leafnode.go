@@ -3442,6 +3442,11 @@ func (c *client) processInboundLeafMsg(msg []byte) {
 		c.in.results[subject] = r
 	}
 
+	if mset := remoteRestoreFencedStream(r); mset != nil {
+		mset.sendRemoteRestoreFencePubAck(string(c.pa.reply))
+		return
+	}
+
 	// Collect queue names if needed.
 	var qnames [][]byte
 

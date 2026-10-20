@@ -645,7 +645,11 @@ func (c *client) clientTypeString() string {
 // FIXME(dlc) - This is getting bloated for normal subs, need
 // to optionally have an opts section for non-normal stuff.
 type subscription struct {
-	client  *client
+	client *client
+	// mset is set only on the internal subscription that accepts client
+	// publications for a stream. It lets the ingress path reject a fenced
+	// remote-restore write before normal core subscribers observe it.
+	mset    *stream
 	im      *streamImport // This is for import stream support.
 	rsi     bool
 	si      bool
@@ -3109,8 +3113,15 @@ func (c *client) processSub(subject, queue, bsid []byte, cb msgHandler, noForwar
 }
 
 func (c *client) processSubEx(subject, queue, bsid []byte, cb msgHandler, noForward, si, rsi bool) (*subscription, error) {
+	return c.processSubExWithStream(subject, queue, bsid, cb, noForward, si, rsi, nil)
+}
+
+// processSubExWithStream associates the stream input subscription with mset.
+// Only stream ingestion subscriptions use this: other internal subscriptions
+// must continue to participate in ordinary core routing.
+func (c *client) processSubExWithStream(subject, queue, bsid []byte, cb msgHandler, noForward, si, rsi bool, mset *stream) (*subscription, error) {
 	// Create the subscription
-	sub := &subscription{client: c, subject: subject, queue: queue, sid: bsid, icb: cb, si: si, rsi: rsi}
+	sub := &subscription{client: c, mset: mset, subject: subject, queue: queue, sid: bsid, icb: cb, si: si, rsi: rsi}
 
 	c.mu.Lock()
 
@@ -4555,6 +4566,15 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 		}
 	}
 
+	// A remote-restore fence is a publication boundary, rather than a storage
+	// error. Reject it before normal subscribers or gateways see the message;
+	// otherwise a caller can receive a failed PubAck while core subscribers act
+	// on data that was never durably accepted by the stream.
+	if mset := remoteRestoreFencedStream(r); mset != nil {
+		mset.sendRemoteRestoreFencePubAck(string(c.pa.reply))
+		return false, false
+	}
+
 	// Indication if we attempted to deliver the message to anyone.
 	var didDeliver bool
 	var qnames [][]byte
@@ -4601,6 +4621,19 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 	}
 
 	return didDeliver, false
+}
+
+func remoteRestoreFencedStream(r *SublistResult) *stream {
+	// A subject normally belongs to one non-clustered stream. Check every
+	// matching stream nonetheless: if configuration ever permits overlap, one
+	// durable sink rejecting the write must prevent core fanout from claiming
+	// application acceptance for that publication.
+	for _, sub := range r.psubs {
+		if mset := sub.mset; mset != nil && mset.remoteRestoreFenced() {
+			return mset
+		}
+	}
+	return nil
 }
 
 // Return the subscription for this reply subject. Only look at normal subs for this client.

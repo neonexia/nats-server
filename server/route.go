@@ -494,6 +494,11 @@ func (c *client) processInboundRoutedMsg(msg []byte) {
 	acc.stats.rt.inBytes += int64(size)
 	acc.stats.Unlock()
 
+	if mset := remoteRestoreFencedStream(r); mset != nil {
+		mset.sendRemoteRestoreFencePubAck(string(c.pa.reply))
+		return
+	}
+
 	// Check for no interest, short circuit if so.
 	// This is the fanout scale.
 	if len(r.psubs)+len(r.qsubs) > 0 {

@@ -858,6 +858,15 @@ func TestJetStreamS3TierRemoteRestoreSourceAPI(t *testing.T) {
 	if prepare.Error != nil || !prepare.Success || prepare.State != s3TierRemoteRestorePrepared || prepare.Epoch != 1 {
 		t.Fatalf("prepare response: %+v", prepare)
 	}
+	// A rejected write must be invisible to core subscribers as well as the
+	// stream. PubAck is the application acceptance boundary during a handoff.
+	core, err := nc.SubscribeSync("move.events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	// The source stays readable, but the persisted fence rejects a new publish.
 	stored, err := mset.getMsg(1)
 	if err != nil || stored == nil || len(stored.Data) != 1000 {
@@ -873,6 +882,12 @@ func TestJetStreamS3TierRemoteRestoreSourceAPI(t *testing.T) {
 	}
 	if pubAck.Error == nil || !strings.Contains(pubAck.Error.Description, "fenced for remote restore") {
 		t.Fatalf("publish while prepared response: %+v", pubAck)
+	}
+	if delivered, err := core.NextMsg(250 * time.Millisecond); err != nats.ErrTimeout {
+		t.Fatalf("fenced publish reached core subscriber: msg=%+v err=%v", delivered, err)
+	}
+	if state := mset.state(); state.Msgs != 10 || state.LastSeq != 10 {
+		t.Fatalf("fenced publish changed stream state: %+v", state)
 	}
 	checkpoint := request(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "MOVE"))
 	if checkpoint.Error != nil || !checkpoint.Success || checkpoint.State != s3TierRemoteRestoreCheckpointed || checkpoint.CheckpointKey == "" || checkpoint.CheckpointSHA256 == "" {

@@ -2806,7 +2806,7 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 		// the originals first, since if it is in there we can skip, already added.
 		for _, s := range cfg.Subjects {
 			if _, ok := current[s]; !ok {
-				if _, err := mset.subscribeInternal(s, mset.processInboundJetStreamMsg); err != nil {
+				if _, err := mset.subscribeInbound(s); err != nil {
 					mset.mu.Unlock()
 					return err
 				}
@@ -5240,7 +5240,7 @@ func (mset *stream) subscribeToStream() error {
 		return nil
 	}
 	for _, subject := range mset.cfg.Subjects {
-		if _, err := mset.subscribeInternal(subject, mset.processInboundJetStreamMsg); err != nil {
+		if _, err := mset.subscribeInbound(subject); err != nil {
 			return err
 		}
 	}
@@ -5474,6 +5474,33 @@ func (mset *stream) subscribeInternal(subject string, cb msgHandler) (*subscript
 	sid := int(mset.sid.Add(1))
 	// Now create the subscription
 	return c.processSub([]byte(subject), nil, []byte(strconv.Itoa(sid)), cb, false)
+}
+
+// subscribeInbound marks the stream's input subscription so a persisted remote
+// restore fence is enforced before the server fans a rejected publish out to
+// ordinary core subscribers.
+func (mset *stream) subscribeInbound(subject string) (*subscription, error) {
+	if mset.closed.Load() {
+		return nil, errStreamClosed
+	}
+	c := mset.client
+	sid := int(mset.sid.Add(1))
+	return c.processSubExWithStream([]byte(subject), nil, []byte(strconv.Itoa(sid)), mset.processInboundJetStreamMsg, false, false, false, mset)
+}
+
+func (mset *stream) sendRemoteRestoreFencePubAck(reply string) {
+	if reply == _EMPTY_ {
+		return
+	}
+	mset.mu.RLock()
+	doAck, isLeader, name, outq := !mset.cfg.NoAck, mset.isLeaderNodeState(), mset.cfg.Name, mset.outq
+	mset.mu.RUnlock()
+	if !doAck || !isLeader || outq == nil {
+		return
+	}
+	resp := &JSPubAckResponse{PubAck: &PubAck{Stream: name}, Error: NewJSStreamStoreFailedError(errS3TierRemoteRestoreFenced)}
+	b, _ := json.Marshal(resp)
+	outq.sendMsg(reply, b)
 }
 
 // Lock does NOT need to be held, we set the client on setup and never change it at this point.
