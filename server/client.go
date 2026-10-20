@@ -4629,8 +4629,17 @@ func remoteRestoreFencedStream(r *SublistResult) *stream {
 	// durable sink rejecting the write must prevent core fanout from claiming
 	// application acceptance for that publication.
 	for _, sub := range r.psubs {
-		if mset := sub.mset; mset != nil && mset.remoteRestoreFenced() {
-			return mset
+		if mset := sub.mset; mset != nil {
+			// Prepare holds the writer side while it persists the fence and
+			// publishes the in-memory state. Taking the read side here closes
+			// the interval where a caller has received a fenced PubAck but an
+			// ingress goroutine still sees the prior state and fans out data.
+			mset.isolateMu.RLock()
+			fenced := mset.remoteRestoreFenced()
+			mset.isolateMu.RUnlock()
+			if fenced {
+				return mset
+			}
 		}
 	}
 	return nil
