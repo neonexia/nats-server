@@ -85,6 +85,12 @@ type StreamConfig struct {
 	// Allow KV like semantics to also discard new on a per subject basis
 	DiscardNewPer bool `json:"discard_new_per_subject,omitempty"`
 
+	// S3Tier opts this file-backed stream into the server's configured S3 tier.
+	// A server may be configured with object-store credentials while most
+	// streams remain local-only, so this is deliberately false by default.
+	// It cannot change after creation because the file-store layout is fixed.
+	S3Tier bool `json:"s3_tier,omitempty"`
+
 	// Optional qualifiers. These can not be modified after set to true.
 
 	// Sealed will seal a stream so no messages can get out or in.
@@ -1112,7 +1118,7 @@ func (a *Account) addStreamWithAssignmentAndMode(config *StreamConfig, fsConfig 
 	}
 	if cfg.Storage == FileStorage && fsCfg.S3Tier == nil {
 		opts := s.getOpts()
-		if opts.jetStreamS3Tier != nil {
+		if opts.jetStreamS3Tier != nil && cfg.S3Tier {
 			fsCfg.S3Tier = opts.jetStreamS3Tier.streamConfig(a.GetName(), cfg.Name)
 		} else {
 			fsCfg.S3Tier = opts.JetStreamS3Tiers[a.GetName()+"/"+cfg.Name]
@@ -2594,6 +2600,9 @@ func (jsa *jsAccount) configUpdateCheckLocked(old, new *StreamConfig, s *Server,
 	// Can't change storage types.
 	if cfg.Storage != old.Storage {
 		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update can not change storage type"))
+	}
+	if cfg.S3Tier != old.S3Tier {
+		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update can not change S3 tier setting"))
 	}
 	// Can only change retention from limits to interest or back, not to/from work queue for now.
 	if cfg.Retention != old.Retention {

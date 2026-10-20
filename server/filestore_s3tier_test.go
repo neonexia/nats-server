@@ -330,7 +330,7 @@ jetstream {
 	s := RunServer(opts)
 	defer s.Shutdown()
 	stream := &StreamConfig{Name: "TEST", Subjects: []string{"events"}, Storage: FileStorage,
-		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true, S3Tier: true}
 	mset, err := s.GlobalAccount().addStream(stream)
 	if err != nil {
 		t.Fatal(err)
@@ -338,6 +338,15 @@ jetstream {
 	fs := mset.store.(*fileStore)
 	if fs.tier == nil || fs.tier.cfg.Prefix != streamTier.Prefix || fs.tier.cfg.BlockSize != streamTier.BlockSize {
 		t.Fatalf("stream did not inherit server tier configuration: %#v", fs.tier)
+	}
+	localOnly := &StreamConfig{Name: "LOCAL", Subjects: []string{"local"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	localMset, err := s.GlobalAccount().addStream(localOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fs := localMset.store.(*fileStore); fs.tier != nil {
+		t.Fatalf("local-only stream unexpectedly inherited S3 tier: %#v", fs.tier)
 	}
 	changed := *opts
 	changedTier := *tier
