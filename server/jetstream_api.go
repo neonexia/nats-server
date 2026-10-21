@@ -4809,8 +4809,17 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 		mset.mu.RLock()
 		current := mset.remoteRestore
 		mset.mu.RUnlock()
-		if current == nil || current.OperationID != req.OperationID || current.State != s3TierRemoteRestorePrepared {
+		if current == nil || current.OperationID != req.OperationID ||
+			(current.State != s3TierRemoteRestorePrepared && current.State != s3TierRemoteRestoreCheckpointed) {
 			err = errors.New("remote restore operation is not prepared")
+			break
+		}
+		if current.State == s3TierRemoteRestoreCheckpointed {
+			// The checkpoint may have committed before its response reached the
+			// caller. Preserve the original evidence instead of taking another
+			// snapshot whose consumer state could have advanced since that point.
+			checkpointed := *current
+			state = &checkpointed
 			break
 		}
 		if _, err = fs.DrainS3Tier(); err != nil {

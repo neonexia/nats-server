@@ -902,6 +902,20 @@ func TestJetStreamS3TierRemoteRestoreSourceAPI(t *testing.T) {
 	if checkpoint.Error != nil || !checkpoint.Success || checkpoint.State != s3TierRemoteRestoreCheckpointed || checkpoint.CheckpointKey == "" || checkpoint.CheckpointSHA256 == "" {
 		t.Fatalf("checkpoint response: %+v", checkpoint)
 	}
+	// A response can be lost after committing the immutable checkpoint. Both
+	// repeated prepare and repeated checkpoint must report that same boundary.
+	for _, subject := range []string{
+		fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "MOVE"),
+		fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "MOVE"),
+		fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "MOVE"),
+	} {
+		retried := request(subject)
+		if retried.Error != nil || !retried.Success || retried.State != s3TierRemoteRestoreCheckpointed ||
+			retried.OperationID != checkpoint.OperationID || retried.Epoch != checkpoint.Epoch ||
+			retried.CheckpointKey != checkpoint.CheckpointKey || retried.CheckpointSHA256 != checkpoint.CheckpointSHA256 {
+			t.Fatalf("checkpoint retry changed durable evidence: %+v", retried)
+		}
+	}
 	store.mu.Lock()
 	checkpointData := append([]byte(nil), store.objects[checkpoint.CheckpointKey]...)
 	store.mu.Unlock()
@@ -1120,6 +1134,18 @@ func TestJetStreamS3TierRemoteRestoreFenceSurvivesRestart(t *testing.T) {
 		s.Shutdown()
 		t.Fatalf("prepare response: %+v, %v", prepared, err)
 	}
+	msg, err = nc.Request(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "FENCED"), body, 5*time.Second)
+	if err != nil {
+		nc.Close()
+		s.Shutdown()
+		t.Fatal(err)
+	}
+	var checkpointed JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(msg.Data, &checkpointed); err != nil || checkpointed.Error != nil || checkpointed.State != s3TierRemoteRestoreCheckpointed {
+		nc.Close()
+		s.Shutdown()
+		t.Fatalf("checkpoint response: %+v, %v", checkpointed, err)
+	}
 	nc.Close()
 	s.Shutdown()
 
@@ -1127,6 +1153,18 @@ func TestJetStreamS3TierRemoteRestoreFenceSurvivesRestart(t *testing.T) {
 	defer s.Shutdown()
 	nc = clientConnectToServer(t, s)
 	defer nc.Close()
+	for _, subject := range []string{JSApiStreamPrepareRemoteRestoreT, JSApiStreamCheckpointRemoteRestoreT} {
+		msg, err = nc.Request(fmt.Sprintf(subject, "FENCED"), body, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var retried JSApiStreamRemoteRestoreResponse
+		if err := json.Unmarshal(msg.Data, &retried); err != nil || retried.Error != nil || !retried.Success ||
+			retried.State != s3TierRemoteRestoreCheckpointed || retried.OperationID != checkpointed.OperationID || retried.Epoch != checkpointed.Epoch ||
+			retried.CheckpointKey != checkpointed.CheckpointKey || retried.CheckpointSHA256 != checkpointed.CheckpointSHA256 {
+			t.Fatalf("checkpoint retry after restart changed evidence: %+v, %v", retried, err)
+		}
+	}
 	msg, err = nc.Request("fenced.events", []byte("after-restart"), 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
