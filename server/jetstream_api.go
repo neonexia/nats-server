@@ -4798,6 +4798,8 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 	// the persisted fence before they reach the file store.
 	mset.isolateMu.Lock()
 	defer mset.isolateMu.Unlock()
+	mset.remoteConsumerMu.Lock()
+	defer mset.remoteConsumerMu.Unlock()
 
 	var state *s3TierRemoteRestoreState
 	switch action {
@@ -6607,6 +6609,13 @@ func (s *Server) jsConsumerDeleteRequest(sub *subscription, c *client, _ *Accoun
 		return
 	}
 
+	mset.remoteConsumerMu.RLock()
+	defer mset.remoteConsumerMu.RUnlock()
+	if mset.remoteRestoreFenced() {
+		resp.Error = NewJSStreamGeneralError(errS3TierRemoteRestoreFenced, Unless(errS3TierRemoteRestoreFenced))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 	obs := mset.lookupConsumer(consumer)
 	if obs == nil {
 		resp.Error = NewJSConsumerNotFoundError()
@@ -6752,6 +6761,13 @@ func (s *Server) jsConsumerPauseRequest(sub *subscription, c *client, _ *Account
 		return
 	}
 
+	mset.remoteConsumerMu.RLock()
+	defer mset.remoteConsumerMu.RUnlock()
+	if mset.remoteRestoreFenced() {
+		resp.Error = NewJSStreamGeneralError(errS3TierRemoteRestoreFenced, Unless(errS3TierRemoteRestoreFenced))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 	obs := mset.lookupConsumer(consumer)
 	if obs == nil {
 		resp.Error = NewJSConsumerNotFoundError()

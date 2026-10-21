@@ -173,6 +173,29 @@ timeout, call `STATUS` on the appropriate server and follow `next_action`.
   query source `STATUS` using the operation ID. The durable retirement receipt
   returns `retired` even though the local source stream no longer exists.
 
+### Durable consumers during a planned move
+
+Prepare serializes with publication and consumer mutations. An ACK that receives
+its confirmation before the fence is represented in the subsequent immutable
+checkpoint, including out-of-order ACK holes. ACKs arriving after the fence do
+not receive a success reply. A caller must treat a timed-out ACK as ambiguous;
+the corresponding message may be redelivered on the target. This is at-least-once
+processing, not an exactly-once processing guarantee.
+
+Consumer configuration, delivered and acknowledged positions, and pending
+redelivery state travel with the checkpoint. Source consumer creation, updates,
+deletion and inactive expiry are fenced while the move is pending. Delivery
+pauses on the source; a replay or rate-limited message selected before the fence
+is checked again before sending. Direct stream message reads remain available
+until source retirement.
+
+The consumer-mutation barrier is acquired before consumer locks. Prepare waits
+for ACK processing already admitted by that barrier, then persists the fence;
+checkpoint retries use the original immutable consumer snapshot. Repeating
+activation on an already-active target does not reapply that snapshot or rewind
+ACKs accepted after activation. These rules cover planned single-replica moves;
+they do not add consumer recovery from an unplanned loss of the source.
+
 ### Object and snapshot boundaries
 
 Remote data is immutable under an opaque per-stream prefix. Stream deletion

@@ -2203,3 +2203,146 @@ func TestJetStreamS3TierRemoteRestoreCompatibleEndpoint(t *testing.T) {
 		t.Fatal("source stream remains after retirement")
 	}
 }
+
+func TestJetStreamS3TierPlannedMovePreservesConfirmedAcksAndPending(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	start := func() *Server {
+		opts := DefaultTestOptions
+		opts.Port, opts.JetStream, opts.StoreDir = -1, true, t.TempDir()
+		opts.JetStreamS3Tiers = map[string]*S3TierConfig{"$G/MOVE_ACKS": {Store: store, Prefix: "test/move-acks", BlockSize: 16 * 1024, LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29, RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29}}
+		server := RunServer(&opts)
+		t.Cleanup(server.Shutdown)
+		return server
+	}
+	source, target := start(), start()
+	nc := clientConnectToServer(t, source)
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = js.AddStream(&nats.StreamConfig{Name: "MOVE_ACKS", Subjects: []string{"move.acks"}, Storage: nats.FileStorage, Retention: nats.LimitsPolicy, Discard: nats.DiscardNew, DenyDelete: true, DenyPurge: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &nats.ConsumerConfig{Durable: "worker", AckPolicy: nats.AckExplicitPolicy, AckWait: 200 * time.Millisecond, MaxAckPending: 32, MaxDeliver: 10}
+	if _, err = js.AddConsumer("MOVE_ACKS", config); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := js.PullSubscribe("move.acks", "worker", nats.Bind("MOVE_ACKS", "worker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for seq := 1; seq <= 16; seq++ {
+		if _, err = js.Publish("move.acks", []byte(fmt.Sprintf("message-%d", seq))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	messages, err := sub.Fetch(8, nats.MaxWait(time.Second))
+	if err != nil || len(messages) != 8 {
+		t.Fatalf("fetch=%d: %v", len(messages), err)
+	}
+	confirmed := map[uint64]bool{}
+	for _, index := range []int{0, 2} {
+		if err = messages[index].AckSync(); err != nil {
+			t.Fatal(err)
+		}
+		confirmed[uint64(index+1)] = true
+	}
+	request := func(connection *nats.Conn, subject string, body any) JSApiStreamRemoteRestoreResponse {
+		t.Helper()
+		data, _ := json.Marshal(body)
+		msg, err := connection.Request(subject, data, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resp JSApiStreamRemoteRestoreResponse
+		if err = json.Unmarshal(msg.Data, &resp); err != nil || resp.Error != nil {
+			t.Fatalf("%s: %+v %v", subject, resp, err)
+		}
+		return resp
+	}
+	operation := JSApiStreamRemoteRestoreRequest{OperationID: "acks_move"}
+	// Race processing ACKs against prepare. Every confirmed ACK must survive;
+	// an unconfirmed ACK is allowed either outcome, so compare source evidence.
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for index := 3; index < 8; index++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			if messages[index].AckSync(nats.AckWait(300*time.Millisecond)) == nil {
+				mu.Lock()
+				confirmed[uint64(index+1)] = true
+				mu.Unlock()
+			}
+		}(index)
+	}
+	request(nc, fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "MOVE_ACKS"), operation)
+	wg.Wait()
+	if err = messages[1].AckSync(nats.AckWait(100 * time.Millisecond)); err == nil {
+		t.Fatal("source confirmed an ACK after prepare")
+	}
+	if err = js.DeleteConsumer("MOVE_ACKS", "worker"); err == nil {
+		t.Fatal("fenced source allowed consumer deletion")
+	}
+	if _, err = js.AddConsumer("MOVE_ACKS", &nats.ConsumerConfig{Durable: "late", AckPolicy: nats.AckExplicitPolicy}); err == nil {
+		t.Fatal("fenced source allowed consumer creation")
+	}
+	checkpoint := request(nc, fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "MOVE_ACKS"), operation)
+	targetNC := clientConnectToServer(t, target)
+	defer targetNC.Close()
+	restore := JSApiStreamRestoreRemoteRequest{OperationID: "acks_move", ExpectedEpoch: checkpoint.Epoch, TargetID: "target"}
+	request(targetNC, fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE_ACKS"), restore)
+	targetJS, err := targetNC.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := targetJS.ConsumerInfo("MOVE_ACKS", "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Config.AckPolicy != config.AckPolicy || info.Config.AckWait != config.AckWait || info.Config.MaxAckPending != config.MaxAckPending || info.Config.MaxDeliver != config.MaxDeliver {
+		t.Fatalf("restored config=%+v", info.Config)
+	}
+	if info.AckFloor.Stream != 1 {
+		t.Fatalf("out-of-order ACK hole lost: %+v", info)
+	}
+	targetSub, err := targetJS.PullSubscribe("move.acks", "worker", nats.Bind("MOVE_ACKS", "worker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := int(info.NumPending) + info.NumAckPending
+	seen := map[uint64]bool{}
+	for len(seen) < remaining {
+		batch, fetchErr := targetSub.Fetch(1, nats.MaxWait(2*time.Second))
+		if fetchErr != nil {
+			t.Fatal(fetchErr)
+		}
+		message := batch[0]
+		metadata, err := message.Metadata()
+		if err != nil {
+			t.Fatal(err)
+		}
+		seq := metadata.Sequence.Stream
+		if confirmed[seq] || seen[seq] {
+			t.Fatalf("unexpected redelivery of sequence %d", seq)
+		}
+		if string(message.Data) != fmt.Sprintf("message-%d", seq) {
+			t.Fatalf("corrupt payload at %d", seq)
+		}
+		seen[seq] = true
+		if err = message.AckSync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !seen[2] {
+		t.Fatal("pending hole was not redelivered")
+	}
+	// Repeating activation after processing must not reset the restored cursor.
+	request(targetNC, fmt.Sprintf(JSApiStreamRestoreRemoteT, "MOVE_ACKS"), restore)
+	info, err = targetJS.ConsumerInfo("MOVE_ACKS", "worker")
+	if err != nil || info.AckFloor.Stream != 16 || info.NumAckPending != 0 {
+		t.Fatalf("activation retry reset consumer: %+v %v", info, err)
+	}
+}

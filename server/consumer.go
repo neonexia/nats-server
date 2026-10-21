@@ -1047,6 +1047,10 @@ func (mset *stream) addConsumerForRestore(config *ConsumerConfig) (*consumer, er
 }
 
 func (mset *stream) addConsumerWithAssignmentAndMode(config *ConsumerConfig, oname string, ca *consumerAssignment, isRecovering bool, action ConsumerAction, pedantic, restoring bool) (*consumer, error) {
+	if !restoring {
+		mset.remoteConsumerMu.RLock()
+		defer mset.remoteConsumerMu.RUnlock()
+	}
 	// Check if this stream has closed.
 	if mset.closed.Load() {
 		return nil, NewJSStreamInvalidError()
@@ -2236,6 +2240,14 @@ var (
 // deleteNotActive must only be called from time.AfterFunc or in its own
 // goroutine, as it can block on clean-up.
 func (o *consumer) deleteNotActive() {
+	o.mu.RLock()
+	mset := o.mset
+	o.mu.RUnlock()
+	if mset == nil {
+		return
+	}
+	mset.remoteConsumerMu.RLock()
+	defer mset.remoteConsumerMu.RUnlock()
 	// Take a copy of these when the goroutine starts, mostly it avoids a
 	// race condition with tests that modify these consts, such as
 	// TestJetStreamClusterGhostEphemeralsAfterRestart.
@@ -2244,6 +2256,15 @@ func (o *consumer) deleteNotActive() {
 
 	o.mu.Lock()
 	if o.mset == nil || !o.isLeader() {
+		o.mu.Unlock()
+		return
+	}
+	if mset.remoteRestoreFenced() {
+		// Inactivity on the fenced source must not discard a durable cursor
+		// while a checkpoint or target activation is being retried.
+		if o.dtmr != nil {
+			o.dtmr.Reset(o.dthresh)
+		}
 		o.mu.Unlock()
 		return
 	}
@@ -2852,7 +2873,14 @@ func (o *consumer) processAck(subject, reply string, hdr int, rmsg []byte) {
 	o.mu.RLock()
 	mset := o.mset
 	o.mu.RUnlock()
-	if mset == nil || mset.remoteRestoreFenced() {
+	if mset == nil {
+		return
+	}
+	// A confirmed ACK must be included in the move checkpoint. Checking the
+	// fence alone leaves a race between that check and updating consumer state.
+	mset.remoteConsumerMu.RLock()
+	defer mset.remoteConsumerMu.RUnlock()
+	if mset.remoteRestoreFenced() {
 		return
 	}
 
@@ -5821,6 +5849,20 @@ func convertToHeadersOnly(pmsg *jsPubMsg) {
 // Lock should be held and o.mset validated to be non-nil.
 func (o *consumer) deliverMsg(dsubj, ackReply string, pmsg *jsPubMsg, dc uint64, rp RetentionPolicy) {
 	if o.mset == nil {
+		pmsg.returnToPool()
+		return
+	}
+	if o.mset.remoteRestoreFenced() {
+		// Replay/rate limiting can release the consumer lock after selecting
+		// a message. Preserve that selection for an abort, without sending a
+		// delivery whose ACK can no longer be accepted by this source.
+		if dc == 1 && pmsg.seq == o.sseq-1 {
+			o.sseq--
+			o.npc++
+		} else if !o.onRedeliverQueue(pmsg.seq) {
+			o.decDeliveryCount(pmsg.seq)
+			o.addToRedeliverQueue(pmsg.seq)
+		}
 		pmsg.returnToPool()
 		return
 	}

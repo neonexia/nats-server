@@ -616,6 +616,9 @@ type stream struct {
 	// paths hold consumer locks while stream interest processing holds mset.mu, so
 	// consulting remoteRestore through mset.mu would invert the lock order.
 	remoteRestoreFence atomic.Bool
+	// Consumer mutations acquire this before consumer locks. A planned move
+	// waits for acknowledged mutations before persisting its source fence.
+	remoteConsumerMu sync.RWMutex
 
 	// Mirror
 	mirror              *sourceInfo
