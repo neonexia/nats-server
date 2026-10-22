@@ -168,12 +168,15 @@ type jsaStorage struct {
 // an internal sub for a stream, so we will direct link to the stream
 // and walk backwards as needed vs multiple hash lookups and locks, etc.
 type jsAccount struct {
-	mu       sync.RWMutex
-	js       *jetStream
-	account  *Account
-	storeDir string
-	inflight sync.Map
-	streams  map[string]*stream
+	mu sync.RWMutex
+	// Serializes archive cleanup with stream creation. Serving existing
+	// streams does not take this lock, so sibling traffic remains independent.
+	archiveMu sync.Mutex
+	js        *jetStream
+	account   *Account
+	storeDir  string
+	inflight  sync.Map
+	streams   map[string]*stream
 
 	// From server
 	sendq *ipQueue[*pubMsg]
@@ -1429,6 +1432,12 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits, tq c
 	doStream := func(fi os.DirEntry) error {
 		plaintext := true
 		mdir := filepath.Join(sdir, fi.Name())
+		if _, err := os.Stat(jsa.archiveTombstoneFile(fi.Name())); err == nil || !os.IsNotExist(err) {
+			// An interrupted archive must never return to service. The caller
+			// retries cleanup using the durable receipt outside this directory.
+			s.Noticef("  Skipping archived stream '%s > %s'; local cleanup can be retried", a.Name, fi.Name())
+			return nil
+		}
 		// Check for partially deleted streams. They are marked with "." prefix.
 		if strings.HasPrefix(fi.Name(), tsep) {
 			go os.RemoveAll(mdir)

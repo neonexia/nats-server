@@ -105,6 +105,8 @@ const (
 	JSApiStreamRestoreRemoteT           = "$JS.API.STREAM.RESTORE_REMOTE.%s"
 	JSApiStreamRetireRemoteSource       = "$JS.API.STREAM.RETIRE_REMOTE_SOURCE.*"
 	JSApiStreamRetireRemoteSourceT      = "$JS.API.STREAM.RETIRE_REMOTE_SOURCE.%s"
+	JSApiStreamArchiveRemote            = "$JS.API.STREAM.ARCHIVE_REMOTE.*"
+	JSApiStreamArchiveRemoteT           = "$JS.API.STREAM.ARCHIVE_REMOTE.%s"
 
 	// JSApiStreamSnapshot is the endpoint to snapshot streams.
 	// Will return a stream of chunks with a nil chunk as EOF to
@@ -1224,6 +1226,7 @@ func (s *Server) setJetStreamExportSubs() error {
 		{JSApiStreamAbortRemoteRestore, s.jsStreamAbortRemoteRestoreRequest},
 		{JSApiStreamRemoteRestoreStatus, s.jsStreamRemoteRestoreStatusRequest},
 		{JSApiStreamRetireRemoteSource, s.jsStreamRetireRemoteSourceRequest},
+		{JSApiStreamArchiveRemote, s.jsStreamArchiveRemoteRequest},
 		{JSApiStreamRestoreRemote, s.jsStreamRestoreRemoteRequest},
 		{JSApiStreamSnapshot, s.jsStreamSnapshotRequest},
 		{JSApiStreamRestore, s.jsStreamRestoreRequest},
@@ -1813,6 +1816,14 @@ func (s *Server) jsStreamUpdateRequest(sub *subscription, c *client, _ *Account,
 		s.jsClusteredStreamUpdateRequest(ci, acc, subject, reply, copyBytes(rmsg), &cfg, ncfg.Pedantic)
 		return
 	}
+	_, jsa, err := acc.checkForJetStream()
+	if err != nil {
+		resp.Error = NewJSStreamUpdateError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	jsa.archiveMu.Lock()
+	defer jsa.archiveMu.Unlock()
 
 	mset, err := acc.lookupStream(streamName)
 	if err != nil {
@@ -3844,6 +3855,14 @@ func (s *Server) jsStreamDeleteRequest(sub *subscription, c *client, _ *Account,
 		s.jsClusteredStreamDeleteRequest(ci, acc, stream, subject, reply, msg)
 		return
 	}
+	_, jsa, err := acc.checkForJetStream()
+	if err != nil {
+		resp.Error = NewJSStreamDeleteError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	jsa.archiveMu.Lock()
+	defer jsa.archiveMu.Unlock()
 
 	mset, err := acc.lookupStream(stream)
 	if err != nil {
@@ -5001,7 +5020,14 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	jsa.archiveMu.Lock()
+	defer jsa.archiveMu.Unlock()
 	stageDir := filepath.Join(jsa.storeDir, "__remote_restore__", stream, req.OperationID)
+	if _, err := os.Stat(jsa.archiveTombstoneFile(stream)); err == nil || !os.IsNotExist(err) {
+		resp.Error = NewJSStreamNameExistRestoreFailedError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 	if err := os.RemoveAll(stageDir); err != nil {
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
@@ -5032,7 +5058,7 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
-	mset, err := acc.addStreamForRestore(&material.checkpoint.StreamConfig)
+	mset, err := acc.addStreamWithAssignmentAndModeLocked(&material.checkpoint.StreamConfig, nil, nil, false, false, true)
 	if err != nil {
 		os.RemoveAll(streamDir)
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))

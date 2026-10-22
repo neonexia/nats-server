@@ -407,8 +407,9 @@ type S3TierGCResult struct {
 type fileS3Tier struct {
 	fs             *fileStore
 	cfg            S3TierConfig
-	mu             sync.Mutex // Protects descriptors and in-flight fetches.
-	runMu          sync.Mutex // One eviction pass at a time.
+	mu             sync.Mutex   // Protects descriptors and in-flight fetches.
+	runMu          sync.Mutex   // One eviction pass at a time.
+	hydrateMu      sync.RWMutex // Archive cleanup waits for cold reads before removing files.
 	desc           map[uint32]s3BlockDescriptor
 	fetch          map[uint32]*s3TierFetch
 	gen            uint64
@@ -810,6 +811,9 @@ func (t *fileS3Tier) removeGCCandidateLocked(key string) error {
 func (t *fileS3Tier) collectGarbage(execute bool) (S3TierGCResult, error) {
 	t.runMu.Lock()
 	defer t.runMu.Unlock()
+	if t.fs.isClosed() {
+		return S3TierGCResult{}, ErrStoreClosed
+	}
 
 	t.mu.Lock()
 	candidates := append([]s3TierGCCandidate(nil), t.gc...)
@@ -1442,6 +1446,11 @@ func checksumS3Block(data []byte) string {
 }
 
 func (t *fileS3Tier) ensureHydrated(index uint32) error {
+	t.hydrateMu.RLock()
+	defer t.hydrateMu.RUnlock()
+	if t.fs.isClosed() {
+		return ErrStoreClosed
+	}
 	t.mu.Lock()
 	d, ok := t.desc[index]
 	t.mu.Unlock()
@@ -1507,6 +1516,9 @@ func (t *fileS3Tier) fetchBlock(d s3BlockDescriptor, path string) error {
 func (t *fileS3Tier) evictToBudget() error {
 	t.runMu.Lock()
 	defer t.runMu.Unlock()
+	if t.fs.isClosed() {
+		return ErrStoreClosed
+	}
 	fs := t.fs
 	fs.mu.RLock()
 	var used, uncovered uint64
@@ -1605,6 +1617,9 @@ func (t *fileS3Tier) evictToBudget() error {
 func (t *fileS3Tier) drain(coveredThrough uint64) (uint64, error) {
 	t.runMu.Lock()
 	defer t.runMu.Unlock()
+	if t.fs.isClosed() {
+		return 0, ErrStoreClosed
+	}
 	fs := t.fs
 	fs.mu.RLock()
 	candidates := make([]*msgBlock, 0, len(fs.blks))

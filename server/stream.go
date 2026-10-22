@@ -860,6 +860,18 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 }
 
 func (a *Account) addStreamWithAssignmentAndMode(config *StreamConfig, fsConfig *FileStoreConfig, sa *streamAssignment, pedantic, recovering, restoring bool) (*stream, error) {
+	_, jsa, err := a.checkForJetStream()
+	if err != nil {
+		return nil, err
+	}
+	jsa.archiveMu.Lock()
+	defer jsa.archiveMu.Unlock()
+	return a.addStreamWithAssignmentAndModeLocked(config, fsConfig, sa, pedantic, recovering, restoring)
+}
+
+// The account archive lock must cover restore directory publication as well
+// as registration, so restore callers use this entry point while holding it.
+func (a *Account) addStreamWithAssignmentAndModeLocked(config *StreamConfig, fsConfig *FileStoreConfig, sa *streamAssignment, pedantic, recovering, restoring bool) (*stream, error) {
 	s, jsa, err := a.checkForJetStream()
 	if err != nil {
 		return nil, err
@@ -878,6 +890,9 @@ func (a *Account) addStreamWithAssignmentAndMode(config *StreamConfig, fsConfig 
 		return nil, apiErr
 	}
 	cfg := &ccfg
+	if _, err := os.Stat(jsa.archiveTombstoneFile(cfg.Name)); err == nil || !os.IsNotExist(err) {
+		return nil, errors.New("stream identity is archived; use a new stream name")
+	}
 
 	singleServerMode := !s.JetStreamIsClustered() && s.standAloneMode()
 	if singleServerMode && cfg.Replicas > 1 {
@@ -9663,6 +9678,11 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 	if fcfg.Name != cfg.Name {
 		return nil, errors.New("stream names do not match")
 	}
+	jsa.archiveMu.Lock()
+	defer jsa.archiveMu.Unlock()
+	if _, err := os.Stat(jsa.archiveTombstoneFile(cfg.Name)); err == nil || !os.IsNotExist(err) {
+		return nil, errors.New("stream identity is archived; use a new stream name")
+	}
 
 	// See if this stream already exists.
 	if _, err := a.lookupStream(cfg.Name); err == nil {
@@ -9683,7 +9703,7 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 		return nil, err
 	}
 
-	mset, err := a.addStream(&cfg)
+	mset, err := a.addStreamWithAssignmentAndModeLocked(&cfg, nil, nil, false, false, false)
 	if err != nil {
 		// Make sure to clean up after ourselves here.
 		os.RemoveAll(ndir)

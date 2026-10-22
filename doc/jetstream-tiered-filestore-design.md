@@ -199,7 +199,43 @@ activation on an already-active target does not reapply that snapshot or rewind
 ACKs accepted after activation. These rules cover planned single-replica moves;
 they do not add consumer recovery from an unplanned loss of the source.
 
-### Object and snapshot boundaries
+### Archive-only local release
+
+`$JS.API.STREAM.ARCHIVE_REMOTE.<stream>` accepts
+`{"operation_id":"<stable retirement identity>"}` for a sealed, single-replica
+remote stream with no active move. The caller seals the stream first; this
+operation drains its final sequence and verifies the remote manifest and payload
+checksums without filling the local cache. It writes immutable `archive.json`
+under the stream prefix with the operation, account, stream incarnation,
+configuration, stream state, and message checkpoint. This receipt enables future
+history readers; it is not a consumer restore checkpoint.
+
+Only after that receipt is verified does the server fsync a local tombstone at
+`<account store>/__remote_archives__/<stream>.json`. The tombstone is outside the
+stream directory and permanently reserves that local stream name. Cleanup waits
+for background uploads and cold-read hydration, stops the stream, and removes
+only its local stream directory. Remote objects are never deleted. Small local
+tombstones remain deliberately; this is payload reclamation, not zero metadata
+growth or aggregate node disk protection.
+
+Success returns `success`, `archive_key`, and `covered_through`. Retry the same
+operation after any error or lost response. A missing stream without a valid
+local receipt is an error. A valid receipt permits retrying partial removal even
+while S3 is unavailable; it records the completed remote durability boundary.
+Conflicting IDs or unreadable receipts fail closed. Startup skips tombstoned
+streams before reading their potentially partially removed metadata, and new
+stream creation rejects tombstoned names. Use a new immutable stream identity
+for a new channel. The server serializes archive and create operations within
+an account; existing sibling traffic does not take this lifecycle lock.
+
+Failures before the remote receipt or local tombstone leave the sealed local
+data intact. Failures after the tombstone leave cleanup pending without reviving
+the stream. The lifecycle caller must keep its slot reserved until successful
+cleanup, and must retain the remote object location in its channel metadata.
+Alini uses existing retirement status, attempt reports, and OTel to expose this
+progress. Legacy local-only channels remain seal-only and retain their files.
+
+### Retained remote objects and snapshots
 
 Remote data is immutable under an opaque per-stream prefix. Stream deletion
 and retirement deliberately leave those objects in place for a later history
