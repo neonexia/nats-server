@@ -183,7 +183,10 @@ the corresponding message may be redelivered on the target. This is at-least-onc
 processing, not an exactly-once processing guarantee.
 
 Consumer configuration, delivered and acknowledged positions, and pending
-redelivery state travel with the checkpoint. Source consumer creation, updates,
+redelivery state travel with the checkpoint. Empty channels use a verified
+empty manifest and a zero-coverage checkpoint, so their configuration and named
+consumer cursors can move before the first publication. Zero coverage is rejected
+if either the saved stream state or manifest contains messages. Source consumer creation, updates,
 deletion and inactive expiry are fenced while the move is pending. Delivery
 pauses on the source; a replay or rate-limited message selected before the fence
 is checked again before sending. Direct stream message reads remain available

@@ -748,7 +748,7 @@ func (t *fileS3Tier) validStreamRecord(record *s3TierStreamRecord) bool {
 }
 
 func (t *fileS3Tier) validCheckpoint(checkpoint *s3TierCheckpoint) bool {
-	if checkpoint == nil || checkpoint.Version != 1 || checkpoint.Incarnation == "" || checkpoint.ManifestGeneration == 0 || checkpoint.ManifestKey == "" || checkpoint.ManifestSHA256 == "" || checkpoint.CoveredThrough == 0 {
+	if checkpoint == nil || checkpoint.Version != 1 || checkpoint.Incarnation == "" || checkpoint.ManifestGeneration == 0 || checkpoint.ManifestKey == "" || checkpoint.ManifestSHA256 == "" {
 		return false
 	}
 	digest, err := t.configSHA256()
@@ -1614,7 +1614,7 @@ func (t *fileS3Tier) drain(coveredThrough uint64) (uint64, error) {
 		}
 	}
 	fs.mu.RUnlock()
-	if len(candidates) == 0 || coveredThrough == 0 {
+	if len(candidates) == 0 && coveredThrough != 0 {
 		return 0, nil
 	}
 	if _, err := t.ensureStreamRecord(); err != nil {

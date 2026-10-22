@@ -2346,3 +2346,74 @@ func TestJetStreamS3TierPlannedMovePreservesConfirmedAcksAndPending(t *testing.T
 		t.Fatalf("activation retry reset consumer: %+v %v", info, err)
 	}
 }
+
+func TestJetStreamS3TierPlannedMoveEmptyChannel(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	start := func() *Server {
+		opts := DefaultTestOptions
+		opts.Port, opts.JetStream, opts.StoreDir = -1, true, t.TempDir()
+		opts.JetStreamS3Tiers = map[string]*S3TierConfig{"$G/EMPTY_MOVE": {Store: store, Prefix: "test/empty-move", BlockSize: 16 * 1024, LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29, RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29}}
+		s := RunServer(&opts)
+		t.Cleanup(s.Shutdown)
+		return s
+	}
+	source, target := start(), start()
+	nc := clientConnectToServer(t, source)
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.AddStream(&nats.StreamConfig{Name: "EMPTY_MOVE", Subjects: []string{"empty.move"}, Storage: nats.FileStorage, Retention: nats.LimitsPolicy, Discard: nats.DiscardNew, DenyDelete: true, DenyPurge: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.AddConsumer("EMPTY_MOVE", &nats.ConsumerConfig{Durable: "worker", AckPolicy: nats.AckExplicitPolicy}); err != nil {
+		t.Fatal(err)
+	}
+	request := func(conn *nats.Conn, subject string, body any) JSApiStreamRemoteRestoreResponse {
+		t.Helper()
+		data, _ := json.Marshal(body)
+		msg, err := conn.Request(subject, data, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response JSApiStreamRemoteRestoreResponse
+		if err = json.Unmarshal(msg.Data, &response); err != nil || response.Error != nil {
+			t.Fatalf("%s: %+v %v", subject, response, err)
+		}
+		return response
+	}
+	operation := JSApiStreamRemoteRestoreRequest{OperationID: "empty_move"}
+	request(nc, fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "EMPTY_MOVE"), operation)
+	checkpoint := request(nc, fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "EMPTY_MOVE"), operation)
+	again := request(nc, fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "EMPTY_MOVE"), operation)
+	if again.CheckpointSHA256 != checkpoint.CheckpointSHA256 {
+		t.Fatal("empty checkpoint retry changed evidence")
+	}
+	targetNC := clientConnectToServer(t, target)
+	defer targetNC.Close()
+	request(targetNC, fmt.Sprintf(JSApiStreamRestoreRemoteT, "EMPTY_MOVE"), JSApiStreamRestoreRemoteRequest{OperationID: operation.OperationID, ExpectedEpoch: checkpoint.Epoch, TargetID: "target"})
+	targetJS, err := targetNC.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := targetJS.ConsumerInfo("EMPTY_MOVE", "worker")
+	if err != nil || info.AckFloor.Stream != 0 {
+		t.Fatalf("empty consumer: %+v %v", info, err)
+	}
+	ack, err := targetJS.Publish("empty.move", []byte("first"))
+	if err != nil || ack.Sequence != 1 {
+		t.Fatalf("first publish: %+v %v", ack, err)
+	}
+	sub, err := targetJS.PullSubscribe("empty.move", "worker", nats.Bind("EMPTY_MOVE", "worker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages, err := sub.Fetch(1, nats.MaxWait(time.Second))
+	if err != nil || len(messages) != 1 || string(messages[0].Data) != "first" {
+		t.Fatalf("empty restored delivery: %v %v", messages, err)
+	}
+	if err := messages[0].AckSync(); err != nil {
+		t.Fatal(err)
+	}
+}

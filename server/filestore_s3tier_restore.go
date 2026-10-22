@@ -62,7 +62,7 @@ func (t *fileS3Tier) loadRemoteRestoreMaterial(operationID string, expectedEpoch
 		return nil, err
 	}
 	messageCheckpoint := checkpoint.MessageCheckpoint
-	if messageCheckpoint.Version != 1 || messageCheckpoint.Incarnation == "" || messageCheckpoint.CoveredThrough == 0 ||
+	if messageCheckpoint.Version != 1 || messageCheckpoint.Incarnation == "" ||
 		messageCheckpoint.ConfigSHA256 != configSHA256 || messageCheckpoint.ManifestKey != t.manifestKey(messageCheckpoint.ManifestGeneration) ||
 		messageCheckpoint.ManifestSHA256 == "" {
 		return nil, errors.New("remote restore checkpoint has an invalid message checkpoint")
@@ -80,7 +80,14 @@ func (t *fileS3Tier) loadRemoteRestoreMaterial(operationID string, expectedEpoch
 		manifest.Incarnation != messageCheckpoint.Incarnation {
 		return nil, errors.New("remote restore manifest is invalid")
 	}
-	if len(manifest.Blocks) == 0 {
+	// Empty channels still need a durable configuration and consumer checkpoint
+	// when their shard moves. Zero coverage is valid only for an empty stream
+	// and an empty manifest; it must never hide missing payload descriptors.
+	if messageCheckpoint.CoveredThrough == 0 {
+		if len(manifest.Blocks) != 0 || checkpoint.StreamState.Msgs != 0 || checkpoint.StreamState.FirstSeq != 0 {
+			return nil, errors.New("remote restore empty checkpoint contains message state")
+		}
+	} else if len(manifest.Blocks) == 0 {
 		return nil, errors.New("remote restore manifest has no blocks")
 	}
 	for i, block := range manifest.Blocks {
