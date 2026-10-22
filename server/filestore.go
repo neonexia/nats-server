@@ -442,7 +442,7 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 
 	// Check the directory
 	if stat, err := os.Stat(fcfg.StoreDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(fcfg.StoreDir, defaultDirPerms); err != nil {
+		if err := mkdirAllWithDiskBudget(dios, fcfg.StoreDir, defaultDirPerms); err != nil {
 			return nil, fmt.Errorf("could not create storage directory - %v", err)
 		}
 	} else if stat == nil || !stat.IsDir() {
@@ -473,6 +473,11 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 	}
 	if fcfg.S3Tier != nil {
 		fs.tier = newFileS3Tier(fs, *fcfg.S3Tier)
+		defer func() {
+			if err == nil && fs != nil {
+				fs.dios.budget.Load().register(fs.tier)
+			}
+		}()
 	}
 	fs.syncAlways.Store(fcfg.SyncAlways && !fcfg.SyncOnFlush)
 	fs.syncOnFlush.Store(fcfg.SyncOnFlush)
@@ -496,10 +501,10 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 	// Check if this is a new setup.
 	mdir := filepath.Join(fcfg.StoreDir, msgDir)
 	odir := filepath.Join(fcfg.StoreDir, consumerDir)
-	if err := os.MkdirAll(mdir, defaultDirPerms); err != nil {
+	if err := mkdirAllWithDiskBudget(dios, mdir, defaultDirPerms); err != nil {
 		return nil, fmt.Errorf("could not create message storage directory - %v", err)
 	}
-	if err := os.MkdirAll(odir, defaultDirPerms); err != nil {
+	if err := mkdirAllWithDiskBudget(fs.dios, odir, defaultDirPerms); err != nil {
 		return nil, fmt.Errorf("could not create consumer storage directory - %v", err)
 	}
 	if err := fs.prepareS3Tier(); err != nil {
@@ -5372,6 +5377,12 @@ func (fs *fileStore) genEncryptionKeysForBlock(mb *msgBlock) error {
 // Stores a raw message with expected sequence number and timestamp.
 // Lock should be held.
 func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, ttl int64, discardNewCheck bool) (err error) {
+	if fs.tier != nil && fs.dios.budget.Load() != nil {
+		if err := fs.tier.ensureProjectedLocalCapacity(fileStoreMsgSize(subj, hdr, msg)); err != nil {
+			return err
+		}
+	}
+
 	if fs.isClosed() {
 		return ErrStoreClosed
 	}
@@ -5597,7 +5608,7 @@ func (fs *fileStore) setWriteErr(err error) {
 		return
 	}
 	// Ignore non-write errors.
-	if err == ErrStoreClosed {
+	if err == ErrStoreClosed || errors.Is(err, ErrDiskBudgetExceeded) {
 		return
 	}
 	// If this is a not found report but do not disable.
@@ -5627,7 +5638,7 @@ func (fs *fileStore) setWriteErr(err error) {
 
 // StoreRawMsg stores a raw message with expected sequence number and timestamp.
 func (fs *fileStore) StoreRawMsg(subj string, hdr, msg []byte, seq uint64, ts, ttl int64, discardNewCheck bool) error {
-	if fs.tier != nil {
+	if fs.tier != nil && fs.dios.budget.Load() == nil {
 		if err := fs.tier.ensureLocalCapacity(); err != nil {
 			return err
 		}
@@ -5660,7 +5671,7 @@ func (fs *fileStore) StoreRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 
 // Store stores a message. We hold the main filestore lock for any write operation.
 func (fs *fileStore) StoreMsg(subj string, hdr, msg []byte, ttl int64) (uint64, int64, error) {
-	if fs.tier != nil {
+	if fs.tier != nil && fs.dios.budget.Load() == nil {
 		if err := fs.tier.ensureLocalCapacity(); err != nil {
 			return 0, 0, err
 		}
@@ -7852,13 +7863,25 @@ func (mb *msgBlock) writeMsgRecord(rl, seq uint64, subj string, mhdr, msg []byte
 // filestore lock will be held.
 // mb lock should be held.
 func (mb *msgBlock) writeMsgRecordLocked(rl, seq uint64, subj string, mhdr, msg []byte, ts int64, flush, kick bool) (rerr error) {
+	if budget := mb.fs.dios.budget.Load(); budget != nil {
+		rollback, err := budget.reserveGrowth(mb.mfn, addSaturate(mb.rbytes, rl), false)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if rerr != nil {
+				rollback()
+			}
+		}()
+	}
+
 	// Return previous write errors immediately.
 	if mb.werr != nil {
 		return mb.werr
 	}
 	// Persist any returned errors to be used in the future.
 	defer func() {
-		if rerr != nil && mb.werr == nil {
+		if rerr != nil && mb.werr == nil && !errors.Is(rerr, ErrDiskBudgetExceeded) {
 			// Read/decode errors surfaced from existing on-disk data are not write failures.
 			// Log and continue instead of disabling writes.
 			if isReadErr(rerr) {
@@ -8249,6 +8272,15 @@ func (mb *msgBlock) atomicOverwriteFile(buf []byte, allowCompress bool) error {
 
 	origFN := mb.mfn               // The original message block on disk.
 	tmpFN := mb.mfn + blkTmpSuffix // The new block will be written here.
+	budget := mb.fs.dios.budget.Load()
+	if budget != nil {
+		// Compression/encryption may add framing; budget the uncompressed copy and
+		// one block of framing before creating a temporary replacement.
+		if _, err := budget.reserveGrowth(tmpFN, uint64(len(buf))+4096, true); err != nil {
+			return err
+		}
+		defer budget.completed(tmpFN, origFN)
+	}
 
 	// Rather than modifying the existing block on disk (which is a dangerous
 	// operation if something goes wrong), create a new temporary file. We will
@@ -8296,6 +8328,11 @@ func (mb *msgBlock) atomicOverwriteFile(buf []byte, allowCompress bool) error {
 
 	// Write the new block data (which might be compressed or encrypted) to the
 	// temporary file.
+	if budget != nil {
+		if _, err := budget.reserveGrowth(tmpFN, uint64(len(buf)), true); err != nil {
+			return errorCleanup(err)
+		}
+	}
 	if n, err := tmpFD.Write(buf); err != nil {
 		return errorCleanup(fmt.Errorf("failed to write to temporary file: %w", err))
 	} else if n != len(buf) {
@@ -8909,6 +8946,13 @@ func (mb *msgBlock) flushPendingMsgs() error {
 // mb.mfd should not be nil.
 // Lock should held.
 func (mb *msgBlock) writeAt(buf []byte, woff int64) (int, error) {
+	budget := mb.fs.dios.budget.Load()
+	if budget != nil {
+		if _, err := budget.reserveGrowth(mb.mfn, uint64(woff)+uint64(len(buf)), true); err != nil {
+			return 0, err
+		}
+	}
+
 	// Used to mock write failures.
 	if mb.mockWriteErr {
 		// Reset on trip.
@@ -8918,6 +8962,10 @@ func (mb *msgBlock) writeAt(buf []byte, woff int64) (int, error) {
 	mb.fs.dios.acquire()
 	n, err := mb.mfd.WriteAt(buf, woff)
 	mb.fs.dios.release()
+	budget.observed(mb.mfn)
+	if mb.fs.tier != nil {
+		mb.fs.tier.kick()
+	}
 	return n, err
 }
 
@@ -11021,7 +11069,7 @@ func (fs *fileStore) purgeLocked(fseq uint64) (purged, bytes uint64, err error) 
 	}
 
 	// Create directory to move the new tombstone to.
-	if err := os.MkdirAll(ndir, defaultDirPerms); err != nil {
+	if err := mkdirAllWithDiskBudget(fs.dios, ndir, defaultDirPerms); err != nil {
 		fs.dios.release()
 		return purged, bytes, err
 	}
@@ -12306,7 +12354,12 @@ func (fs *fileStore) populateGlobalPerSubjectInfo(mb *msgBlock) error {
 // Calls os.RemoveAll on the given `dir` directory, but if an error occurs,
 // retries up to one second. If that still fails, returns the last error
 // that os.RemoveAll returned.
-func removeAllWithRetry(dios *diskIOSemaphore, dir string) error {
+func removeAllWithRetry(dios *diskIOSemaphore, dir string) (rerr error) {
+	defer func() {
+		if rerr == nil {
+			dios.budget.Load().forgetTree(dir)
+		}
+	}()
 	dios.acquire()
 	err := os.RemoveAll(dir)
 	dios.release()
@@ -12728,6 +12781,15 @@ func (fs *fileStore) _writeFullState(force bool) error {
 		fs.warn("WriteFullState took %v (%d bytes)", took.Round(time.Millisecond), len(buf))
 	}
 
+	// Metadata may use the maintenance reserve, but cannot exceed the hard
+	// aggregate budget. wfsmu serializes this file's reservation and write.
+	budget := fs.dios.budget.Load()
+	if budget != nil {
+		if _, err := budget.reserveGrowth(fn, uint64(len(buf)), true); err != nil {
+			return err
+		}
+		defer budget.completed(fn)
+	}
 	// Write our update index.db
 	// Protect with dios.
 	fs.dios.acquire()
@@ -13718,7 +13780,7 @@ func (fs *fileStore) ConsumerStore(name string, created time.Time, cfg *Consumer
 	}
 
 	odir := filepath.Join(fs.fcfg.StoreDir, consumerDir, name)
-	if err := os.MkdirAll(odir, defaultDirPerms); err != nil {
+	if err := mkdirAllWithDiskBudget(fs.dios, odir, defaultDirPerms); err != nil {
 		return nil, fmt.Errorf("could not create consumer directory - %v", err)
 	}
 	csi := &FileConsumerInfo{Name: name, Created: created, ConsumerConfig: *cfg}
@@ -14976,6 +15038,14 @@ func writeAtomically(dios *diskIOSemaphore, name string, data []byte, perm fs.Fi
 }
 
 func writeAtomicallyWithTemp(dios *diskIOSemaphore, tmp, name string, data []byte, perm fs.FileMode, sync bool) error {
+	budget := dios.budget.Load()
+	if budget != nil {
+		if _, err := budget.reserveGrowth(tmp, uint64(len(data)), !strings.HasSuffix(name, ".blk")); err != nil {
+			return err
+		}
+		defer budget.completed(tmp, name)
+	}
+
 	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 	if sync {
 		flags = flags | os.O_SYNC

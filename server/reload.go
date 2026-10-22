@@ -1587,7 +1587,7 @@ func imposeOrder(value any) error {
 		slices.Sort(value.AllowedOrigins)
 	case string, bool, uint8, uint16, uint64, int, int32, int64, time.Duration, float64, nil, LeafNodeOpts, ClusterOpts, *tls.Config, PinnedCertSet,
 		*URLAccResolver, *MemAccResolver, *DirAccResolver, *CacheDirAccResolver, Authentication, MQTTOpts, jwt.TagList,
-		*OCSPConfig, map[string]string, map[string]bool, JSLimitOpts, StoreCipher, *OCSPResponseCacheConfig, *ProxiesConfig, WriteTimeoutPolicy:
+		*DiskBudgetConfig, *OCSPConfig, map[string]string, map[string]bool, JSLimitOpts, StoreCipher, *OCSPResponseCacheConfig, *ProxiesConfig, WriteTimeoutPolicy:
 		// explicitly skipped types
 	case map[string]*S3TierConfig:
 		// Programmatic tier mappings are a test seam, not reloadable configuration.
@@ -1621,6 +1621,9 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 		jsStoreDirChanged   bool
 		jsLimitsUpdate      *jetStreamLimitsOption
 	)
+	if !reflect.DeepEqual(oldOpts.JetStreamDiskBudget, newOpts.JetStreamDiskBudget) {
+		return nil, fmt.Errorf("config reload not supported for JetStream disk_budget")
+	}
 	if !oldOpts.jetStreamS3Tier.equal(newOpts.jetStreamS3Tier) {
 		return nil, fmt.Errorf("config reload not supported for JetStream S3 tier")
 	}

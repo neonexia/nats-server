@@ -3126,6 +3126,7 @@ type MetaClusterInfo struct {
 
 // JSInfo has detailed information on JetStream.
 type JSInfo struct {
+	DiskBudget *DiskBudgetStats `json:"disk_budget,omitempty"`
 	JetStreamStats
 	ID              string           `json:"server_id"`
 	Now             time.Time        `json:"now"`
@@ -3320,6 +3321,7 @@ func (s *Server) Jsz(opts *JSzOptions) (*JSInfo, error) {
 		return jsi, nil
 	}
 
+	jsi.DiskBudget = s.diskIOSemaphore().budget.Load().snapshot()
 	jsi.Limits = &s.getOpts().JetStreamLimits
 
 	js.mu.RLock()

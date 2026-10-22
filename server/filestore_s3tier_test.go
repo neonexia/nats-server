@@ -300,6 +300,7 @@ jetstream {
     local_low_bytes: 4M
     remote_high_bytes: 2M
     remote_low_bytes: 1M
+    remote_flush_max_age: "7s"
     timeout: "2s"
     retry_min: "10ms"
     retry_max: "100ms"
@@ -320,7 +321,7 @@ jetstream {
 	if tier == nil || tier.Endpoint != "minio.internal:9000" || tier.Bucket != "nodus-history" || tier.store == nil {
 		t.Fatalf("tier config = %#v", tier)
 	}
-	if tier.BlockSize != 1_000_000 || tier.LocalHighBytes != 8_000_000 || tier.RemoteLowBytes != 1_000_000 || tier.Timeout != 2*time.Second || tier.RetryMax != 100*time.Millisecond || tier.GCGrace != 2*time.Hour {
+	if tier.BlockSize != 1_000_000 || tier.LocalHighBytes != 8_000_000 || tier.RemoteLowBytes != 1_000_000 || tier.Timeout != 2*time.Second || tier.RetryMax != 100*time.Millisecond || tier.GCGrace != 2*time.Hour || tier.RemoteFlushMaxAge != 7*time.Second {
 		t.Fatalf("unexpected tier settings: %#v", tier)
 	}
 	streamTier := tier.streamConfig("$G", "TEST")
@@ -379,7 +380,7 @@ jetstream {
 		t.Fatal(err)
 	}
 	tier := opts.jetStreamS3Tier
-	if tier == nil || tier.BlockSize != defaultS3TierBlockSize || tier.LocalHighBytes != defaultS3TierLocalHigh || tier.RemoteLowBytes != defaultS3TierRemoteLow || tier.Timeout != defaultS3TierTimeout || tier.RetryMax != defaultS3TierRetryMax || tier.GCGrace != defaultS3TierGCGrace {
+	if tier == nil || tier.BlockSize != defaultS3TierBlockSize || tier.LocalHighBytes != defaultS3TierLocalHigh || tier.RemoteLowBytes != defaultS3TierRemoteLow || tier.Timeout != defaultS3TierTimeout || tier.RetryMax != defaultS3TierRetryMax || tier.GCGrace != defaultS3TierGCGrace || tier.RemoteFlushMaxAge != 5*time.Minute {
 		t.Fatalf("tier defaults = %#v", tier)
 	}
 	badConfig := createConfFile(t, []byte(`

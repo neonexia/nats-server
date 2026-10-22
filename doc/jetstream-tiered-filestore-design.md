@@ -37,6 +37,7 @@ jetstream {
     block_size: 8M
     local_high_bytes: 512M
     local_low_bytes: 384M
+    remote_flush_max_age: "5m"
     remote_high_bytes: 128M
     remote_low_bytes: 64M
     timeout: 30s
@@ -310,3 +311,75 @@ Keep enough sequence/subject metadata locally to select a remote block without s
 Run a local S3-compatible service and exercise real PUT/GET/list/delete behavior, not only an in-memory mock. Publish enough messages to roll multiple blocks, lower the local budget, verify that old local payload bytes are reclaimed, and use a **native durable consumer** plus direct `Get` to replay every original sequence across the local/S3 boundary. Repeat after restart and after deleting the node's local block cache. Inject failures at each commit step and during cold reads. Compare stream state, consumer ACK/redelivery state, and checksums before and after. Then benchmark cold-read latency, concurrent consumers, local-write latency during misses, upload lag, cache hit rate, and S3 request volume.
 
 The first implementation should remain explicitly experimental until these gates pass. Do not enable automatic eviction for Nodus based solely on successful upload or a single happy-path replay.
+
+## Aggregate local disk admission
+
+An optional server-wide `jetstream.disk_budget` applies to the JetStream storage
+root, across streams, consumer metadata, local tier payloads and hydrated blocks.
+It is independent of logical retention (`max_store`) and the existing per-stream
+local-residency and remote-coverage watermarks:
+
+```conf
+jetstream {
+  disk_budget {
+    limit_bytes: 1GB
+    reserve_bytes: 64MB
+    min_free_bytes: 1GB
+  }
+}
+```
+
+All three values must be positive. `reserve_bytes` must be below 20% of the
+assigned limit. Changes require restart. `/jsz.disk_budget` reports configuration,
+allocated and reserved bytes, filesystem availability, pressure, admission state,
+and rejection count. Missing filesystem measurements fail admission closed.
+
+Buffered message growth is reserved before accepting it. Hydration reserves the
+incoming whole block; remote checkpoint restore reserves the entire staging
+footprint before downloading payloads. Atomic replacements account for old and
+new files concurrently. Metadata writes may consume the maintenance reserve;
+ordinary payload admission cannot. Directory scans at startup and during operation
+reconcile actual allocations without erasing accepted buffered reservations.
+Filesystem availability must retain `min_free_bytes`, and filesystems reporting
+inode totals must retain at least 128 free inodes.
+
+At 80% projected aggregate usage, a background worker forces remote coverage and
+reclaims covered payloads across streams, including rolling a partial active block
+when needed. The worker skips remote-only blocks. Pressure clears below 60% with
+filesystem headroom restored. Hard exhaustion rejects new allocation transiently;
+it does not latch a permanent file-store write error. Existing local reads remain
+available. Remote outages can prevent reclamation and therefore prolong rejection.
+Pressure-driven uploads share the configured exponential upload backoff; repeated
+publisher or pressure wakeups cannot bypass its retry interval.
+Per-stream residency limits continue to apply even when the aggregate budget has
+space. Their pressure path also uploads/reclaims asynchronously.
+
+Native snapshot restore is explicitly unavailable when `disk_budget` is enabled:
+its extraction path does not yet provide complete staging admission. Use remote
+checkpoint restore for supported tiered-stream moves. That restore currently needs
+the entire restored payload locally; lazy restore is not implemented.
+
+This controller is not a filesystem quota. Accounting uses conservative 4 KiB
+rounding and observed allocation; filesystem metadata growth and unrelated writers
+can consume physical space outside its reservations. Dedicated volumes or native
+quotas remain necessary for strict physical isolation. Deployment must verify that
+aggregate assigned budgets on a shared filesystem leave real headroom. This work
+does not establish clustered-stream disk admission guarantees.
+
+### Age-driven remote coverage
+
+`jetstream.s3_tier.remote_flush_max_age` defaults to `5m` in server configuration;
+`0s` disables it. Negative and invalid durations are rejected. The programmatic
+`S3TierConfig.RemoteFlushMaxAge` zero value stays disabled for compatibility.
+
+A background timer checks the first message timestamp of uncovered blocks. That
+timestamp is part of the persisted message state, so restart does not reset the
+age. Once due, a partial active block is sealed and uploaded through the existing
+verified payload/descriptor/manifest sequence. This adds remote coverage without
+evicting its local copy. Residency and aggregate disk pressure remain independent.
+
+The duration is a scheduling threshold, not a durability deadline: buffered flush,
+upload latency and outages can delay coverage. Timer checks are bounded between
+10ms and 1s. Age-driven uploads share exponential upload retry backoff even when
+aggregate disk admission is disabled. The explicit drain/checkpoint APIs remain
+the way to request and verify a completed remote boundary.

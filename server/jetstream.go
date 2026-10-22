@@ -249,6 +249,14 @@ func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 		return err
 	}
 
+	if budgetConfig := s.getOpts().JetStreamDiskBudget; budgetConfig != nil {
+		budget, err := newFileDiskBudget(cfg.StoreDir, *budgetConfig)
+		if err != nil {
+			return fmt.Errorf("initialize disk budget: %w", err)
+		}
+		s.diskIOSemaphore().budget.Store(budget)
+		go budget.run(s.quitCh)
+	}
 	return s.enableJetStream(cfg)
 }
 

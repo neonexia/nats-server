@@ -144,9 +144,51 @@ func writeS3TierRestoreFile(path string, data []byte) error {
 // stageRemoteRestore writes a complete private file-store directory. No stream
 // points at it until the caller verifies the staged state and completes the
 // activation receipt protocol.
-func (t *fileS3Tier) stageRemoteRestore(dir string, material *s3TierRemoteRestoreMaterial) error {
+func (t *fileS3Tier) stageRemoteRestore(dir string, material *s3TierRemoteRestoreMaterial, budgets ...*fileDiskBudget) error {
 	if material == nil {
 		return errors.New("remote restore material is required")
+	}
+	var budget *fileDiskBudget
+	if len(budgets) > 0 {
+		budget = budgets[0]
+	}
+	if budget != nil {
+		sizes := map[string]uint64{
+			filepath.Join(dir, "s3-tier.json"):                    uint64(len(strings.Trim(t.cfg.Prefix, "/"))),
+			filepath.Join(dir, msgDir, "s3-tier.manifest.json"):   uint64(len(material.manifestData)),
+			filepath.Join(dir, msgDir, "s3-tier.stream.json"):     uint64(len(material.streamData)),
+			filepath.Join(dir, msgDir, "s3-tier.checkpoint.json"): uint64(len(material.messageData)),
+		}
+		// Include the directory allocations before any remote download too.
+		for path := filepath.Join(dir, msgDir); budget.owns(path); path = filepath.Dir(path) {
+			if _, err := os.Stat(path); err == nil {
+				break
+			} else if !os.IsNotExist(err) {
+				return err
+			}
+			sizes[path] = 4096
+			if path == budget.root {
+				break
+			}
+		}
+		for _, block := range material.manifest.Blocks {
+			descriptor, err := json.Marshal(block)
+			if err != nil {
+				return err
+			}
+			sizes[filepath.Join(dir, msgDir, fmt.Sprintf(blkScan, block.Index))] = uint64(block.Size)
+			sizes[filepath.Join(dir, msgDir, fmt.Sprintf("%d.tier.json", block.Index))] = uint64(len(descriptor))
+		}
+		// Admit the complete restore before downloading any payload. Each file's
+		// reservation transfers to allocated bytes as the staging tree materializes.
+		var paths []string
+		defer func() { budget.completed(paths...) }()
+		for path, size := range sizes {
+			if _, err := budget.reserveGrowth(path, size, false); err != nil {
+				return err
+			}
+			paths = append(paths, path)
+		}
 	}
 	if err := writeS3TierRestoreFile(filepath.Join(dir, "s3-tier.json"), []byte(strings.Trim(t.cfg.Prefix, "/"))); err != nil {
 		return err

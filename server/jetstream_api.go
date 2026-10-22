@@ -5028,12 +5028,12 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
-	if err := os.RemoveAll(stageDir); err != nil {
+	if err := removeAllWithRetry(s.diskIOSemaphore(), stageDir); err != nil {
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
-	if err := tier.stageRemoteRestore(stageDir, material); err != nil {
+	if err := tier.stageRemoteRestore(stageDir, material, s.diskIOSemaphore().budget.Load()); err != nil {
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
@@ -5048,7 +5048,7 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(streamDir), defaultDirPerms); err != nil {
+	if err := mkdirAllWithDiskBudget(s.diskIOSemaphore(), filepath.Dir(streamDir), defaultDirPerms); err != nil {
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
@@ -5057,6 +5057,10 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
+	}
+	if budget := s.diskIOSemaphore().budget.Load(); budget != nil {
+		budget.renamedTree(stageDir, streamDir)
+		_ = budget.reconcile()
 	}
 	mset, err := acc.addStreamWithAssignmentAndModeLocked(&material.checkpoint.StreamConfig, nil, nil, false, false, true)
 	if err != nil {

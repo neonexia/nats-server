@@ -179,7 +179,7 @@ func (s *Server) archiveStream(acc *Account, name, operation string) (*s3TierArc
 			if err != nil {
 				return nil, err
 			}
-			if err = os.MkdirAll(filepath.Dir(marker), defaultDirPerms); err != nil {
+			if err = mkdirAllWithDiskBudget(dios, filepath.Dir(marker), defaultDirPerms); err != nil {
 				return nil, err
 			}
 			if canFsyncDirectories {

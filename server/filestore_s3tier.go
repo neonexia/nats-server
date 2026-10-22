@@ -40,11 +40,12 @@ type S3TierConfig struct {
 	// RemoteHighBytes and RemoteLowBytes control when sealed local blocks gain
 	// remote coverage. Zero values retain the original behavior of using the
 	// local watermarks for both policies.
-	RemoteHighBytes uint64
-	RemoteLowBytes  uint64
-	Timeout         time.Duration
-	RetryMin        time.Duration
-	RetryMax        time.Duration
+	RemoteHighBytes   uint64
+	RemoteLowBytes    uint64
+	RemoteFlushMaxAge time.Duration // Zero disables age-driven remote coverage.
+	Timeout           time.Duration
+	RetryMin          time.Duration
+	RetryMax          time.Duration
 	// GCGrace delays deletion of a known failed payload upload. This is only
 	// for protocol debris recorded before a descriptor was committed; it never
 	// applies to stream history.
@@ -78,15 +79,16 @@ type S3TierServerConfig struct {
 	SecretKeyEnv       string
 	SessionTokenEnv    string
 
-	BlockSize       uint64
-	LocalHighBytes  uint64
-	LocalLowBytes   uint64
-	RemoteHighBytes uint64
-	RemoteLowBytes  uint64
-	Timeout         time.Duration
-	RetryMin        time.Duration
-	RetryMax        time.Duration
-	GCGrace         time.Duration
+	BlockSize         uint64
+	LocalHighBytes    uint64
+	LocalLowBytes     uint64
+	RemoteHighBytes   uint64
+	RemoteLowBytes    uint64
+	RemoteFlushMaxAge time.Duration // Zero disables age-driven remote coverage.
+	Timeout           time.Duration
+	RetryMin          time.Duration
+	RetryMax          time.Duration
+	GCGrace           time.Duration
 
 	store S3TierObjectStore
 }
@@ -142,15 +144,16 @@ type s3TierObjectDeleter interface {
 
 func newS3TierServerConfig() *S3TierServerConfig {
 	return &S3TierServerConfig{
-		BlockSize:       defaultS3TierBlockSize,
-		LocalHighBytes:  defaultS3TierLocalHigh,
-		LocalLowBytes:   defaultS3TierLocalLow,
-		RemoteHighBytes: defaultS3TierRemoteHigh,
-		RemoteLowBytes:  defaultS3TierRemoteLow,
-		Timeout:         defaultS3TierTimeout,
-		RetryMin:        defaultS3TierRetryMin,
-		RetryMax:        defaultS3TierRetryMax,
-		GCGrace:         defaultS3TierGCGrace,
+		BlockSize:         defaultS3TierBlockSize,
+		LocalHighBytes:    defaultS3TierLocalHigh,
+		LocalLowBytes:     defaultS3TierLocalLow,
+		RemoteHighBytes:   defaultS3TierRemoteHigh,
+		RemoteLowBytes:    defaultS3TierRemoteLow,
+		RemoteFlushMaxAge: 5 * time.Minute,
+		Timeout:           defaultS3TierTimeout,
+		RetryMin:          defaultS3TierRetryMin,
+		RetryMax:          defaultS3TierRetryMax,
+		GCGrace:           defaultS3TierGCGrace,
 	}
 }
 
@@ -193,7 +196,7 @@ func (c *S3TierServerConfig) streamConfig(account, stream string) *S3TierConfig 
 	return &S3TierConfig{
 		Store: c.store, Prefix: prefix, BlockSize: c.BlockSize,
 		LocalHighBytes: c.LocalHighBytes, LocalLowBytes: c.LocalLowBytes,
-		RemoteHighBytes: c.RemoteHighBytes, RemoteLowBytes: c.RemoteLowBytes,
+		RemoteHighBytes: c.RemoteHighBytes, RemoteLowBytes: c.RemoteLowBytes, RemoteFlushMaxAge: c.RemoteFlushMaxAge,
 		Timeout: c.Timeout, RetryMin: c.RetryMin, RetryMax: c.RetryMax,
 		GCGrace: c.GCGrace,
 	}
@@ -205,7 +208,7 @@ func (c *S3TierServerConfig) equal(other *S3TierServerConfig) bool {
 	}
 	return c.Endpoint == other.Endpoint && c.Bucket == other.Bucket && c.Region == other.Region && c.TLS == other.TLS && c.Prefix == other.Prefix &&
 		c.CredentialProvider == other.CredentialProvider && c.AccessKeyEnv == other.AccessKeyEnv && c.SecretKeyEnv == other.SecretKeyEnv && c.SessionTokenEnv == other.SessionTokenEnv &&
-		c.BlockSize == other.BlockSize && c.LocalHighBytes == other.LocalHighBytes && c.LocalLowBytes == other.LocalLowBytes && c.RemoteHighBytes == other.RemoteHighBytes && c.RemoteLowBytes == other.RemoteLowBytes &&
+		c.BlockSize == other.BlockSize && c.LocalHighBytes == other.LocalHighBytes && c.LocalLowBytes == other.LocalLowBytes && c.RemoteHighBytes == other.RemoteHighBytes && c.RemoteLowBytes == other.RemoteLowBytes && c.RemoteFlushMaxAge == other.RemoteFlushMaxAge &&
 		c.Timeout == other.Timeout && c.RetryMin == other.RetryMin && c.RetryMax == other.RetryMax && c.GCGrace == other.GCGrace
 }
 
@@ -405,24 +408,28 @@ type S3TierGCResult struct {
 }
 
 type fileS3Tier struct {
-	fs             *fileStore
-	cfg            S3TierConfig
-	mu             sync.Mutex   // Protects descriptors and in-flight fetches.
-	runMu          sync.Mutex   // One eviction pass at a time.
-	hydrateMu      sync.RWMutex // Archive cleanup waits for cold reads before removing files.
-	desc           map[uint32]s3BlockDescriptor
-	fetch          map[uint32]*s3TierFetch
-	gen            uint64
-	manifestSHA256 string
-	record         *s3TierStreamRecord
-	checkpoint     *s3TierCheckpoint
-	restore        *s3TierRemoteRestoreState
-	activation     *s3TierRemoteRestoreActivation
-	gc             []s3TierGCCandidate
-	stats          s3TierCounters
-	wake           chan struct{}
-	quit           chan struct{}
-	once           sync.Once
+	budgetRetryAt    time.Time
+	budgetRetryDelay time.Duration
+	budgetRetryErr   error
+	localPressure    atomic.Bool
+	fs               *fileStore
+	cfg              S3TierConfig
+	mu               sync.Mutex   // Protects descriptors and in-flight fetches.
+	runMu            sync.Mutex   // One eviction pass at a time.
+	hydrateMu        sync.RWMutex // Archive cleanup waits for cold reads before removing files.
+	desc             map[uint32]s3BlockDescriptor
+	fetch            map[uint32]*s3TierFetch
+	gen              uint64
+	manifestSHA256   string
+	record           *s3TierStreamRecord
+	checkpoint       *s3TierCheckpoint
+	restore          *s3TierRemoteRestoreState
+	activation       *s3TierRemoteRestoreActivation
+	gc               []s3TierGCCandidate
+	stats            s3TierCounters
+	wake             chan struct{}
+	quit             chan struct{}
+	once             sync.Once
 }
 
 type s3TierCounters struct {
@@ -471,7 +478,7 @@ func validateS3Tier(fcfg FileStoreConfig, cfg StreamConfig) error {
 	}
 	if t.Store == nil || strings.Trim(t.Prefix, "/") == "" || t.LocalLowBytes == 0 || t.LocalHighBytes <= t.LocalLowBytes ||
 		(t.RemoteHighBytes > 0 && t.RemoteHighBytes <= t.RemoteLowBytes) || (t.RemoteHighBytes == 0 && t.RemoteLowBytes != 0) ||
-		t.RetryMin <= 0 || t.RetryMax < t.RetryMin {
+		t.RetryMin <= 0 || t.RetryMax < t.RetryMin || t.RemoteFlushMaxAge < 0 {
 		return fmt.Errorf("S3 tier requires store, unique prefix, valid watermarks, and retry max >= retry min > 0")
 	}
 	if cfg.Replicas > 1 || cfg.Retention != LimitsPolicy || cfg.Discard != DiscardNew || !cfg.DenyDelete || !cfg.DenyPurge ||
@@ -1388,6 +1395,14 @@ func (t *fileS3Tier) hasDescriptor(index uint32) bool {
 }
 
 func (t *fileS3Tier) loop() {
+	var ageC <-chan time.Time
+	if t.cfg.RemoteFlushMaxAge > 0 {
+		// Polling is bounded even for tiny configured ages. The due decision
+		// always uses persisted message time, never time since this loop began.
+		ticker := time.NewTicker(max(10*time.Millisecond, min(time.Second, t.cfg.RemoteFlushMaxAge/4)))
+		defer ticker.Stop()
+		ageC = ticker.C
+	}
 	var (
 		delay  time.Duration
 		timer  *time.Timer
@@ -1399,6 +1414,7 @@ func (t *fileS3Tier) loop() {
 		}
 	}()
 	for {
+		ageTick := false
 		select {
 		case <-t.wake:
 			if timer != nil && !timer.Stop() {
@@ -1408,12 +1424,33 @@ func (t *fileS3Tier) loop() {
 				}
 			}
 			retryC = nil
+		case <-ageC:
+			ageTick = true
+			t.mu.Lock()
+			backingOff := time.Now().Before(t.budgetRetryAt)
+			t.mu.Unlock()
+			if backingOff {
+				continue
+			}
 		case <-retryC:
 			retryC = nil
 		case <-t.quit:
 			return
 		}
-		if err := t.evictToBudget(); err != nil {
+		var err error
+		if t.localPressure.Swap(false) {
+			err = t.reclaimDiskBudgetBlock()
+			if err != nil {
+				t.localPressure.Store(true)
+			}
+		}
+		if err == nil {
+			err = t.flushAgedBlocks()
+		}
+		if err == nil && !ageTick {
+			err = t.evictToBudget()
+		}
+		if err != nil {
 			t.fs.warn("S3 tier eviction failed: %v", err)
 			t.stats.retryAttempts.Add(1)
 			if delay == 0 {
@@ -1422,6 +1459,9 @@ func (t *fileS3Tier) loop() {
 				delay *= 2
 			} else {
 				delay = t.cfg.RetryMax
+			}
+			if timer != nil {
+				timer.Stop()
 			}
 			timer = time.NewTimer(delay)
 			retryC = timer.C
@@ -1438,7 +1478,14 @@ func (t *fileS3Tier) kick() {
 	}
 }
 
-func (t *fileS3Tier) stop() { t.once.Do(func() { close(t.quit) }) }
+func (t *fileS3Tier) stop() {
+	t.once.Do(func() {
+		close(t.quit)
+		if t.fs != nil {
+			t.fs.dios.budget.Load().unregister(t)
+		}
+	})
+}
 
 func checksumS3Block(data []byte) string {
 	h := sha256.Sum256(data)
@@ -1491,6 +1538,14 @@ func (t *fileS3Tier) ensureHydrated(index uint32) error {
 }
 
 func (t *fileS3Tier) fetchBlock(d s3BlockDescriptor, path string) error {
+	budget := t.fs.dios.budget.Load()
+	if budget != nil {
+		if _, err := budget.reserveGrowth(path+".tmp", uint64(d.Size), false); err != nil {
+			return err
+		}
+		defer budget.completed(path+".tmp", path)
+	}
+
 	ctx, cancel := t.ctx()
 	data, err := t.cfg.Store.Get(ctx, d.Key)
 	cancel()
@@ -1770,7 +1825,7 @@ func (t *fileS3Tier) backlog() (uint64, uint64) {
 
 // evictBlock uploads a sealed block when needed. reclaim determines whether
 // the local copy is removed after remote coverage is durably recorded.
-func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool) (uint64, error) {
+func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool) (size uint64, resultErr error) {
 	fs := t.fs
 	t.mu.Lock()
 	_, alreadyRemote := t.desc[mb.index]
@@ -1797,6 +1852,36 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool) (uint64, error) {
 			return t.removeLocalBlock(mb, data, nil)
 		}
 		return uint64(len(data)), nil
+	}
+	// Aggregate pressure wakes more often than the upload retry interval. All
+	// coverage callers share this gate so pressure and publisher kicks cannot
+	// bypass the configured outage backoff. Covered local eviction remains free
+	// to proceed without making a remote request.
+	if fs.dios.budget.Load() != nil || t.cfg.RemoteFlushMaxAge > 0 {
+		t.mu.Lock()
+		if time.Now().Before(t.budgetRetryAt) {
+			err := t.budgetRetryErr
+			t.mu.Unlock()
+			return 0, err
+		}
+		t.mu.Unlock()
+		defer func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			if resultErr == nil {
+				t.budgetRetryAt, t.budgetRetryDelay, t.budgetRetryErr = time.Time{}, 0, nil
+				return
+			}
+			if t.budgetRetryDelay == 0 {
+				t.budgetRetryDelay = t.cfg.RetryMin
+			} else if t.budgetRetryDelay < t.cfg.RetryMax/2 {
+				t.budgetRetryDelay *= 2
+			} else {
+				t.budgetRetryDelay = t.cfg.RetryMax
+			}
+			t.budgetRetryAt = time.Now().Add(t.budgetRetryDelay)
+			t.budgetRetryErr = resultErr
+		}()
 	}
 	record, err := t.ensureStreamRecord()
 	if err != nil {
@@ -1892,6 +1977,7 @@ func (t *fileS3Tier) removeLocalBlock(mb *msgBlock, expected []byte, descriptor 
 	if err := os.Remove(mb.mfn); err != nil {
 		return 0, err
 	}
+	fs.dios.budget.Load().completed(mb.mfn)
 	if canFsyncDirectories {
 		if err := syncDir(filepath.Dir(mb.mfn)); err != nil {
 			return 0, err
@@ -1926,4 +2012,131 @@ func (fs *fileStore) hydrateS3TierMiss(err error) (bool, error) {
 		return false, err
 	}
 	return true, fs.tier.ensureHydrated(missing.index)
+}
+
+// reclaimDiskBudgetBlock performs at most one block of work per stream/pass,
+// independently of its normal residency and remote-coverage watermarks.
+func (t *fileS3Tier) reclaimDiskBudgetBlock() error {
+	t.runMu.Lock()
+	defer t.runMu.Unlock()
+	fs := t.fs
+	fs.mu.Lock()
+	if fs.closing || fs.isClosed() {
+		fs.mu.Unlock()
+		return ErrStoreClosed
+	}
+	var candidate *msgBlock
+	t.mu.Lock()
+	for _, mb := range fs.blks {
+		if mb != fs.lmb {
+			// Remote-only blocks cannot release local capacity. Skip them so
+			// repeated pressure passes continue toward the resident tail.
+			if _, err := os.Stat(mb.mfn); os.IsNotExist(err) {
+				continue
+			} else if err != nil {
+				t.mu.Unlock()
+				fs.mu.Unlock()
+				return err
+			}
+			if candidate == nil {
+				candidate = mb
+			}
+			if _, covered := t.desc[mb.index]; covered {
+				candidate = mb
+				break
+			}
+		}
+	}
+	t.mu.Unlock()
+	if candidate == nil && fs.lmb != nil {
+		fs.lmb.mu.RLock()
+		nonempty := fs.lmb.msgs > 0
+		fs.lmb.mu.RUnlock()
+		if nonempty {
+			candidate = fs.lmb
+			if _, err := fs.newMsgBlockForWrite(); err != nil {
+				fs.mu.Unlock()
+				return err
+			}
+			fs.dirty++
+		}
+	}
+	fs.mu.Unlock()
+	if candidate == nil {
+		return nil
+	}
+	_, err := t.evictBlock(candidate, true)
+	return err
+}
+
+// Called with fs.mu held: concurrent publishers cannot both spend the same
+// per-stream residency headroom. Reclamation remains asynchronous.
+func (t *fileS3Tier) ensureProjectedLocalCapacity(additional uint64) error {
+	b := t.fs.dios.budget.Load()
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	var used uint64
+	for _, mb := range t.fs.blks {
+		e := b.files[mb.mfn]
+		used = addSaturate(used, max(e.actual, e.planned))
+	}
+	b.mu.Unlock()
+	additional = diskBudgetRound(additional)
+	if used > t.cfg.LocalHighBytes || additional > t.cfg.LocalHighBytes-used {
+		t.localPressure.Store(true)
+		t.kick()
+		t.stats.capacityErrors.Add(1)
+		return errS3TierLocalCapacity
+	}
+	return nil
+}
+
+// flushAgedBlocks grants remote coverage without changing local residency.
+// Message timestamps survive restart, so reopening cannot reset an old tail's age.
+func (t *fileS3Tier) flushAgedBlocks() error {
+	if t.cfg.RemoteFlushMaxAge == 0 {
+		return nil
+	}
+	t.runMu.Lock()
+	defer t.runMu.Unlock()
+	fs := t.fs
+	fs.mu.Lock()
+	if fs.closing || fs.isClosed() {
+		fs.mu.Unlock()
+		return ErrStoreClosed
+	}
+	// Snapshot once: a long outage backlog must not rescan all historical
+	// descriptors after every successful block upload.
+	var candidates []*msgBlock
+	cutoff := time.Now().Add(-t.cfg.RemoteFlushMaxAge).UnixNano()
+	t.mu.Lock()
+	for _, mb := range fs.blks {
+		if _, covered := t.desc[mb.index]; covered {
+			continue
+		}
+		mb.mu.RLock()
+		due := mb.msgs > 0 && mb.first.ts > 0 && mb.first.ts <= cutoff
+		mb.mu.RUnlock()
+		if due {
+			candidates = append(candidates, mb)
+		}
+	}
+	t.mu.Unlock()
+	if len(candidates) > 0 && candidates[len(candidates)-1] == fs.lmb {
+		if _, err := fs.newMsgBlockForWrite(); err != nil {
+			fs.mu.Unlock()
+			return err
+		}
+		fs.dirty++
+	}
+	fs.mu.Unlock()
+	for _, candidate := range candidates {
+		size, err := t.evictBlock(candidate, false)
+		if err != nil || size == 0 {
+			return err
+		}
+	}
+	return nil
 }

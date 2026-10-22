@@ -613,7 +613,8 @@ type Options struct {
 
 	// jetStreamS3Tier is the experimental server-wide object tier parsed from
 	// the JetStream configuration block. Credentials stay out of stream config.
-	jetStreamS3Tier *S3TierServerConfig
+	jetStreamS3Tier     *S3TierServerConfig
+	JetStreamDiskBudget *DiskBudgetConfig `json:"-"`
 
 	// JetStreamS3Tiers is retained as a programmatic test seam. Keys use
 	// "account/stream" and are superseded by JetStreamS3Tier when configured.
@@ -2764,6 +2765,10 @@ func parseJetStream(v any, opts *Options, errors *[]error, warnings *[]error) er
 				if err := parseJetStreamTPM(tk, opts, errors); err != nil {
 					return err
 				}
+			case "disk_budget":
+				if err := parseJetStreamDiskBudget(tk, mv, opts); err != nil {
+					return err
+				}
 			case "s3_tier":
 				if err := parseJetStreamS3Tier(tk, mv, opts, errors, warnings); err != nil {
 					return err
@@ -2886,6 +2891,12 @@ func parseJetStreamS3Tier(tk token, v any, opts *Options, errors *[]error, warni
 			case "remote_low_bytes":
 				tier.RemoteLowBytes = uint64(size)
 			}
+		case "remote_flush_max_age":
+			duration := parseDuration(key, fieldToken, value, errors, warnings)
+			if duration < 0 {
+				return fmt.Errorf("remote_flush_max_age must be non-negative")
+			}
+			tier.RemoteFlushMaxAge = duration
 		case "timeout", "retry_min", "retry_max", "gc_grace":
 			duration := parseDuration(key, fieldToken, value, errors, warnings)
 			if duration <= 0 {
@@ -6858,4 +6869,36 @@ func redactURLListUser(raw string) string {
 		parts[i] = redactURLUser(part)
 	}
 	return strings.Join(parts, ",")
+}
+
+func parseJetStreamDiskBudget(tk token, v any, opts *Options) error {
+	var lt token
+	_, v = unwrapValue(v, &lt)
+	values, ok := v.(map[string]any)
+	if !ok {
+		return &configErr{tk, "disk_budget must be a map"}
+	}
+	cfg := &DiskBudgetConfig{}
+	for key, value := range values {
+		_, value = unwrapValue(value, &lt)
+		size, err := getStorageSize(value)
+		if err != nil || size <= 0 {
+			return &configErr{tk, "disk_budget byte values must be positive sizes"}
+		}
+		switch strings.ToLower(key) {
+		case "limit_bytes":
+			cfg.LimitBytes = uint64(size)
+		case "reserve_bytes":
+			cfg.ReserveBytes = uint64(size)
+		case "min_free_bytes":
+			cfg.MinFreeBytes = uint64(size)
+		default:
+			return &configErr{tk, "unknown disk_budget field " + key}
+		}
+	}
+	if err := validateDiskBudget(cfg); err != nil {
+		return &configErr{tk, err.Error()}
+	}
+	opts.JetStreamDiskBudget = cfg
+	return nil
 }

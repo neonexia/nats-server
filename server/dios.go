@@ -25,6 +25,7 @@ const maxConcurrentIOs = 8192
 // Used to limit number of disk IO calls in flight since they could all be blocking an OS thread.
 // https://github.com/nats-io/nats-server/issues/2742
 type diskIOSemaphore struct {
+	budget       atomic.Pointer[fileDiskBudget]
 	ch           chan struct{}
 	waiters      atomic.Int64
 	waits        atomic.Uint64

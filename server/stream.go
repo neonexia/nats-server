@@ -9574,6 +9574,12 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 	if err != nil {
 		return nil, err
 	}
+	// Snapshot extraction does not yet reserve its complete staging footprint.
+	// Remote checkpoint restore provides budgeted admission for tiered streams.
+	if s.diskIOSemaphore().budget.Load() != nil {
+		return nil, errors.New("native snapshot restore is unavailable with disk_budget; use remote checkpoint restore")
+	}
+
 	js := jsa.js
 	if js == nil {
 		return nil, NewJSNotEnabledForAccountError()
