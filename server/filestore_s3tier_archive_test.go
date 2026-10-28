@@ -32,7 +32,7 @@ func archiveTestRequest(t *testing.T, nc *nats.Conn, operation string) JSApiStre
 	return response
 }
 
-func archiveTestServer(t *testing.T, store S3TierObjectStore) (*Server, Options, *nats.Conn, nats.JetStreamContext) {
+func archiveTestServer(t *testing.T, store S3TierObjectStore, timeout ...time.Duration) (*Server, Options, *nats.Conn, nats.JetStreamContext) {
 	t.Helper()
 	opts := DefaultTestOptions
 	opts.Port, opts.JetStream, opts.StoreDir = -1, true, t.TempDir()
@@ -40,6 +40,9 @@ func archiveTestServer(t *testing.T, store S3TierObjectStore) (*Server, Options,
 		Store: store, Prefix: "test/archive", BlockSize: 16 * 1024,
 		LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29, RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
 	}}
+	if len(timeout) > 0 {
+		opts.JetStreamS3Tiers["$G/ARCHIVE"].Timeout = timeout[0]
+	}
 	s := RunServer(&opts)
 	t.Cleanup(s.Shutdown)
 	nc := clientConnectToServer(t, s)

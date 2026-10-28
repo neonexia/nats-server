@@ -1450,6 +1450,9 @@ func TestFileStoreS3TierRejectsWritesWhenOffloadCannotRelievePressure(t *testing
 	store.mu.Lock()
 	store.failPut = false
 	store.mu.Unlock()
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatalf("background offload after recovery: %v", err)
+	}
 	if _, _, err := fs.StoreMsg("events", nil, []byte("recovered"), 0); err != nil {
 		t.Fatalf("write after object store recovery: %v", err)
 	}
@@ -1546,6 +1549,7 @@ func TestFileStoreS3TierGarbageSkipsPayloadReferencedByDescriptor(t *testing.T) 
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/gc-referenced")
 	defer fs.Stop()
 	fs.tier.stop()
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
 		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
 			t.Fatal(err)
@@ -1647,6 +1651,12 @@ func TestFileStoreS3TierStatsTrackPhysicalTierActivity(t *testing.T) {
 	before := fs.S3TierStats()
 	if before == nil || before.RemoteBlocks == 0 || before.RemoteBytes == 0 || before.Evictions == 0 || before.Uploads == 0 {
 		t.Fatalf("stats after offload: %#v", before)
+	}
+	for _, kind := range []string{"payload", "descriptor", "manifest"} {
+		io := before.ImmutableIO[kind]
+		if io.PutCalls == 0 || io.VerifyCalls == 0 || io.PutBytes == 0 || io.VerifyBytes == 0 || io.PutSeconds <= 0 || io.VerifySeconds <= 0 || io.Errors != 0 {
+			t.Fatalf("missing successful IO telemetry for %s: %+v", kind, io)
+		}
 	}
 	if _, err := fs.LoadMsg(1, nil); err != nil {
 		t.Fatal(err)
@@ -1923,10 +1933,43 @@ func TestJetStreamS3TierNativePullConsumer(t *testing.T) {
 	}
 }
 
-func TestFileStoreS3TierCompatibleEndpoint(t *testing.T) {
+// testS3TierCompatibleStore preserves the local RustFS defaults while allowing
+// the same protocol tests to use an existing AWS bucket and refreshable role.
+func testS3TierCompatibleStore(t *testing.T) *S3TierMinIOStore {
+	t.Helper()
 	endpoint := os.Getenv("TEST_S3_TIER_ENDPOINT")
 	if endpoint == "" {
 		t.Skip("set TEST_S3_TIER_ENDPOINT to an S3-compatible endpoint")
+	}
+	provider := os.Getenv("TEST_S3_TIER_PROVIDER")
+	if provider == "iam" || provider == "env" {
+		bucket, region := os.Getenv("TEST_S3_TIER_BUCKET"), os.Getenv("TEST_S3_TIER_REGION")
+		if bucket == "" || region == "" {
+			t.Fatal("AWS integration requires TEST_S3_TIER_BUCKET and TEST_S3_TIER_REGION")
+		}
+		credentialConfig := "provider: iam"
+		if provider == "env" {
+			credentialConfig = `provider: env
+				access_key_env: "TEST_S3_TIER_ACCESS_KEY"
+				secret_key_env: "TEST_S3_TIER_SECRET_KEY"
+				session_token_env: "TEST_S3_TIER_SESSION_TOKEN"`
+		}
+		config := createConfFile(t, []byte(fmt.Sprintf(`jetstream { s3_tier {
+			endpoint: %q
+			bucket: %q
+			region: %q
+			tls: true
+			prefix: "integration"
+			credentials { %s }
+		} }`, endpoint, bucket, region, credentialConfig)))
+		opts, err := ProcessConfigFile(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return opts.jetStreamS3Tier.store.(*S3TierMinIOStore)
+	}
+	if provider != "" {
+		t.Fatalf("unsupported TEST_S3_TIER_PROVIDER %q", provider)
 	}
 	store, err := NewS3TierMinIOStore(endpoint, "testaccess", "testsecret123", "tier-test", false)
 	if err != nil {
@@ -1937,11 +1980,63 @@ func TestFileStoreS3TierCompatibleEndpoint(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), fmt.Sprintf("integration/%d", time.Now().UnixNano()))
-	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
+	return store
+}
+
+func TestJetStreamS3TierImmutableCompatibleEndpoint(t *testing.T) {
+	store := testS3TierCompatibleStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	key := fmt.Sprintf("integration/immutable/%d/payload", time.Now().UnixNano())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := store.Delete(ctx, key); err != nil {
+			t.Errorf("cleanup object: %v", err)
 		}
+	})
+	if created, err := store.PutIfAbsent(ctx, key, []byte("original")); err != nil || !created {
+		t.Fatalf("first write = (%v, %v)", created, err)
+	}
+	if created, err := store.PutIfAbsent(ctx, key, []byte("replacement")); err != nil || created {
+		t.Fatalf("conditional write = (%v, %v)", created, err)
+	}
+	if data, err := store.Get(ctx, key); err != nil || string(data) != "original" {
+		t.Fatalf("read original = (%q, %v)", data, err)
+	}
+	if keys, err := store.List(ctx, key); err != nil || len(keys) != 1 || keys[0] != key {
+		t.Fatalf("list original = (%v, %v)", keys, err)
+	}
+	if err := store.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if keys, err := store.List(ctx, key); err != nil || len(keys) != 0 {
+		t.Fatalf("list deleted = (%v, %v)", keys, err)
+	}
+	if _, err := store.Get(ctx, key); minio.ToErrorResponse(err).Code != "NoSuchKey" {
+		t.Fatalf("get deleted error = %v", err)
+	}
+}
+
+func TestFileStoreS3TierCompatibleEndpoint(t *testing.T) {
+	store := testS3TierCompatibleStore(t)
+	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), fmt.Sprintf("integration/%d", time.Now().UnixNano()))
+	// A real remote store can outlast the bounded local-capacity wait. Retry
+	// only rejected writes and require contiguous sequences to detect duplicates.
+	deadline := time.Now().Add(time.Minute)
+	for i := 0; i < 100; {
+		seq, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0)
+		if errors.Is(err, errS3TierLocalCapacity) && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			t.Fatalf("store message %d: %v", i+1, err)
+		}
+		if seq != uint64(i+1) {
+			t.Fatalf("stored sequence = %d, want %d", seq, i+1)
+		}
+		i++
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -1955,7 +2050,7 @@ func TestFileStoreS3TierCompatibleEndpoint(t *testing.T) {
 	if err := fs.Stop(); err != nil {
 		t.Fatal(err)
 	}
-	fs, err = newFileStore(fcfg, cfg)
+	fs, err := newFileStore(fcfg, cfg)
 	if err != nil {
 		t.Fatalf("S3 restart: %v", err)
 	}
@@ -1966,19 +2061,7 @@ func TestFileStoreS3TierCompatibleEndpoint(t *testing.T) {
 }
 
 func TestFileStoreS3TierGarbageCompatibleEndpoint(t *testing.T) {
-	endpoint := os.Getenv("TEST_S3_TIER_ENDPOINT")
-	if endpoint == "" {
-		t.Skip("set TEST_S3_TIER_ENDPOINT to an S3-compatible endpoint")
-	}
-	store, err := NewS3TierMinIOStore(endpoint, "testaccess", "testsecret123", "tier-test", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.client.MakeBucket(context.Background(), store.bucket, minio.MakeBucketOptions{}); err != nil {
-		if exists, existsErr := store.client.BucketExists(context.Background(), store.bucket); existsErr != nil || !exists {
-			t.Fatal(err)
-		}
-	}
+	store := testS3TierCompatibleStore(t)
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), fmt.Sprintf("integration/gc/%d", time.Now().UnixNano()))
 	defer fs.Stop()
 	key := strings.Trim(fs.tier.cfg.Prefix, "/") + "/blocks/0000000001-orphan.blk"
@@ -2105,19 +2188,7 @@ func TestFileStoreS3TierRepairsStaleStateFromDescriptors(t *testing.T) {
 // the separate compatibility gate for request signing, immutable writes,
 // listing, and cold restoration over the network.
 func TestJetStreamS3TierRemoteRestoreCompatibleEndpoint(t *testing.T) {
-	endpoint := os.Getenv("TEST_S3_TIER_ENDPOINT")
-	if endpoint == "" {
-		t.Skip("set TEST_S3_TIER_ENDPOINT to an S3-compatible endpoint")
-	}
-	store, err := NewS3TierMinIOStore(endpoint, "testaccess", "testsecret123", "tier-test", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.client.MakeBucket(context.Background(), store.bucket, minio.MakeBucketOptions{}); err != nil {
-		if exists, existsErr := store.client.BucketExists(context.Background(), store.bucket); existsErr != nil || !exists {
-			t.Fatal(err)
-		}
-	}
+	store := testS3TierCompatibleStore(t)
 	prefix := fmt.Sprintf("integration/remote-restore/%d", time.Now().UnixNano())
 	newOptions := func(dir string) Options {
 		opts := DefaultTestOptions
@@ -2416,5 +2487,188 @@ func TestJetStreamS3TierPlannedMoveEmptyChannel(t *testing.T) {
 	}
 	if err := messages[0].AckSync(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFileStoreS3TierCapacityDoesNotWaitForUploadLock(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/bounded-capacity")
+	defer fs.Stop()
+	fs.tier.stop()
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 32*1024, 16*1024
+	// Model a remote pass stalled in network I/O while holding its batch lock.
+	fs.tier.runMu.Lock()
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := fs.StoreMsg("events", nil, []byte("must-not-store"), 0)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		fs.tier.runMu.Unlock()
+		if !errors.Is(err, errS3TierLocalCapacity) {
+			t.Fatalf("publish = %v, want transient capacity error", err)
+		}
+	case <-time.After(time.Second):
+		fs.tier.runMu.Unlock()
+		<-result
+		t.Fatal("publish waited for the remote upload lock")
+	}
+	if state := fs.State(); state.Msgs != 100 {
+		t.Fatalf("rejected publish changed stored message count: %d", state.Msgs)
+	}
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	if seq, _, err := fs.StoreMsg("events", nil, []byte("recovered"), 0); err != nil || seq != 101 {
+		t.Fatalf("publish after reclamation = (%d, %v)", seq, err)
+	}
+}
+
+type failOnePayloadStore struct {
+	*testS3BlockStore
+	failMu sync.Mutex
+	fail   bool
+}
+
+func (s *failOnePayloadStore) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+	s.failMu.Lock()
+	fail := s.fail && strings.HasSuffix(key, ".blk")
+	if fail {
+		s.fail = false
+	}
+	s.failMu.Unlock()
+	if fail {
+		return false, errors.New("injected batch payload failure")
+	}
+	return s.testS3BlockStore.PutIfAbsent(ctx, key, data)
+}
+
+func TestFileStoreS3TierDrainRecoversPartialParallelBatch(t *testing.T) {
+	store := &failOnePayloadStore{testS3BlockStore: &testS3BlockStore{objects: make(map[string][]byte)}, fail: true}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/partial-batch")
+	defer fs.Stop()
+	fs.tier.stop()
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
+	for i := 0; i < 100; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := fs.DrainS3Tier(); err == nil {
+		t.Fatal("drain accepted a partial batch")
+	}
+	if stats := fs.S3TierStats(); stats.CheckpointSeq != 0 || stats.GCPending == 0 {
+		t.Fatalf("partial drain lost pending payloads or checkpointed: %+v", stats)
+	}
+	if _, err := fs.DrainS3Tier(); err != nil {
+		t.Fatalf("retry partial drain: %v", err)
+	}
+	if stats := fs.S3TierStats(); stats.CheckpointSeq != 100 || stats.GCPending != 0 || stats.BacklogBlocks != 0 {
+		t.Fatalf("completed drain: %+v", stats)
+	}
+	for seq := uint64(1); seq <= 100; seq++ {
+		if msg, err := fs.LoadMsg(seq, nil); err != nil || string(msg.msg) != strings.Repeat("x", 1000) {
+			t.Fatalf("message %d after retry: %v", seq, err)
+		}
+	}
+}
+
+func TestFileStoreS3TierReclaimsBeforeHardCapacityLimit(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/reclamation-headroom")
+	defer fs.Stop()
+	fs.tier.stop()
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 64*1024, 32*1024
+	for i := 0; i < 50; i++ {
+		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := fs.S3TierStats()
+	if before.LocalBytes >= before.HighWatermark {
+		t.Fatalf("fixture already exceeded hard limit: %+v", before)
+	}
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	if after := fs.S3TierStats(); after.LocalBytes > after.LowWatermark || after.Evictions == 0 {
+		t.Fatalf("no headroom before hard limit: %+v", after)
+	}
+	if msg, err := fs.LoadMsg(1, nil); err != nil || string(msg.msg) != strings.Repeat("x", 1000) {
+		t.Fatalf("reclaimed message: %v", err)
+	}
+}
+
+type boundedUploadStore struct {
+	*testS3BlockStore
+	gateMu       sync.Mutex
+	active, peak int
+	entered      chan struct{}
+	release      chan struct{}
+}
+
+func (s *boundedUploadStore) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+	if strings.HasSuffix(key, ".blk") {
+		s.gateMu.Lock()
+		s.active++
+		if s.active > s.peak {
+			s.peak = s.active
+		}
+		s.gateMu.Unlock()
+		s.entered <- struct{}{}
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+		}
+		s.gateMu.Lock()
+		s.active--
+		s.gateMu.Unlock()
+	}
+	return s.testS3BlockStore.PutIfAbsent(ctx, key, data)
+}
+
+func TestFileStoreS3TierBoundsUploadsAcrossStreams(t *testing.T) {
+	store := &boundedUploadStore{testS3BlockStore: &testS3BlockStore{objects: make(map[string][]byte)}, entered: make(chan struct{}, 128), release: make(chan struct{})}
+	results := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		fs, _, _ := testTieredFileStore(t, store, t.TempDir(), fmt.Sprintf("test/upload-cap/%d", i))
+		defer fs.Stop()
+		fs.tier.stop()
+		fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
+		for j := 0; j < 100; j++ {
+			if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		go func() { _, err := fs.DrainS3Tier(); results <- err }()
+	}
+	for i := 0; i < 16; i++ {
+		select {
+		case <-store.entered:
+		case <-time.After(time.Second):
+			t.Error("upload workers failed to reach the expected concurrency")
+			i = 16
+		}
+	}
+	// Give other streams an opportunity to contend for the process-wide slots.
+	time.Sleep(20 * time.Millisecond)
+	store.gateMu.Lock()
+	peak := store.peak
+	store.gateMu.Unlock()
+	close(store.release)
+	for i := 0; i < 8; i++ {
+		if err := <-results; err != nil {
+			t.Errorf("drain stream: %v", err)
+		}
+	}
+	if peak != 16 {
+		t.Fatalf("simultaneous payload writes = %d, want bounded concurrency 16", peak)
 	}
 }

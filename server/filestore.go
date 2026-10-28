@@ -5377,7 +5377,7 @@ func (fs *fileStore) genEncryptionKeysForBlock(mb *msgBlock) error {
 // Stores a raw message with expected sequence number and timestamp.
 // Lock should be held.
 func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, ttl int64, discardNewCheck bool) (err error) {
-	if fs.tier != nil && fs.dios.budget.Load() != nil {
+	if fs.tier != nil {
 		if err := fs.tier.ensureProjectedLocalCapacity(fileStoreMsgSize(subj, hdr, msg)); err != nil {
 			return err
 		}
@@ -7863,6 +7863,9 @@ func (mb *msgBlock) writeMsgRecord(rl, seq uint64, subj string, mhdr, msg []byte
 // filestore lock will be held.
 // mb lock should be held.
 func (mb *msgBlock) writeMsgRecordLocked(rl, seq uint64, subj string, mhdr, msg []byte, ts int64, flush, kick bool) (rerr error) {
+	if tier := mb.fs.tier; tier != nil {
+		tier.accountResidentAppend(mb.index, addSaturate(mb.rbytes, rl))
+	}
 	if budget := mb.fs.dios.budget.Load(); budget != nil {
 		rollback, err := budget.reserveGrowth(mb.mfn, addSaturate(mb.rbytes, rl), false)
 		if err != nil {

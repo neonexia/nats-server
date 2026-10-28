@@ -32,14 +32,137 @@ type s3TierArchive struct {
 	Checkpoint  s3TierCheckpoint `json:"checkpoint"`
 }
 
+// JSApiStreamArchiveRemoteRequest opts into resumable, non-blocking observation.
+// The default remains the original synchronous archive contract.
+type JSApiStreamArchiveRemoteRequest struct {
+	OperationID string `json:"operation_id"`
+	Async       bool   `json:"async,omitempty"`
+	StatusOnly  bool   `json:"status_only,omitempty"`
+}
+
 type JSApiStreamArchiveRemoteResponse struct {
 	ApiResponse
 	Success        bool   `json:"success"`
+	OperationID    string `json:"operation_id,omitempty"`
+	State          string `json:"state,omitempty"`
 	ArchiveKey     string `json:"archive_key,omitempty"`
 	CoveredThrough uint64 `json:"covered_through"`
 }
 
 const JSApiStreamArchiveRemoteResponseType = "io.nats.jetstream.api.v1.stream_archive_remote_response"
+
+// One active operation per account matches archiveMu serialization. A process-
+// wide bound prevents API callers from creating an unbounded set of workers.
+var s3TierArchiveAsyncGate = make(chan struct{}, 16)
+
+type s3TierArchiveTask struct {
+	stream, operation string
+	running           bool
+	err               error
+}
+
+func (s *Server) archiveStreamAsync(acc *Account, name string, req JSApiStreamArchiveRemoteRequest, resp *JSApiStreamArchiveRemoteResponse) error {
+	resp.OperationID = req.OperationID
+	if !isValidAssetName(name) || !validS3TierRemoteRestoreOperationID(req.OperationID) {
+		return errors.New("archive requires a valid stream and operation_id")
+	}
+	_, jsa, err := acc.checkForJetStream()
+	if err != nil {
+		return err
+	}
+	jsa.archiveTaskMu.Lock()
+	defer jsa.archiveTaskMu.Unlock()
+	task := jsa.archiveTask
+	if task != nil && task.stream == name && task.running {
+		if task.operation != req.OperationID {
+			return errors.New("archive operation_id conflicts with the current stream operation")
+		}
+		resp.State = "running"
+		return nil
+	}
+
+	// A receipt fences the name before cleanup completes. After restart, only
+	// absent stream files and no live stream establish completed local cleanup.
+	marker := jsa.archiveTombstoneFile(name)
+	if data, readErr := os.ReadFile(marker); readErr == nil {
+		var archive s3TierArchive
+		if json.Unmarshal(data, &archive) != nil || !validS3TierArchive(&archive, acc.Name, name, req.OperationID) {
+			return errors.New("local archive receipt conflicts with stream identity or operation")
+		}
+		_, statErr := os.Stat(filepath.Join(jsa.storeDir, streamsDir, name))
+		mset, _ := acc.lookupStream(name)
+		if os.IsNotExist(statErr) && mset == nil {
+			// Preserve the same durability check used by synchronous receipt recovery.
+			if canFsyncDirectories {
+				if err := syncDir(filepath.Dir(marker)); err != nil {
+					return err
+				}
+				if err := syncDir(jsa.storeDir); err != nil {
+					return err
+				}
+				if err := syncDir(filepath.Join(jsa.storeDir, streamsDir)); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			}
+			resp.Success, resp.State, resp.ArchiveKey, resp.CoveredThrough = true, "archived", archive.ArchiveKey, archive.Checkpoint.CoveredThrough
+			return nil
+		}
+		if statErr != nil && !os.IsNotExist(statErr) {
+			return statErr
+		}
+	} else if !os.IsNotExist(readErr) {
+		return readErr
+	}
+	// A synchronous retry may have completed an earlier failed async task.
+	// Durable receipt recovery above takes precedence over transient failure state.
+	if task != nil && task.stream == name {
+		if task.operation != req.OperationID {
+			return errors.New("archive operation_id conflicts with the current stream operation")
+		}
+		if req.StatusOnly && task.err != nil {
+			resp.State = "failed"
+			return task.err
+		}
+	}
+	if req.StatusOnly {
+		resp.State = "not_started"
+		return nil
+	}
+	if task != nil && task.running {
+		resp.State = "busy"
+		return nil
+	}
+	if s.shutdown.Load() {
+		return errors.New("server is shutting down")
+	}
+	select {
+	case s3TierArchiveAsyncGate <- struct{}{}:
+	default:
+		resp.State = "busy"
+		return nil
+	}
+	task = &s3TierArchiveTask{stream: name, operation: req.OperationID, running: true}
+	jsa.archiveTask = task
+	if !s.startGoRoutine(func() {
+		defer s.grWG.Done()
+		defer func() { <-s3TierArchiveAsyncGate }()
+		archive, archiveErr := s.archiveStream(acc, name, req.OperationID)
+		jsa.archiveTaskMu.Lock()
+		task.err, task.running = archiveErr, false
+		jsa.archiveTaskMu.Unlock()
+		if archiveErr != nil {
+			s.Warnf("S3 tier archive for stream %q failed: %v", name, archiveErr)
+		} else {
+			s.Noticef("S3 tier archive %s released local stream %q through sequence %d", req.OperationID, name, archive.Checkpoint.CoveredThrough)
+		}
+	}) {
+		<-s3TierArchiveAsyncGate
+		jsa.archiveTask = nil
+		return errors.New("server is shutting down")
+	}
+	resp.State = "running"
+	return nil
+}
 
 func (jsa *jsAccount) archiveTombstoneFile(stream string) string {
 	return filepath.Join(jsa.storeDir, "__remote_archives__", stream+".json")
@@ -57,6 +180,9 @@ func validS3TierArchive(a *s3TierArchive, account, stream, operation string) boo
 func (t *fileS3Tier) archiveRemote(account, operation string, config StreamConfig) (*s3TierArchive, error) {
 	if _, err := t.fs.DrainS3Tier(); err != nil {
 		return nil, err
+	}
+	if t.fs.fcfg.srv != nil && t.fs.fcfg.srv.shutdown.Load() {
+		return nil, ErrStoreClosed
 	}
 	t.mu.Lock()
 	if t.checkpoint == nil {
@@ -104,6 +230,11 @@ func (t *fileS3Tier) archiveRemote(account, operation string, config StreamConfi
 		return nil, errors.New("remote archive checkpoint verification failed")
 	}
 	for _, block := range manifest.Blocks {
+		// Shutdown starts before quitCh closes. Stop between bounded object calls
+		// so a background archive cannot hold shutdown through the entire history.
+		if t.fs.fcfg.srv != nil && t.fs.fcfg.srv.shutdown.Load() {
+			return nil, ErrStoreClosed
+		}
 		ctx, cancel := t.ctx()
 		data, err := t.cfg.Store.Get(ctx, block.Key)
 		cancel()
@@ -138,6 +269,9 @@ func (s *Server) archiveStream(acc *Account, name, operation string) (*s3TierArc
 	}
 	jsa.archiveMu.Lock()
 	defer jsa.archiveMu.Unlock()
+	if s.shutdown.Load() {
+		return nil, ErrStoreClosed
+	}
 	marker := jsa.archiveTombstoneFile(name)
 	var archive *s3TierArchive
 	if data, err := os.ReadFile(marker); err == nil {
@@ -243,8 +377,13 @@ func (s *Server) jsStreamArchiveRemoteRequest(_ *subscription, c *client, _ *Acc
 	} else if s.JetStreamIsClustered() {
 		resp.Error = NewJSStreamGeneralError(errS3TierClusteredDrain, Unless(errS3TierClusteredDrain))
 	} else {
-		var req JSApiStreamRemoteRestoreRequest
-		if err = json.Unmarshal(msg, &req); err == nil {
+		var req JSApiStreamArchiveRemoteRequest
+		if err = json.Unmarshal(msg, &req); err == nil && req.StatusOnly && !req.Async {
+			err = errors.New("status_only requires async")
+		}
+		if err == nil && req.Async {
+			err = s.archiveStreamAsync(acc, streamNameFromSubject(subject), req, &resp)
+		} else if err == nil {
 			var archive *s3TierArchive
 			archive, err = s.archiveStream(acc, streamNameFromSubject(subject), req.OperationID)
 			if err == nil {

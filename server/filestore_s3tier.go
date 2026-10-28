@@ -62,7 +62,13 @@ const (
 	defaultS3TierRetryMin   = time.Second
 	defaultS3TierRetryMax   = 30 * time.Second
 	defaultS3TierGCGrace    = 24 * time.Hour
+	s3TierUploadBatchSize   = 4
+	s3TierUploadSlots       = 16
 )
+
+// Bound speculative payload buffers across all streams, not only within each
+// batch. A busy stream must not multiply staging memory by the channel count.
+var s3TierUploads = make(chan struct{}, s3TierUploadSlots)
 
 // S3TierServerConfig is parsed from the server's JetStream configuration.
 // Nodus supplies one opaque Prefix per NATS server instance; stream paths are
@@ -95,7 +101,26 @@ type S3TierServerConfig struct {
 
 // S3TierStats reports physical tier activity separately from the stream's
 // logical retention counters. Values are exposed in the JetStream monitor view.
+// S3TierIOStats counts logical object-store calls, including the time spent in
+// SDK retries. SlowDown counts errors returned to us, not hidden SDK retries.
+type S3TierIOStats struct {
+	PutCalls      uint64  `json:"put_calls"`
+	PutBytes      uint64  `json:"put_bytes"`
+	PutSeconds    float64 `json:"put_seconds"`
+	VerifyCalls   uint64  `json:"verify_calls"`
+	VerifyBytes   uint64  `json:"verify_bytes"`
+	VerifySeconds float64 `json:"verify_seconds"`
+	Errors        uint64  `json:"errors"`
+	SlowDown      uint64  `json:"slow_down"`
+}
+
+type s3TierIOCounters struct {
+	puts, putBytes, putNanos, gets, getBytes, getNanos, errors, slowDown atomic.Uint64
+}
+
 type S3TierStats struct {
+	ImmutableIO map[string]S3TierIOStats `json:"immutable_io"`
+
 	LocalBytes         uint64 `json:"local_bytes"`
 	RemoteBytes        uint64 `json:"remote_bytes"`
 	RemoteBlocks       uint64 `json:"remote_blocks"`
@@ -161,30 +186,47 @@ func (c *S3TierServerConfig) resolveStore() error {
 	if c == nil || c.Endpoint == "" || c.Bucket == "" || strings.Trim(c.Prefix, "/") == "" {
 		return errors.New("S3 tier requires endpoint, bucket, and opaque prefix")
 	}
-	if c.CredentialProvider != "env" && c.CredentialProvider != "environment" {
-		return fmt.Errorf("S3 tier credential provider %q is not supported", c.CredentialProvider)
+	creds, err := c.credentials()
+	if err != nil {
+		return err
 	}
-	if c.AccessKeyEnv == "" || c.SecretKeyEnv == "" {
-		return errors.New("S3 tier environment credential provider requires access_key_env and secret_key_env")
-	}
-	accessKey, ok := os.LookupEnv(c.AccessKeyEnv)
-	if !ok || accessKey == "" {
-		return fmt.Errorf("S3 tier access key environment variable %q is not set", c.AccessKeyEnv)
-	}
-	secretKey, ok := os.LookupEnv(c.SecretKeyEnv)
-	if !ok || secretKey == "" {
-		return fmt.Errorf("S3 tier secret key environment variable %q is not set", c.SecretKeyEnv)
-	}
-	var sessionToken string
-	if c.SessionTokenEnv != "" {
-		sessionToken = os.Getenv(c.SessionTokenEnv)
-	}
-	store, err := newS3TierMinIOStore(c.Endpoint, accessKey, secretKey, sessionToken, c.Region, c.Bucket, c.TLS)
+	store, err := newS3TierStore(c.Endpoint, c.Region, c.Bucket, c.TLS, creds)
 	if err != nil {
 		return err
 	}
 	c.store = store
 	return nil
+}
+
+func (c *S3TierServerConfig) credentials() (*credentials.Credentials, error) {
+	switch c.CredentialProvider {
+	case "iam":
+		if c.AccessKeyEnv != "" || c.SecretKeyEnv != "" || c.SessionTokenEnv != "" {
+			return nil, errors.New("S3 tier IAM credential provider does not accept environment credential references")
+		}
+		// Keep the provider on the client so expiring role credentials refresh
+		// before signing requests. Resolving once would strand long-lived stores.
+		return credentials.New(&credentials.IAM{Region: c.Region}), nil
+	case "env", "environment":
+		if c.AccessKeyEnv == "" || c.SecretKeyEnv == "" {
+			return nil, errors.New("S3 tier environment credential provider requires access_key_env and secret_key_env")
+		}
+		accessKey := os.Getenv(c.AccessKeyEnv)
+		if accessKey == "" {
+			return nil, fmt.Errorf("S3 tier access key environment variable %q is not set", c.AccessKeyEnv)
+		}
+		secretKey := os.Getenv(c.SecretKeyEnv)
+		if secretKey == "" {
+			return nil, fmt.Errorf("S3 tier secret key environment variable %q is not set", c.SecretKeyEnv)
+		}
+		var sessionToken string
+		if c.SessionTokenEnv != "" {
+			sessionToken = os.Getenv(c.SessionTokenEnv)
+		}
+		return credentials.NewStaticV4(accessKey, secretKey, sessionToken), nil
+	default:
+		return nil, fmt.Errorf("S3 tier credential provider %q is not supported", c.CredentialProvider)
+	}
 }
 
 func (c *S3TierServerConfig) streamConfig(account, stream string) *S3TierConfig {
@@ -223,11 +265,15 @@ func NewS3TierMinIOStore(endpoint, accessKey, secretKey, bucket string, secure b
 }
 
 func newS3TierMinIOStore(endpoint, accessKey, secretKey, sessionToken, region, bucket string, secure bool) (*S3TierMinIOStore, error) {
+	return newS3TierStore(endpoint, region, bucket, secure, credentials.NewStaticV4(accessKey, secretKey, sessionToken))
+}
+
+func newS3TierStore(endpoint, region, bucket string, secure bool, creds *credentials.Credentials) (*S3TierMinIOStore, error) {
 	if endpoint == "" || bucket == "" {
 		return nil, fmt.Errorf("S3 tier endpoint and bucket are required")
 	}
 	client, err := minio.New(endpoint, &minio.Options{
-		Creds: credentials.NewStaticV4(accessKey, secretKey, sessionToken), Secure: secure, Region: region,
+		Creds: creds, Secure: secure, Region: region,
 	})
 	if err != nil {
 		return nil, err
@@ -408,6 +454,13 @@ type S3TierGCResult struct {
 }
 
 type fileS3Tier struct {
+	// Append-only payload residency includes accepted buffered growth. Separate
+	// from logical stream bytes, which also include remotely retained blocks.
+	// Lock order is stream/block -> resident -> disk budget; a resident holder
+	// never acquires stream/block locks. Accounting is rebuilt before exposure.
+	residentMu       sync.Mutex
+	resident         map[uint32]uint64
+	residentBytes    uint64
 	budgetRetryAt    time.Time
 	budgetRetryDelay time.Duration
 	budgetRetryErr   error
@@ -433,6 +486,7 @@ type fileS3Tier struct {
 }
 
 type s3TierCounters struct {
+	immutableIO                                                                                               [4]s3TierIOCounters
 	fetches, fetchErrors, cacheHits, uploads, uploadErrors, evictions, capacityErrors, retryAttempts          atomic.Uint64
 	gcDeletes, gcErrors                                                                                       atomic.Uint64
 	restorePrepares, restoreCheckpoints, restoreAborts, restoreActivations, restoreRetirements, restoreErrors atomic.Uint64
@@ -459,7 +513,7 @@ func newFileS3Tier(fs *fileStore, cfg S3TierConfig) *fileS3Tier {
 	if cfg.RemoteHighBytes == 0 {
 		cfg.RemoteHighBytes, cfg.RemoteLowBytes = cfg.LocalHighBytes, cfg.LocalLowBytes
 	}
-	return &fileS3Tier{fs: fs, cfg: cfg, desc: make(map[uint32]s3BlockDescriptor), fetch: make(map[uint32]*s3TierFetch), wake: make(chan struct{}, 1), quit: make(chan struct{})}
+	return &fileS3Tier{fs: fs, cfg: cfg, resident: make(map[uint32]uint64), desc: make(map[uint32]s3BlockDescriptor), fetch: make(map[uint32]*s3TierFetch), wake: make(chan struct{}, 1), quit: make(chan struct{})}
 }
 
 func validateS3Tier(fcfg FileStoreConfig, cfg StreamConfig) error {
@@ -676,6 +730,24 @@ func (fs *fileStore) prepareS3Tier() error {
 		} else if !os.IsNotExist(err) {
 			return err
 		}
+	}
+	// Recover admission evidence before publishers or reclamation can run. No
+	// remote reads are required, and a measurement failure cannot imply zero.
+	blocks, err := filepath.Glob(filepath.Join(fs.fcfg.StoreDir, msgDir, "*.blk"))
+	if err != nil {
+		return err
+	}
+	for _, path := range blocks {
+		var index uint32
+		if _, err := fmt.Sscanf(filepath.Base(path), blkScan, &index); err != nil {
+			return err
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		t.resident[index] = uint64(info.Size())
+		t.residentBytes = addSaturate(t.residentBytes, uint64(info.Size()))
 	}
 	go t.loop()
 	return nil
@@ -1112,17 +1184,47 @@ func (t *fileS3Tier) checkpointRemoteRestore(operationID string, checkpoint *s3T
 }
 
 func (t *fileS3Tier) putImmutable(key string, data []byte) error {
+	kind := 3
+	switch {
+	case strings.Contains(key, "/blocks/"):
+		kind = 0
+	case strings.Contains(key, "/descriptors/"):
+		kind = 1
+	case strings.Contains(key, "/manifests/"):
+		kind = 2
+	}
+	stats := &t.stats.immutableIO[kind]
+	recordError := func(err error) {
+		stats.errors.Add(1)
+		if minio.ToErrorResponse(err).Code == "SlowDown" {
+			stats.slowDown.Add(1)
+		}
+	}
 	ctx, cancel := t.ctx()
+	started := time.Now()
+	stats.puts.Add(1)
+	stats.putBytes.Add(uint64(len(data)))
 	_, err := t.cfg.Store.PutIfAbsent(ctx, key, data)
+	stats.putNanos.Add(uint64(time.Since(started)))
 	cancel()
 	if err != nil {
+		recordError(err)
 		return err
 	}
 	ctx, cancel = t.ctx()
+	started = time.Now()
+	stats.gets.Add(1)
 	committed, err := t.cfg.Store.Get(ctx, key)
+	stats.getNanos.Add(uint64(time.Since(started)))
+	stats.getBytes.Add(uint64(len(committed)))
 	cancel()
-	if err != nil || !bytes.Equal(committed, data) {
+	if err != nil {
+		recordError(err)
 		return fmt.Errorf("S3 tier immutable object verification failed for %q: %w", key, err)
+	}
+	if !bytes.Equal(committed, data) {
+		stats.errors.Add(1)
+		return fmt.Errorf("S3 tier immutable object verification failed for %q: content mismatch", key)
 	}
 	return nil
 }
@@ -1404,26 +1506,40 @@ func (t *fileS3Tier) loop() {
 		ageC = ticker.C
 	}
 	var (
-		delay  time.Duration
-		timer  *time.Timer
-		retryC <-chan time.Time
+		delay     time.Duration
+		timer     *time.Timer
+		retryC    <-chan time.Time
+		scanTimer *time.Timer
+		scanC     <-chan time.Time
+		nextScan  time.Time
 	)
 	defer func() {
 		if timer != nil {
 			timer.Stop()
 		}
+		if scanTimer != nil {
+			scanTimer.Stop()
+		}
 	}()
 	for {
 		ageTick := false
+		wakeScan := false
 		select {
 		case <-t.wake:
-			if timer != nil && !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
+			reclaimAt := t.cfg.LocalHighBytes - min(t.cfg.LocalHighBytes-t.cfg.LocalLowBytes, uint64(t.fs.fcfg.BlockSize))
+			if !t.localPressure.Load() && t.residentSize() <= reclaimAt && time.Now().Before(nextScan) {
+				// Coalesce normal publisher wakes, but keep a timer so the final
+				// write is processed even when no later publisher arrives.
+				if scanC == nil {
+					scanTimer = time.NewTimer(time.Until(nextScan))
+					scanC = scanTimer.C
 				}
+				continue
 			}
-			retryC = nil
+			wakeScan = true
+		case <-scanC:
+			scanC = nil
+			wakeScan = true
 		case <-ageC:
 			ageTick = true
 			t.mu.Lock()
@@ -1437,6 +1553,16 @@ func (t *fileS3Tier) loop() {
 		case <-t.quit:
 			return
 		}
+		if wakeScan {
+			if timer != nil {
+				timer.Stop()
+			}
+			retryC = nil
+		}
+		if !ageTick && scanC != nil {
+			scanTimer.Stop()
+			scanC = nil
+		}
 		var err error
 		if t.localPressure.Swap(false) {
 			err = t.reclaimDiskBudgetBlock()
@@ -1449,6 +1575,9 @@ func (t *fileS3Tier) loop() {
 		}
 		if err == nil && !ageTick {
 			err = t.evictToBudget()
+			// Explicit drains and pressure work remain outside this normal-wake
+			// rate limit. Neither age-flush ticks nor retry timers are delayed.
+			nextScan = time.Now().Add(100 * time.Millisecond)
 		}
 		if err != nil {
 			t.fs.warn("S3 tier eviction failed: %v", err)
@@ -1545,6 +1674,25 @@ func (t *fileS3Tier) fetchBlock(d s3BlockDescriptor, path string) error {
 		}
 		defer budget.completed(path+".tmp", path)
 	}
+	// An in-flight cold fetch will become resident. Publish admission must see
+	// that claim before network I/O, even while no local payload exists yet.
+	t.residentMu.Lock()
+	previous := t.resident[d.Index]
+	reserved := max(previous, uint64(d.Size))
+	t.setResidentLocked(d.Index, reserved)
+	t.residentMu.Unlock()
+	installAttempted := false
+	defer func() {
+		if !installAttempted {
+			t.residentMu.Lock()
+			// Fetches are single-flight for an immutable block. Concurrent unlink
+			// can clear this charge; rollback must not resurrect removed bytes.
+			if reserved != 0 && t.resident[d.Index] == reserved {
+				t.setResidentLocked(d.Index, previous)
+			}
+			t.residentMu.Unlock()
+		}
+	}()
 
 	ctx, cancel := t.ctx()
 	data, err := t.cfg.Store.Get(ctx, d.Key)
@@ -1555,7 +1703,14 @@ func (t *fileS3Tier) fetchBlock(d s3BlockDescriptor, path string) error {
 	if len(data) != d.Size || checksumS3Block(data) != d.SHA256 {
 		return fmt.Errorf("%w: block %d remote checksum mismatch", errS3TierUnavailable, d.Index)
 	}
-	if err := writeAtomically(t.fs.dios, path, data, defaultFilePerms, true); err != nil {
+	// Serialize payload creation with unlink/accounting. A failed atomic write
+	// may have reached rename, so retain its conservative charge until recovery.
+	t.residentMu.Lock()
+	installAttempted = true
+	t.setResidentLocked(d.Index, max(t.resident[d.Index], uint64(len(data))))
+	err = writeAtomically(t.fs.dios, path, data, defaultFilePerms, true)
+	t.residentMu.Unlock()
+	if err != nil {
 		return err
 	}
 	// A cold read adds a local payload just like a publish does. Schedule the
@@ -1575,6 +1730,9 @@ func (t *fileS3Tier) evictToBudget() error {
 		return ErrStoreClosed
 	}
 	fs := t.fs
+	// Begin reclamation one block before the hard publish fence. This gives
+	// background I/O headroom at steady rates without increasing the budget.
+	reclaimAt := t.cfg.LocalHighBytes - min(t.cfg.LocalHighBytes-t.cfg.LocalLowBytes, uint64(fs.fcfg.BlockSize))
 	fs.mu.RLock()
 	var used, uncovered uint64
 	t.mu.Lock()
@@ -1607,26 +1765,40 @@ func (t *fileS3Tier) evictToBudget() error {
 	fs.mu.RUnlock()
 	// Remote coverage is governed by its own threshold and does not evict a
 	// local copy. This is how a live channel can remain fast after S3 upload.
-	if uncovered > t.cfg.RemoteHighBytes {
+	// Under local pressure, reclaim covered blocks first (or upload and
+	// reclaim one block at a time below). Covering the entire backlog before
+	// freeing any disk unnecessarily holds publishers at the capacity fence.
+	if uncovered > t.cfg.RemoteHighBytes && used <= reclaimAt {
+		var pending []*msgBlock
 		for _, candidate := range candidates {
-			if uncovered <= t.cfg.RemoteLowBytes {
+			if !candidate.remote {
+				pending = append(pending, candidate.mb)
+			}
+		}
+		for len(pending) > 0 && uncovered > t.cfg.RemoteLowBytes {
+			// Publishers can consume headroom while a bounded remote batch is
+			// in flight. Yield between batches so newly covered payloads can be
+			// reclaimed before another batch extends the admission outage.
+			if t.residentSize() > reclaimAt {
 				break
 			}
-			if candidate.remote {
-				continue
-			}
-			size, err := t.evictBlock(candidate.mb, false)
+			n := min(s3TierUploadBatchSize, len(pending))
+			sizes, err := t.coverBlocks(pending[:n])
 			if err != nil {
 				return err
 			}
-			if size > uncovered {
-				uncovered = 0
-			} else {
-				uncovered -= size
+			for _, size := range sizes {
+				uncovered -= min(uncovered, size)
 			}
+			pending = pending[n:]
 		}
 	}
-	if used <= t.cfg.LocalHighBytes {
+	// Also handle pressure that arrived during the final coverage batch. The
+	// physical scan excludes pending cold fetches from reclaimable disk bytes.
+	if t.residentSize() > reclaimAt {
+		used = t.localBytes()
+	}
+	if used <= reclaimAt {
 		return nil
 	}
 	// Coverage may have changed above. Refresh the candidate view before
@@ -1661,6 +1833,11 @@ func (t *fileS3Tier) evictToBudget() error {
 		} else {
 			used -= size
 		}
+	}
+	// Resume normal remote coverage after pressure reclamation even if the
+	// publisher stopped and no new write arrives to wake the worker.
+	if used <= reclaimAt && uncovered > t.cfg.RemoteHighBytes {
+		t.kick()
 	}
 	return nil
 }
@@ -1716,17 +1893,22 @@ func (t *fileS3Tier) drain(coveredThrough uint64) (uint64, error) {
 		return 0, nil
 	}
 	var drained uint64
+	var pending []*msgBlock
 	for _, mb := range candidates {
-		t.mu.Lock()
-		_, covered := t.desc[mb.index]
-		t.mu.Unlock()
-		if covered {
-			continue
+		if !t.hasDescriptor(mb.index) {
+			pending = append(pending, mb)
 		}
-		if _, err := t.evictBlock(mb, false); err != nil {
+	}
+	for len(pending) > 0 {
+		if fs.fcfg.srv != nil && fs.fcfg.srv.shutdown.Load() {
+			return drained, ErrStoreClosed
+		}
+		n := min(s3TierUploadBatchSize, len(pending))
+		if _, err := t.coverBlocks(pending[:n]); err != nil {
 			return drained, err
 		}
-		drained++
+		drained += uint64(n)
+		pending = pending[n:]
 	}
 	// Always write a fresh v2 manifest before a new checkpoint. It binds every
 	// descriptor, including any pre-foundation descriptors, to this record.
@@ -1739,23 +1921,56 @@ func (t *fileS3Tier) drain(coveredThrough uint64) (uint64, error) {
 	return drained, nil
 }
 
-// ensureLocalCapacity is invoked before accepting another publish after a
-// previous asynchronous eviction could not reclaim enough local space. It
-// deliberately returns a transient error instead of poisoning fs.werr: S3 can
-// recover and a later publish may then make progress.
+// ensureLocalCapacity rejects writes promptly while background offload makes
+// room. Waiting for runMu here would put unbounded batches of remote I/O on the
+// publish path, leaving clients unsure whether a timed-out publish was stored.
+// This transient error must not poison fs.werr: retries can succeed after drain.
 func (t *fileS3Tier) ensureLocalCapacity() error {
-	if t.localBytes() <= t.cfg.LocalHighBytes {
+	if t.residentSize() <= t.cfg.LocalHighBytes {
 		return nil
 	}
-	if err := t.evictToBudget(); err != nil {
-		t.stats.capacityErrors.Add(1)
-		return fmt.Errorf("%w: %v", errS3TierLocalCapacity, err)
+	t.kick()
+	// Allow a short background reclamation window for small local budgets,
+	// without waiting for an upload batch or acquiring its serialization lock.
+	deadline := time.NewTimer(100 * time.Millisecond)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			if t.residentSize() <= t.cfg.LocalHighBytes {
+				return nil
+			}
+		case <-deadline.C:
+			t.stats.capacityErrors.Add(1)
+			return errS3TierLocalCapacity
+		}
 	}
-	if t.localBytes() > t.cfg.LocalHighBytes {
-		t.stats.capacityErrors.Add(1)
-		return errS3TierLocalCapacity
+}
+
+func (t *fileS3Tier) residentSize() uint64 {
+	t.residentMu.Lock()
+	defer t.residentMu.Unlock()
+	return t.residentBytes
+}
+
+func (t *fileS3Tier) setResidentLocked(index uint32, size uint64) {
+	t.residentBytes -= t.resident[index]
+	t.residentBytes = addSaturate(t.residentBytes, size)
+	if size == 0 {
+		delete(t.resident, index)
+	} else {
+		t.resident[index] = size
 	}
-	return nil
+}
+
+// Called under the block lock before appending. Keep a conservative charge even
+// if writing fails: a partial write must not grant admission to another writer.
+func (t *fileS3Tier) accountResidentAppend(index uint32, size uint64) {
+	t.residentMu.Lock()
+	t.setResidentLocked(index, max(t.resident[index], size))
+	t.residentMu.Unlock()
 }
 
 func (t *fileS3Tier) localBytes() uint64 {
@@ -1784,9 +1999,15 @@ func (t *fileS3Tier) statsSnapshot() S3TierStats {
 	}
 	gcPending := uint64(len(t.gc))
 	t.mu.Unlock()
+	ioStats := make(map[string]S3TierIOStats, 4)
+	for i, name := range []string{"payload", "descriptor", "manifest", "lifecycle"} {
+		c := &t.stats.immutableIO[i]
+		ioStats[name] = S3TierIOStats{PutCalls: c.puts.Load(), PutBytes: c.putBytes.Load(), PutSeconds: float64(c.putNanos.Load()) / float64(time.Second), VerifyCalls: c.gets.Load(), VerifyBytes: c.getBytes.Load(), VerifySeconds: float64(c.getNanos.Load()) / float64(time.Second), Errors: c.errors.Load(), SlowDown: c.slowDown.Load()}
+	}
 	backlogBytes, backlogBlocks := t.backlog()
 	return S3TierStats{
-		LocalBytes: t.localBytes(), RemoteBytes: remoteBytes, RemoteBlocks: remoteBlocks,
+		ImmutableIO: ioStats,
+		LocalBytes:  t.localBytes(), RemoteBytes: remoteBytes, RemoteBlocks: remoteBlocks,
 		Fetches: t.stats.fetches.Load(), FetchErrors: t.stats.fetchErrors.Load(), CacheHits: t.stats.cacheHits.Load(),
 		Uploads: t.stats.uploads.Load(), UploadErrors: t.stats.uploadErrors.Load(), Evictions: t.stats.evictions.Load(),
 		CapacityErrors: t.stats.capacityErrors.Load(), HighWatermark: t.cfg.LocalHighBytes, LowWatermark: t.cfg.LocalLowBytes,
@@ -1823,13 +2044,108 @@ func (t *fileS3Tier) backlog() (uint64, uint64) {
 	return bytes, blocks
 }
 
+func (t *fileS3Tier) acquireUploadSlot() (func(), error) {
+	ctx, cancel := t.ctx()
+	defer cancel()
+	select {
+	case s3TierUploads <- struct{}{}:
+		return func() { <-s3TierUploads }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("S3 tier upload capacity: %w", ctx.Err())
+	}
+}
+
+// coverBlocks overlaps only immutable payload I/O, at most four blocks per
+// batch. Descriptor/manifest/local commits remain in block order; a failure
+// stops subsequent commits. Journal speculative payloads before remote writes
+// so a partial batch can be retried or garbage-collected after a crash.
+// Callers hold runMu and pass distinct, sealed blocks.
+func (t *fileS3Tier) coverBlocks(blocks []*msgBlock) ([]uint64, error) {
+	if len(blocks) > s3TierUploadBatchSize {
+		return nil, errors.New("S3 tier upload batch exceeds four blocks")
+	}
+	if _, err := t.ensureStreamRecord(); err != nil {
+		t.stats.uploadErrors.Add(1)
+		return nil, err
+	}
+	t.mu.Lock()
+	backoff, retryErr := time.Now().Before(t.budgetRetryAt), t.budgetRetryErr
+	t.mu.Unlock()
+	if backoff {
+		return nil, retryErr
+	}
+	hashes := make([]string, len(blocks))
+	errs := make([]error, len(blocks))
+	var workers sync.WaitGroup
+	for i, mb := range blocks {
+		workers.Add(1)
+		go func(i int, mb *msgBlock) {
+			defer workers.Done()
+			release, err := t.acquireUploadSlot()
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer release()
+			fs := t.fs
+			fs.mu.RLock()
+			mb.mu.RLock()
+			if fs.closing || fs.lmb == mb || mb.pendingWriteSizeLocked() != 0 {
+				mb.mu.RUnlock()
+				fs.mu.RUnlock()
+				return
+			}
+			data, err := os.ReadFile(mb.mfn)
+			mb.mu.RUnlock()
+			fs.mu.RUnlock()
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			hash := checksumS3Block(data)
+			key := fmt.Sprintf("%s/blocks/%010d-%s.blk", strings.Trim(t.cfg.Prefix, "/"), mb.index, hash)
+			if err = t.recordGCCandidate(key); err != nil {
+				errs[i] = err
+				return
+			}
+			t.stats.uploads.Add(1)
+			if err = t.putImmutable(key, data); err != nil {
+				t.stats.uploadErrors.Add(1)
+				errs[i] = err
+				return
+			}
+			hashes[i] = hash
+		}(i, mb)
+	}
+	workers.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	sizes := make([]uint64, len(blocks))
+	for i, mb := range blocks {
+		var err error
+		sizes[i], err = t.evictBlock(mb, false, hashes[i])
+		if err != nil {
+			return sizes, err
+		}
+	}
+	return sizes, nil
+}
+
 // evictBlock uploads a sealed block when needed. reclaim determines whether
 // the local copy is removed after remote coverage is durably recorded.
-func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool) (size uint64, resultErr error) {
+func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool, verified ...string) (size uint64, resultErr error) {
 	fs := t.fs
 	t.mu.Lock()
 	_, alreadyRemote := t.desc[mb.index]
 	t.mu.Unlock()
+	if !alreadyRemote {
+		release, err := t.acquireUploadSlot()
+		if err != nil {
+			return 0, err
+		}
+		defer release()
+	}
 	fs.mu.RLock()
 	mb.mu.RLock()
 	if fs.closing || fs.lmb == mb || mb.pendingWriteSizeLocked() != 0 {
@@ -1891,10 +2207,15 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool) (size uint64, result
 	d.Incarnation = record.Incarnation
 	d.SHA256 = checksumS3Block(data)
 	d.Key = fmt.Sprintf("%s/blocks/%010d-%s.blk", strings.Trim(t.cfg.Prefix, "/"), d.Index, d.SHA256)
-	t.stats.uploads.Add(1)
-	if err := t.putImmutable(d.Key, data); err != nil {
-		t.stats.uploadErrors.Add(1)
-		return 0, err
+	// A batch may have already verified this exact content-addressed payload.
+	// Re-read and hash the local block before trusting that result; metadata
+	// publication and local reclamation retain their existing ordering.
+	if len(verified) == 0 || verified[0] != d.SHA256 {
+		t.stats.uploads.Add(1)
+		if err := t.putImmutable(d.Key, data); err != nil {
+			t.stats.uploadErrors.Add(1)
+			return 0, err
+		}
 	}
 	buf, err := json.Marshal(d)
 	if err != nil {
@@ -1974,9 +2295,15 @@ func (t *fileS3Tier) removeLocalBlock(mb *msgBlock, expected []byte, descriptor 
 		return 0, fmt.Errorf("S3 tier block %d has no durable descriptor", mb.index)
 	}
 	mb.closeFDsLockedNoCheck()
+	t.residentMu.Lock()
 	if err := os.Remove(mb.mfn); err != nil {
+		t.residentMu.Unlock()
 		return 0, err
 	}
+	// Only successful unlink releases residency; remote coverage and durable
+	// descriptor publication have already completed above.
+	t.setResidentLocked(mb.index, 0)
+	t.residentMu.Unlock()
 	fs.dios.budget.Load().completed(mb.mfn)
 	if canFsyncDirectories {
 		if err := syncDir(filepath.Dir(mb.mfn)); err != nil {
@@ -2074,6 +2401,15 @@ func (t *fileS3Tier) reclaimDiskBudgetBlock() error {
 func (t *fileS3Tier) ensureProjectedLocalCapacity(additional uint64) error {
 	b := t.fs.dios.budget.Load()
 	if b == nil {
+		// The waiting precheck runs outside fs.mu. Recheck current occupancy
+		// here so concurrent publishers cannot all spend the same headroom.
+		// Preserve the legacy one-record watermark overshoot; never wait while
+		// holding the stream lock that reclamation needs.
+		if t.residentSize() > t.cfg.LocalHighBytes {
+			t.kick()
+			t.stats.capacityErrors.Add(1)
+			return errS3TierLocalCapacity
+		}
 		return nil
 	}
 	b.mu.Lock()

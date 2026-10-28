@@ -4,7 +4,7 @@ Status: experimental fork implementation, 2026-10-04. The first runnable slice i
 
 ## What the spike actually implements
 
-- `FileStoreConfig.S3Tier` enables an append-only block tier. A server-wide `jetstream.s3_tier` block supplies one Nodus instance's endpoint, bucket, region, TLS, opaque prefix, physical watermarks, retry bounds, and environment-reference credentials. NATS derives safe per-stream paths beneath the opaque prefix. `Options.JetStreamS3Tiers` remains only as a programmatic test seam. Credentials are not persisted in stream metadata.
+- `FileStoreConfig.S3Tier` enables an append-only block tier. A server-wide `jetstream.s3_tier` block supplies one Nodus instance's endpoint, bucket, region, TLS, opaque prefix, physical watermarks, retry bounds, and environment-reference or refreshable IAM role credentials. NATS derives safe per-stream paths beneath the opaque prefix. `Options.JetStreamS3Tiers` remains only as a programmatic test seam. Credentials are not persisted in stream metadata.
 - The S3 adapter uses `minio-go/v7` against an S3-compatible endpoint. Object keys contain a caller-supplied unique stream prefix, block index, and SHA-256 digest. `RemoteHighBytes` and `RemoteLowBytes` control when sealed blocks gain S3 coverage. `LocalHighBytes` and `LocalLowBytes` separately control when covered local payloads are reclaimed. The active block stays local.
 - Each eviction uploads block bytes, reads them back and compares bytes, uploads a JSON descriptor, reads it back and compares bytes, writes and verifies an immutable manifest generation, syncs local descriptor and manifest sidecars, then unlinks the local `.blk` under file-store and block locks. The S3 prefix is opaque to NATS; Nodus supplies its stream identity and a separate history service can later interpret its own namespace.
 - Restart uses local descriptor sidecars to retain remote-only block metadata without listing or reading S3. A cold reader selects one missing block, releases the normal file-store and block locks, coalesces a fetch for that block, verifies it, and retries the native read. Missing tier configuration still fails startup. Corrupt or unavailable remote data fails the read rather than being treated as missing history.
@@ -58,9 +58,76 @@ rejected rather than silently receiving different retention behavior.
 
 The configuration is validated at server start and is non-reloadable. Reload
 semantics need separate ownership, connection-draining, and stream-identity
-rules. The current provider is `env`, which resolves named environment
-variables at startup. Raw access keys, secret keys, and session tokens do not
-belong in the file or persisted stream metadata.
+rules. The `env` provider resolves named environment variables at startup;
+those values do not refresh. Raw access keys, secret keys, and session tokens
+do not belong in the file or persisted stream metadata.
+
+### AWS S3 with an instance role
+
+For a general-purpose S3 bucket in the same AWS region as the EC2 instances,
+replace the endpoint and credentials above with:
+
+```text
+endpoint: "s3.us-east-2.amazonaws.com"
+bucket: "your-test-bucket"
+region: "us-east-2"
+tls: true
+credentials { provider: "iam" }
+```
+
+Attach an instance profile granting access to the intended bucket/prefix. The
+`iam` provider delegates credential retrieval, caching and expiry refresh to
+minio-go; without container or web-identity environment configuration it uses
+EC2 instance metadata. Require IMDSv2 on the instance. Containers must be able
+to reach metadata (including an appropriate metadata response hop limit).
+Do not copy workstation credentials onto instances. IAM mode rejects static
+credential-reference fields and does not fall back to static access-key variables.
+Credentials are retrieved lazily on requests, so valid configuration alone does
+not prove that the role or bucket permissions work. Metadata failures surface as
+object-store errors and use the existing tier retry/backlog behavior.
+
+The SDK IAM provider also recognizes its documented ECS/EKS/web-identity
+settings; these deployment modes require separate integration qualification.
+The adapter makes signed S3 HTTP requests directly; it does not mount S3 or use
+S3FS. Uploads use immutable conditional writes and readback verification. Reads
+currently materialize a complete block into memory before cold-cache installation,
+not an HTTP range stream delivered directly to consumers. Coverage runs in the
+background with per-stream serialization. Benchmark request count, memory,
+readback cost and cross-stream concurrency before changing those durability rules.
+
+Start AWS validation with standard S3. The dependency contains S3 Express support,
+but the fork's conditional-write, listing, restore and session behavior have not
+been qualified against directory buckets. GCS native authentication and APIs are
+not implemented; S3 interoperability alone is not a supported GCS deployment claim.
+
+### Real AWS compatibility gate
+
+On an EC2 instance with the test role and a dedicated existing bucket:
+
+```sh
+TEST_S3_TIER_PROVIDER=iam \
+TEST_S3_TIER_ENDPOINT=s3.us-east-2.amazonaws.com \
+TEST_S3_TIER_REGION=us-east-2 \
+TEST_S3_TIER_BUCKET=your-test-bucket \
+go test ./server -run 'Test.*S3Tier.*CompatibleEndpoint' -count=1 -v -timeout 15m
+```
+
+This runs conditional-write/read/list/delete compatibility, local eviction and
+restart, garbage collection, and remote restore against real S3. It requires
+ListBucket and object Get/Put/Delete permissions. Tests use unique `integration/`
+prefixes; the restore and eviction tests retain objects for diagnosis, so clean
+the dedicated bucket after preserving needed evidence. No bucket is created in
+IAM mode. To run the same tests from an authenticated workstation, explicitly
+set `TEST_S3_TIER_PROVIDER=env` and supply temporary credentials through
+`TEST_S3_TIER_ACCESS_KEY`, `TEST_S3_TIER_SECRET_KEY` and
+`TEST_S3_TIER_SESSION_TOKEN` in the test subprocess environment. This mode also
+requires bucket and region, uses TLS and never creates the bucket. Do not put
+credential values in scripts, config files, logs or shell command arguments;
+use a credential-exporting launcher that passes them directly in memory. These
+static test credentials do not refresh, so their lifetime must cover the run.
+EC2 validation should continue to use the refreshing IAM provider.
+Without `TEST_S3_TIER_ENDPOINT` these network tests skip; passing the
+local credential tests is not AWS compatibility evidence.
 
 ## Observed results
 
@@ -72,7 +139,7 @@ belong in the file or persisted stream metadata.
 
 The block, descriptor, and manifest protocol is feasible for a narrow append-only stream. Native consumer sequence continuity survives eviction and remote-only restart in the tested setup. Restart does not contact S3; it keeps the existing full-state sequence and subject metadata and marks descriptor-backed missing payloads as readable remotely.
 
-Remote coverage and local residency use separate watermark pairs. A node can therefore copy sealed blocks to S3 continuously while retaining a much larger SSD-backed local window for live channels. Local reclamation prefers hydrated or otherwise covered blocks by least-recent block access; a read reaches S3 only after that local payload was reclaimed. Failed coverage retries with exponential backoff bounded by `retry_min` and `retry_max`. At the next publish after an unsuccessful asynchronous eviction, the server attempts synchronously to reach the local budget and returns a transient local-capacity error if it cannot. `/jsz` stream detail exposes local and remote bytes, remote block count, sealed uncovered-block backlog, retry attempts, transfer and cache counters, capacity errors, and both watermark pairs.
+Remote coverage and local residency use separate watermark pairs. A node can therefore copy sealed blocks to S3 continuously while retaining a much larger SSD-backed local window for live channels. Local reclamation prefers hydrated or otherwise covered blocks by least-recent block access; a read reaches S3 only after that local payload was reclaimed. Failed coverage retries with exponential backoff bounded by `retry_min` and `retry_max`. Background reclamation starts one configured block before the local high watermark (never below the low watermark). A publish above the high watermark gives background reclamation a bounded 100 ms window, then returns a transient local-capacity error without waiting for the upload batch lock if space is still unavailable. `/jsz` stream detail exposes local and remote bytes, remote block count, sealed uncovered-block backlog, retry attempts, transfer and cache counters, capacity errors, and both watermark pairs.
 
 The remaining gaps are additional credential providers, bounded upload backlog policy, object garbage collection, remote stream deletion, replica support, encryption recovery, durable consumer and stream metadata backup, full fault injection at every crash point, and benchmarks. Read-path coverage is focused on direct gets and pull consumers; broad upstream coverage is still required. Do not enable this for production or for Nodus's current 64 MiB logical `MaxBytes` streams without those gates and a separate logical-retention decision.
 
@@ -211,6 +278,28 @@ under the stream prefix with the operation, account, stream incarnation,
 configuration, stream state, and message checkpoint. This receipt enables future
 history readers; it is not a consumer restore checkpoint.
 
+Callers may opt into asynchronous observation with
+`{"operation_id":"<same identity>","async":true}`. Add `"status_only":true` to
+observe without starting work. The response echoes `operation_id` and reports:
+
+| State | Meaning |
+| --- | --- |
+| `running` | The job is still executing; poll with the same identity. |
+| `busy` | No worker was admitted; retry later. |
+| `not_started` | No matching transient job or completed receipt is available; start/resume with the same identity. |
+| `failed` | The observed job failed; an API error gives the reason. Retry the same identity to resume. |
+| `archived` | Durable receipt and local cleanup are complete; `success` is true and archive fields are returned. |
+
+Pending responses have `success:false`. There is one active asynchronous job per
+account and at most 16 per process, without an unbounded queue. Duplicate starts
+for the same in-flight operation do not enqueue more work. Conflicting identities
+fail closed. Running/failed status is transient: restart or a later account job
+can replace it. Completed status is recovered from the durable receipt only when
+both the live stream and local stream directory are absent. A lost status is not
+proof of success; resume the same operation. Shutdown stops between drain batches
+and verification reads; an in-flight object request is bounded by its configured
+timeout. Omitting `async` preserves the existing synchronous API.
+
 Only after that receipt is verified does the server fsync a local tombstone at
 `<account store>/__remote_archives__/<stream>.json`. The tombstone is outside the
 stream directory and permanently reserves that local stream name. Cleanup waits
@@ -278,7 +367,7 @@ The file store needs a tier manager with an object-store interface. Use a real S
 ### Offload state machine
 
 1. A block becomes eligible only after the next block is active, pending writes are flushed and synced according to the stream's durability policy, and compression/rewrite tasks have completed. Keep the active block and a configurable recent reserve local.
-2. When local bytes exceed the high watermark, choose the oldest eligible local blocks until projected usage is below the low watermark. Coalesce concurrent work per block; bound background I/O so live writes are not starved.
+2. When local bytes reach the reclamation trigger one block before the high watermark, choose eligible local blocks until usage is below the low watermark. Coalesce concurrent work per block; bound background I/O so live writes are not starved.
 3. Upload a new immutable object key containing a generation or content digest. Verify object length and checksum by an independent read or equivalent strong checksum check. An upload alone does not make a block remote-readable.
 4. Commit an immutable remote descriptor with stream identity, block index, sequence bounds, object key/version, checksum, key-material reference, and format version. Commit an immutable manifest generation that includes the descriptor. The local synced descriptor and manifest sidecars speed restart. Commit ordering is **block bytes → verification → remote descriptor → remote manifest → local manifest and descriptor → local unlink**. A crash between steps leaves either a still-local block or an orphan remote object, never a local deletion with no committed remote reference.
 5. Reclaim the local payload only after the descriptor is durable and the block has no active readers or writers. Keep logical stream/account byte counters unchanged. Record separate local payload, local cache, remote retained, and transfer backlog metrics.
@@ -383,3 +472,63 @@ upload latency and outages can delay coverage. Timer checks are bounded between
 10ms and 1s. Age-driven uploads share exponential upload retry backoff even when
 aggregate disk admission is disabled. The explicit drain/checkpoint APIs remain
 the way to request and verify a completed remote boundary.
+
+### Publish behavior during local pressure
+
+When local residency exceeds its high watermark, a publish wakes background
+reclamation and waits at most a 100 ms reclamation window before returning the
+transient local-capacity error. This window excludes local filesystem work and
+scheduler delays; it does not acquire the uploader's batch lock or wait for S3
+network I/O. The rejected message is not stored. After background reclamation
+succeeds, publishers can retry. Capacity errors do not poison the file store.
+
+Pressure reclamation prioritizes covered local blocks, then uploads and reclaims
+uncovered blocks individually. It does not first upload the complete remote
+backlog. Normal remote coverage resumes afterward independently of residency.
+Immutable payload, descriptor, and manifest verification remains unchanged.
+
+### Bounded parallel payload coverage
+
+Normal remote coverage and drain stage up to four sealed payloads concurrently
+per stream. Each payload is journaled as a potential GC candidate before PUT and
+read-back verification. Descriptors, complete manifests, local descriptor files,
+and checkpoint publication retain their sequential commit order. On partial
+failure, the batch does not publish its remaining metadata; verified speculative
+payloads remain journaled for retry or existing GC. Retry re-reads and hashes each
+local block before reusing the verified payload. Local-pressure reclamation stays
+incremental so it can free disk without waiting for an entire backlog.
+
+Payload staging uses batches of at most four configured blocks per stream, plus
+verification buffers. A process-wide 16-operation gate bounds concurrent staging
+and uncovered-block commits across streams. Waiting for the gate respects the
+configured operation timeout; covered local reclamation does not acquire it. This does not remove full-manifest rewrite costs or change
+object paths. `immutable_io` reports cumulative logical PUT/verification calls,
+bytes, elapsed seconds, errors, and returned SlowDown errors by bounded object
+kind; SDK-internal HTTP retry counts are not represented.
+
+### Residency admission cost
+
+For tiered streams without an aggregate disk budget, publish admission reads a
+conservative in-memory total of local payload residency. It does not stat every
+historical block for each message. Startup seeds the total from local block files;
+append accounting includes buffered growth, verified cold hydration reserves its
+payload before network I/O, and successful unlink releases the charge only after
+remote coverage and descriptor durability. Failed cold fetches before installation
+roll back their reservation. Failed installation/append can retain a conservative
+charge rather than underestimate local occupancy. Retrying an append projects the
+block length rather than charging the same record repeatedly.
+
+Physical monitoring still scans files and remains separate from admission. This
+optimization does not turn the per-stream watermark into aggregate filesystem
+protection or change aggregate disk-budget reservations. External modifications to
+managed payload files are unsupported. The aggregate-budget projected per-stream
+check still scans in-memory entries; it is not claimed constant-time.
+
+Concurrent publishers recheck the watermark while holding the stream lock before
+appending. Failed hydration releases only an unchanged reservation, so it cannot
+restore a charge that a concurrent eviction has already released. Normal publish
+wakes coalesce for up to 100 ms, retaining a timer for the final pending wake;
+local pressure bypasses this delay. Age flush and retry timers remain independent.
+Remote coverage checks residency between bounded payload batches and yields to
+covered-block reclamation when pressure develops during a flush. This prevents a
+large background coverage pass from starving local reclamation.

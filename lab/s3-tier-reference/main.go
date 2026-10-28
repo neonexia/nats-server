@@ -181,6 +181,38 @@ func ensureBucket(ctx context.Context, client *minio.Client, bucket string, time
 	return fmt.Errorf("create bucket %q: %w", bucket, lastErr)
 }
 
+// The upstream client config does not expose the fork's opt-in field. Set it
+// explicitly so outage/recovery assertions actually exercise remote storage.
+func addRemoteStream(nc *nats.Conn, config *nats.StreamConfig) (bool, error) {
+	data, err := json.Marshal(struct {
+		*nats.StreamConfig
+		S3Tier bool `json:"s3_tier"`
+	}{config, true})
+	if err != nil {
+		return false, err
+	}
+	message, err := nc.Request("$JS.API.STREAM.CREATE."+config.Name, data, 10*time.Second)
+	if err != nil {
+		return false, err
+	}
+	var response struct {
+		Config struct {
+			S3Tier bool `json:"s3_tier"`
+		} `json:"config"`
+		Error *nats.APIError `json:"error"`
+	}
+	if err := json.Unmarshal(message.Data, &response); err != nil {
+		return false, err
+	}
+	if response.Error != nil {
+		return false, response.Error
+	}
+	if !response.Config.S3Tier {
+		return false, errors.New("reference stream did not enable remote storage")
+	}
+	return true, nil
+}
+
 func request(nc *nats.Conn, subject string, value any) (restoreResponse, error) {
 	var response restoreResponse
 	var data []byte
@@ -429,7 +461,7 @@ jetstream {
 	if err != nil {
 		panic(err)
 	}
-	if _, err := js.AddStream(&nats.StreamConfig{
+	if _, err := addRemoteStream(nc, &nats.StreamConfig{
 		Name: streamName, Subjects: []string{subject}, Storage: nats.FileStorage,
 		Retention: nats.LimitsPolicy, Discard: nats.DiscardNew,
 		DenyDelete: true, DenyPurge: true,
@@ -446,7 +478,7 @@ jetstream {
 	// exhausted, then resume draining after RustFS returns. Keep this separate
 	// from the handoff stream so its intentionally rejected publishes do not
 	// affect the recovery sequence assertions below.
-	if _, err := js.AddStream(&nats.StreamConfig{
+	if _, err := addRemoteStream(nc, &nats.StreamConfig{
 		Name: "PRESSURE", Subjects: []string{"pressure.raw"}, Storage: nats.FileStorage,
 		Retention: nats.LimitsPolicy, Discard: nats.DiscardNew,
 		DenyDelete: true, DenyPurge: true,
