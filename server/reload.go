@@ -1621,6 +1621,9 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 		jsStoreDirChanged   bool
 		jsLimitsUpdate      *jetStreamLimitsOption
 	)
+	if !reflect.DeepEqual(oldOpts.Placement, newOpts.Placement) {
+		return nil, fmt.Errorf("config reload not supported for placement")
+	}
 	if !reflect.DeepEqual(oldOpts.JetStreamDiskBudget, newOpts.JetStreamDiskBudget) {
 		return nil, fmt.Errorf("config reload not supported for JetStream disk_budget")
 	}

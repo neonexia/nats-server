@@ -2453,6 +2453,12 @@ func (c *client) processConnect(arg []byte) error {
 			return ErrAuthentication
 		}
 
+		if kind == CLIENT && !srv.placementAdmits(c) {
+			c.sendErr("Placement unavailable")
+			c.closeConnection(AuthenticationViolation)
+			return ErrConnectionClosed
+		}
+
 		// Check for Account designation, we used to have this as an optional feature for dynamic
 		// sandbox environments. Now its considered an error.
 		if accountNew || account != _EMPTY_ {

@@ -427,6 +427,8 @@ type Options struct {
 	Debug           bool   `json:"-"`
 	TraceVerbose    bool   `json:"-"`
 
+	Placement *PlacementConfig `json:"-"`
+
 	// TraceHeaders if true will only trace message headers, not the payload.
 	TraceHeaders               bool          `json:"-"`
 	NoLog                      bool          `json:"-"`
@@ -825,6 +827,10 @@ func (o *Options) Clone() *Options {
 	}
 	clone := &Options{}
 	*clone = *o
+	if o.Placement != nil {
+		placement := *o.Placement
+		clone.Placement = &placement
+	}
 	if o.Users != nil {
 		clone.Users = make([]*User, len(o.Users))
 		for i, user := range o.Users {
@@ -1165,6 +1171,13 @@ func (o *Options) processConfigFileLine(k string, v any, errors *[]error, warnin
 		}
 		o.Host = hp.host
 		o.Port = hp.port
+	case "placement":
+		config, err := parsePlacementConfig(v)
+		if err != nil {
+			*errors = append(*errors, &configErr{tk, err.Error()})
+			return
+		}
+		o.Placement = config
 	case "client_advertise":
 		o.ClientAdvertise = v.(string)
 	case "port":
