@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -313,4 +314,50 @@ func TestPlacementResetRejectsRetainedStreams(t *testing.T) {
 	}
 	placementRequest(t, s, "/reset", placementTestToken, PlacementBinding{BootID: status.BootID}, 202)
 	s.WaitForShutdown()
+}
+
+func TestPlacementConfigurationReload(t *testing.T) {
+	base := `port: -1
+ authorization { users: [{user: control, password: control-secret}, {user: alternate, password: alternate-secret}] }
+ `
+	placement := fmt.Sprintf(`placement { control_user: control, control_listen: "127.0.0.1:0", control_token: %q }`, placementTestToken)
+	for _, tc := range []struct{ name, initial, replacement string }{
+		{"unchanged disabled", "", ""},
+		{"unchanged enabled", placement, placement},
+		{"enable", "", placement},
+		{"disable", placement, ""},
+		{"control user", placement, strings.Replace(placement, "control_user: control", "control_user: alternate", 1)},
+		{"control address", placement, strings.Replace(placement, "127.0.0.1:0", "127.0.0.1:4229", 1)},
+		{"control token", placement, strings.Replace(placement, placementTestToken, "replacement-control-token", 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := createConfFile(t, []byte(base+tc.initial))
+			opts, err := ProcessConfigFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := RunServer(opts)
+			defer s.Shutdown()
+			before := s.PlacementStatus()
+			if err := os.WriteFile(path, []byte(base+tc.replacement), 0600); err != nil {
+				t.Fatal(err)
+			}
+			err = s.Reload()
+			if tc.initial == tc.replacement {
+				if err != nil {
+					t.Fatalf("unchanged configuration reload: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "config reload not supported for placement") {
+				t.Fatalf("changed placement reload error=%v", err)
+			}
+			after := s.PlacementStatus()
+			if after.BootID != before.BootID || after.Active != before.Active || after.Fenced != before.Fenced {
+				t.Fatalf("reload changed placement status: before=%+v after=%+v", before, after)
+			}
+			if tc.initial != "" {
+				placementRequest(t, s, "", placementTestToken, nil, 200)
+				placementRequest(t, s, "", "replacement-control-token", nil, 401)
+			}
+		})
+	}
 }
