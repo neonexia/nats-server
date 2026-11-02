@@ -108,7 +108,12 @@ func TestJetStreamS3TierArchiveRemovesOnlyRetiredFiles(t *testing.T) {
 			require_NoError(t, json.Unmarshal(store.objects[response.ArchiveKey], &receipt))
 			var manifest s3TierManifest
 			require_NoError(t, json.Unmarshal(store.objects[receipt.Checkpoint.ManifestKey], &manifest))
-			for _, block := range manifest.Blocks {
+			store.mu.Unlock()
+			reader := &fileS3Tier{cfg: S3TierConfig{Store: store, Prefix: receipt.Prefix, Timeout: time.Second}}
+			blocks, _, err := reader.loadManifestIndex(manifest)
+			require_NoError(t, err)
+			store.mu.Lock()
+			for _, block := range blocks {
 				if checksumS3Block(store.objects[block.Key]) != block.SHA256 {
 					t.Errorf("lost remote block %s", block.Key)
 				}
@@ -141,7 +146,7 @@ func TestJetStreamS3TierArchiveRemovesOnlyRetiredFiles(t *testing.T) {
 }
 
 func TestJetStreamS3TierArchiveFailurePreservesLocalData(t *testing.T) {
-	for _, failure := range []string{"object-store", "corrupt-block", "tombstone-directory"} {
+	for _, failure := range []string{"object-store", "corrupt-block", "missing-index-page", "corrupt-index-page", "tombstone-directory"} {
 		t.Run(failure, func(t *testing.T) {
 			store := &testS3BlockStore{objects: make(map[string][]byte)}
 			s, _, nc, js := archiveTestServer(t, store)
@@ -157,7 +162,7 @@ func TestJetStreamS3TierArchiveFailurePreservesLocalData(t *testing.T) {
 				store.failPut = true
 				store.mu.Unlock()
 			}
-			if failure == "corrupt-block" {
+			if failure == "corrupt-block" || strings.Contains(failure, "index-page") {
 				msg, err := nc.Request(fmt.Sprintf(JSApiStreamDrainRemoteT, "ARCHIVE"), nil, 5*time.Second)
 				require_NoError(t, err)
 				var r JSApiStreamDrainRemoteResponse
@@ -167,15 +172,20 @@ func TestJetStreamS3TierArchiveFailurePreservesLocalData(t *testing.T) {
 				}
 				store.mu.Lock()
 				for key, data := range store.objects {
-					if strings.HasSuffix(key, ".blk") {
+					if (failure == "corrupt-block" && strings.HasSuffix(key, ".blk")) ||
+						(strings.Contains(failure, "index-page") && strings.Contains(key, "/index/pages/")) {
 						savedKey, saved = key, append([]byte(nil), data...)
-						store.objects[key] = []byte("corrupt")
+						if failure == "missing-index-page" {
+							delete(store.objects, key)
+						} else {
+							store.objects[key] = []byte("corrupt")
+						}
 						break
 					}
 				}
 				store.mu.Unlock()
 				if savedKey == "" {
-					t.Fatal("no uploaded payload")
+					t.Fatal("no uploaded object to fault")
 				}
 			}
 			parent := filepath.Dir(jsa.archiveTombstoneFile("ARCHIVE"))

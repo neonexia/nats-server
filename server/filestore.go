@@ -489,6 +489,7 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 	defer func() {
 		if err != nil {
 			if fs != nil && fs.tier != nil {
+				fs.tier.remoteCancel()
 				fs.tier.stop()
 			}
 			ats.Unregister()
@@ -13063,6 +13064,8 @@ func (fs *fileStore) stop(delete, writeState bool) error {
 	// so we don't end up with this function running more than once.
 	fs.closing = true
 	if fs.tier != nil {
+		// Cancel remote waits before joining workers outside the store lock.
+		fs.tier.remoteCancel()
 		fs.tier.stop()
 	}
 
@@ -13109,6 +13112,17 @@ func (fs *fileStore) stop(delete, writeState bool) error {
 	// syncMu before fs.mu.
 	fs.syncMu.Lock()
 	fs.syncMu.Unlock() //nolint:staticcheck // Only waiting for in-flight syncBlocks.
+
+	if fs.tier != nil {
+		// Remote commits and cold fetches write local files outside fs.mu.
+		// A caller may reopen or remove this directory immediately after Stop;
+		// join these writes before returning. Waiting while holding fs.mu would
+		// deadlock workers that need it to finish their publication checks.
+		fs.tier.runMu.Lock()
+		fs.tier.runMu.Unlock() //nolint:staticcheck // Only waiting for in-flight tier commits.
+		fs.tier.hydrateMu.Lock()
+		fs.tier.hydrateMu.Unlock()
+	}
 
 	fs.cmu.Lock()
 	var _cfs [256]ConsumerStore

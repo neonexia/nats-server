@@ -667,7 +667,7 @@ func TestFileStoreS3TierDrainCreatesImmutableCheckpoint(t *testing.T) {
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if storedRecord.Incarnation != manifest.Incarnation || manifest.Version != 2 || storedCheckpoint.ManifestGeneration != manifest.Generation {
+	if storedRecord.Incarnation != manifest.Incarnation || manifest.Version != 3 || storedCheckpoint.ManifestGeneration != manifest.Generation {
 		t.Fatalf("record=%+v checkpoint=%+v manifest=%+v", storedRecord, storedCheckpoint, manifest)
 	}
 	if drained, err := fs.DrainS3Tier(); err != nil || drained != 0 {
@@ -1619,17 +1619,25 @@ func TestFileStoreS3TierWritesImmutableManifest(t *testing.T) {
 	var latest s3TierManifest
 	for key, data := range store.objects {
 		if strings.Contains(key, "/manifests/") {
-			if err := json.Unmarshal(data, &latest); err != nil {
+			var candidate s3TierManifest
+			if err := json.Unmarshal(data, &candidate); err != nil {
 				store.mu.Unlock()
 				t.Fatal(err)
+			}
+			if candidate.Generation > latest.Generation {
+				latest = candidate
 			}
 		}
 	}
 	store.mu.Unlock()
-	if latest.Version != 2 || latest.Incarnation == "" || latest.Generation == 0 || len(latest.Blocks) == 0 {
+	blocks, _, err := fs.tier.loadManifestIndex(latest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Version != 3 || latest.Incarnation == "" || latest.Generation == 0 || len(blocks) == 0 {
 		t.Fatalf("invalid manifest: %#v", latest)
 	}
-	for _, d := range latest.Blocks {
+	for _, d := range blocks {
 		if !validS3BlockDescriptor(d) {
 			t.Fatalf("invalid manifest descriptor: %#v", d)
 		}

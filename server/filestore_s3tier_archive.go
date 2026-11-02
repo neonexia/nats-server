@@ -216,8 +216,12 @@ func (t *fileS3Tier) archiveRemote(account, operation string, config StreamConfi
 		return nil, err
 	}
 	var manifest s3TierManifest
-	if checksumS3Block(data) != checkpoint.ManifestSHA256 || json.Unmarshal(data, &manifest) != nil || manifest.Incarnation != checkpoint.Incarnation || manifest.Prefix != prefix {
+	if checksumS3Block(data) != checkpoint.ManifestSHA256 || json.Unmarshal(data, &manifest) != nil || manifest.Version != 3 || manifest.Generation != checkpoint.ManifestGeneration || manifest.Incarnation != checkpoint.Incarnation || manifest.Prefix != prefix {
 		return nil, errors.New("remote archive manifest verification failed")
+	}
+	blocks, _, err := t.loadManifestIndex(manifest)
+	if err != nil {
+		return nil, fmt.Errorf("remote archive index verification failed: %w", err)
 	}
 	ctx, cancel = t.ctx()
 	data, err = t.cfg.Store.Get(ctx, t.checkpointKey(state.LastSeq))
@@ -229,7 +233,7 @@ func (t *fileS3Tier) archiveRemote(account, operation string, config StreamConfi
 	if json.Unmarshal(data, &remoteCheckpoint) != nil || remoteCheckpoint != checkpoint {
 		return nil, errors.New("remote archive checkpoint verification failed")
 	}
-	for _, block := range manifest.Blocks {
+	for _, block := range blocks {
 		// Shutdown starts before quitCh closes. Stop between bounded object calls
 		// so a background archive cannot hold shutdown through the entire history.
 		if t.fs.fcfg.srv != nil && t.fs.fcfg.srv.shutdown.Load() {
@@ -329,13 +333,12 @@ func (s *Server) archiveStream(acc *Account, name, operation string) (*s3TierArc
 				return nil, err
 			}
 		}
-		// Uploads and cold reads write sidecars/payloads outside the store
-		// lock. Quiesce them before stopping so they cannot recreate files
-		// after cleanup. Queued operations observe the closed store.
-		fs.tier.runMu.Lock()
-		defer fs.tier.runMu.Unlock()
+		// Archive lets admitted cold reads finish before stop cancels remote
+		// requests. Do not hold this barrier across stop, which joins readers.
 		fs.tier.hydrateMu.Lock()
-		defer fs.tier.hydrateMu.Unlock()
+		fs.tier.hydrateMu.Unlock()
+		// File-store stop quiesces uploads and cold reads before returning,
+		// so cleanup cannot race a late sidecar, index-page or payload write.
 		if err = mset.stop(false, false); err != nil {
 			return nil, err
 		}

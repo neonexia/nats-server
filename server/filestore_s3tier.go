@@ -338,7 +338,7 @@ type s3BlockDescriptor struct {
 	Incarnation string `json:"incarnation,omitempty"`
 }
 
-// s3TierManifest is an immutable snapshot of committed block descriptors.
+// s3TierManifest pins an immutable, paged index of committed block descriptors.
 // Readers can discover a stream's remote index without inspecting payloads;
 // each new generation receives a new object key so a partial update can never
 // replace an earlier complete view.
@@ -347,7 +347,9 @@ type s3TierManifest struct {
 	Generation  uint64              `json:"generation"`
 	Prefix      string              `json:"prefix"`
 	Incarnation string              `json:"incarnation,omitempty"`
-	Blocks      []s3BlockDescriptor `json:"blocks"`
+	Root        *s3IndexRef         `json:"root,omitempty"`
+	Count       uint64              `json:"count"`
+	Blocks      []s3BlockDescriptor `json:"-"`
 }
 
 // s3TierStreamRecord separates a stream incarnation from the caller supplied
@@ -466,6 +468,8 @@ type fileS3Tier struct {
 	budgetRetryErr   error
 	localPressure    atomic.Bool
 	fs               *fileStore
+	remoteCtx        context.Context
+	remoteCancel     context.CancelFunc
 	cfg              S3TierConfig
 	mu               sync.Mutex   // Protects descriptors and in-flight fetches.
 	runMu            sync.Mutex   // One eviction pass at a time.
@@ -474,6 +478,9 @@ type fileS3Tier struct {
 	fetch            map[uint32]*s3TierFetch
 	gen              uint64
 	manifestSHA256   string
+	indexRoot        *s3IndexRef
+	indexStaging     map[string][]byte // runMu: only final batch paths become durable pages.
+	coverageBatch    *[]s3TierCoverage // runMu: payloads remain local until the batch root commits.
 	record           *s3TierStreamRecord
 	checkpoint       *s3TierCheckpoint
 	restore          *s3TierRemoteRestoreState
@@ -513,7 +520,8 @@ func newFileS3Tier(fs *fileStore, cfg S3TierConfig) *fileS3Tier {
 	if cfg.RemoteHighBytes == 0 {
 		cfg.RemoteHighBytes, cfg.RemoteLowBytes = cfg.LocalHighBytes, cfg.LocalLowBytes
 	}
-	return &fileS3Tier{fs: fs, cfg: cfg, resident: make(map[uint32]uint64), desc: make(map[uint32]s3BlockDescriptor), fetch: make(map[uint32]*s3TierFetch), wake: make(chan struct{}, 1), quit: make(chan struct{})}
+	remoteCtx, remoteCancel := context.WithCancel(context.Background())
+	return &fileS3Tier{fs: fs, remoteCtx: remoteCtx, remoteCancel: remoteCancel, cfg: cfg, resident: make(map[uint32]uint64), desc: make(map[uint32]s3BlockDescriptor), fetch: make(map[uint32]*s3TierFetch), wake: make(chan struct{}, 1), quit: make(chan struct{})}
 }
 
 func validateS3Tier(fcfg FileStoreConfig, cfg StreamConfig) error {
@@ -545,7 +553,11 @@ func validateS3Tier(fcfg FileStoreConfig, cfg StreamConfig) error {
 }
 
 func (t *fileS3Tier) ctx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), t.cfg.Timeout)
+	parent := t.remoteCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, t.cfg.Timeout)
 }
 
 func (t *fileS3Tier) descriptorKey(index uint32) string {
@@ -641,11 +653,19 @@ func (fs *fileStore) prepareS3Tier() error {
 	}
 	if buf, err := os.ReadFile(t.manifestFile()); err == nil {
 		var manifest s3TierManifest
-		if err := json.Unmarshal(buf, &manifest); err != nil || (manifest.Version != 1 && manifest.Version != 2) || manifest.Generation == 0 || manifest.Prefix != strings.Trim(t.cfg.Prefix, "/") {
+		if err := json.Unmarshal(buf, &manifest); err != nil || manifest.Version != 3 || manifest.Generation == 0 || manifest.Prefix != strings.Trim(t.cfg.Prefix, "/") {
 			return fmt.Errorf("invalid local S3 tier manifest: %v", err)
 		}
 		t.gen = manifest.Generation
 		t.manifestSHA256 = checksumS3Block(buf)
+		t.indexRoot = manifest.Root
+		blocks, err := t.loadLocalManifestIndex(manifest)
+		if err != nil {
+			return err
+		}
+		for _, d := range blocks {
+			t.desc[d.Index] = d
+		}
 		manifestIncarnation = manifest.Incarnation
 	} else if !os.IsNotExist(err) {
 		return err
@@ -722,7 +742,9 @@ func (fs *fileStore) prepareS3Tier() error {
 		if err := json.Unmarshal(buf, &d); err != nil || !validS3BlockDescriptor(d) || filepath.Clean(path) != t.descriptorFile(d.Index) {
 			return fmt.Errorf("invalid local S3 tier descriptor %q: %v", path, err)
 		}
-		t.desc[d.Index] = d
+		if committed, ok := t.desc[d.Index]; !ok || committed != d {
+			return errors.New("local S3 descriptor is not in committed index")
+		}
 		if local, err := os.ReadFile(filepath.Join(fs.fcfg.StoreDir, msgDir, fmt.Sprintf(blkScan, d.Index))); err == nil {
 			if len(local) != d.Size || checksumS3Block(local) != d.SHA256 {
 				return fmt.Errorf("S3 tier block %d local checksum mismatch during recovery", d.Index)
@@ -730,6 +752,32 @@ func (fs *fileStore) prepareS3Tier() error {
 		} else if !os.IsNotExist(err) {
 			return err
 		}
+	}
+	// The committed local tree is sufficient evidence after a crash between
+	// root installation and per-block descriptor installation. Repair locally.
+	for _, d := range t.desc {
+		path := t.descriptorFile(d.Index)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if local, err := os.ReadFile(filepath.Join(fs.fcfg.StoreDir, msgDir, fmt.Sprintf(blkScan, d.Index))); err == nil {
+				if len(local) != d.Size || checksumS3Block(local) != d.SHA256 {
+					return fmt.Errorf("S3 tier block %d local checksum mismatch during descriptor recovery", d.Index)
+				}
+			} else if !os.IsNotExist(err) {
+				return err
+			}
+			buf, err := json.Marshal(d)
+			if err != nil {
+				return err
+			}
+			if err = writeAtomically(fs.dios, path, buf, defaultFilePerms, true); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+	}
+	if err := t.recoverIndexCache(); err != nil {
+		return err
 	}
 	// Recover admission evidence before publishers or reclamation can run. No
 	// remote reads are required, and a measurement failure cannot imply zero.
@@ -1190,7 +1238,7 @@ func (t *fileS3Tier) putImmutable(key string, data []byte) error {
 		kind = 0
 	case strings.Contains(key, "/descriptors/"):
 		kind = 1
-	case strings.Contains(key, "/manifests/"):
+	case strings.Contains(key, "/manifests/"), strings.Contains(key, "/index/pages/"):
 		kind = 2
 	}
 	stats := &t.stats.immutableIO[kind]
@@ -1395,38 +1443,64 @@ func (t *fileS3Tier) ensureStreamRecord() (*s3TierStreamRecord, error) {
 }
 
 func (t *fileS3Tier) commitManifest(add *s3BlockDescriptor) error {
+	var added []s3BlockDescriptor
+	if add != nil {
+		added = []s3BlockDescriptor{*add}
+	}
+	return t.commitManifestBatch(added)
+}
+func (t *fileS3Tier) commitManifestBatch(added []s3BlockDescriptor) error {
 	record, err := t.ensureStreamRecord()
 	if err != nil {
 		return err
 	}
+	if err = t.finishIndexPending(); err != nil {
+		return err
+	}
 	t.mu.Lock()
-	blocks := make([]s3BlockDescriptor, 0, len(t.desc)+1)
-	for _, current := range t.desc {
-		blocks = append(blocks, current)
-	}
-	if add != nil {
-		blocks = append(blocks, *add)
-	}
-	generation := t.gen + 1
+	generation, root := t.gen, t.indexRoot
 	t.mu.Unlock()
-	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Index < blocks[j].Index })
-	manifest := s3TierManifest{Version: 2, Generation: generation, Prefix: strings.Trim(t.cfg.Prefix, "/"), Incarnation: record.Incarnation, Blocks: blocks}
-	buf, err := json.Marshal(manifest)
+	if len(added) == 0 && generation > 0 {
+		return nil
+	}
+	t.indexStaging = make(map[string][]byte)
+	defer func() { t.indexStaging = nil }()
+	next := root
+	var obsolete []s3IndexRef
+	for _, add := range added {
+		refs, err := t.insertIndex(next, add, &obsolete)
+		if err != nil {
+			return err
+		}
+		if len(refs) == 1 {
+			next = &refs[0]
+		} else {
+			r, err := t.storeIndexPage(s3IndexPage{Version: 1, Incarnation: record.Incarnation, Level: refs[0].Level + 1, Children: refs})
+			if err != nil {
+				return err
+			}
+			next = &r
+		}
+	}
+	if root != nil && next != nil && *next == *root {
+		return nil
+	}
+	if err = t.publishStagedIndex(next); err != nil {
+		return err
+	}
+	m := s3TierManifest{Version: 3, Generation: generation + 1, Prefix: strings.Trim(t.cfg.Prefix, "/"), Incarnation: record.Incarnation, Root: next}
+	if next != nil {
+		m.Count = next.Count
+	}
+	pending := s3IndexPending{Manifest: m, Added: added, Obsolete: obsolete}
+	buf, err := json.Marshal(pending)
 	if err != nil {
 		return err
 	}
-	key := t.manifestKey(generation)
-	if err := t.putImmutable(key, buf); err != nil {
-		return fmt.Errorf("S3 tier manifest verification failed for generation %d: %w", generation, err)
-	}
-	if err := writeAtomically(t.fs.dios, t.manifestFile(), buf, defaultFilePerms, true); err != nil {
+	if err = writeAtomically(t.fs.dios, t.indexPendingFile(), buf, defaultFilePerms, true); err != nil {
 		return err
 	}
-	t.mu.Lock()
-	t.gen = generation
-	t.manifestSHA256 = checksumS3Block(buf)
-	t.mu.Unlock()
-	return nil
+	return t.finishIndexPending()
 }
 
 func (t *fileS3Tier) findCheckpoint(sequence uint64) (*s3TierCheckpoint, error) {
@@ -1573,7 +1647,10 @@ func (t *fileS3Tier) loop() {
 		if err == nil {
 			err = t.flushAgedBlocks()
 		}
-		if err == nil && !ageTick {
+		// An age flush can consume the remaining local headroom. Do not make
+		// reclamation wait for another publisher wake after that flush yields.
+		reclaimAt := t.cfg.LocalHighBytes - min(t.cfg.LocalHighBytes-t.cfg.LocalLowBytes, uint64(t.fs.fcfg.BlockSize))
+		if err == nil && (!ageTick || t.localPressure.Load() || t.residentSize() > reclaimAt) {
 			err = t.evictToBudget()
 			// Explicit drains and pressure work remain outside this normal-wake
 			// rate limit. Neither age-flush ticks nor retry timers are delayed.
@@ -1698,6 +1775,11 @@ func (t *fileS3Tier) fetchBlock(d s3BlockDescriptor, path string) error {
 	data, err := t.cfg.Store.Get(ctx, d.Key)
 	cancel()
 	if err != nil {
+		// Closing the store cancels remote I/O intentionally. Preserve the
+		// normal read/close contract rather than reporting a storage outage.
+		if t.remoteCtx != nil && t.remoteCtx.Err() != nil {
+			return ErrStoreClosed
+		}
 		return fmt.Errorf("%w: block %d unavailable: %v", errS3TierUnavailable, d.Index, err)
 	}
 	if len(data) != d.Size || checksumS3Block(data) != d.SHA256 {
@@ -1910,8 +1992,8 @@ func (t *fileS3Tier) drain(coveredThrough uint64) (uint64, error) {
 		drained += uint64(n)
 		pending = pending[n:]
 	}
-	// Always write a fresh v2 manifest before a new checkpoint. It binds every
-	// descriptor, including any pre-foundation descriptors, to this record.
+	// An empty stream still needs a committed root. Nonempty checkpoints pin
+	// the existing immutable root rather than rewriting its descriptor history.
 	if err := t.commitManifest(nil); err != nil {
 		return drained, err
 	}
@@ -2056,23 +2138,24 @@ func (t *fileS3Tier) acquireUploadSlot() (func(), error) {
 }
 
 // coverBlocks overlaps only immutable payload I/O, at most four blocks per
-// batch. Descriptor/manifest/local commits remain in block order; a failure
-// stops subsequent commits. Journal speculative payloads before remote writes
+// batch. Descriptors remain ordered and one immutable root commits the batch
+// before local coverage is installed. Journal speculative payloads before remote writes
 // so a partial batch can be retried or garbage-collected after a crash.
 // Callers hold runMu and pass distinct, sealed blocks.
-func (t *fileS3Tier) coverBlocks(blocks []*msgBlock) ([]uint64, error) {
+func (t *fileS3Tier) coverBlocks(blocks []*msgBlock) (sizes []uint64, resultErr error) {
 	if len(blocks) > s3TierUploadBatchSize {
 		return nil, errors.New("S3 tier upload batch exceeds four blocks")
-	}
-	if _, err := t.ensureStreamRecord(); err != nil {
-		t.stats.uploadErrors.Add(1)
-		return nil, err
 	}
 	t.mu.Lock()
 	backoff, retryErr := time.Now().Before(t.budgetRetryAt), t.budgetRetryErr
 	t.mu.Unlock()
 	if backoff {
 		return nil, retryErr
+	}
+	defer func() { t.noteCoverageResult(resultErr) }()
+	if _, err := t.ensureStreamRecord(); err != nil {
+		t.stats.uploadErrors.Add(1)
+		return nil, err
 	}
 	hashes := make([]string, len(blocks))
 	errs := make([]error, len(blocks))
@@ -2121,7 +2204,12 @@ func (t *fileS3Tier) coverBlocks(blocks []*msgBlock) ([]uint64, error) {
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
-	sizes := make([]uint64, len(blocks))
+	// Stage descriptors for one atomic bounded index update. No staged payload
+	// is reclaimed, and no remote coverage is advertised before the root commits.
+	var batch []s3TierCoverage
+	t.coverageBatch = &batch
+	defer func() { t.coverageBatch = nil }()
+	sizes = make([]uint64, len(blocks))
 	for i, mb := range blocks {
 		var err error
 		sizes[i], err = t.evictBlock(mb, false, hashes[i])
@@ -2129,7 +2217,51 @@ func (t *fileS3Tier) coverBlocks(blocks []*msgBlock) ([]uint64, error) {
 			return sizes, err
 		}
 	}
+	t.coverageBatch = nil
+	added := make([]s3BlockDescriptor, len(batch))
+	for i, item := range batch {
+		added[i] = item.descriptor
+	}
+	if len(added) > 0 {
+		if err := t.commitManifestBatch(added); err != nil {
+			return sizes, err
+		}
+		for _, item := range batch {
+			if err := t.recordRemoteBlock(item.block, item.data, item.descriptor); err != nil {
+				return sizes, err
+			}
+			t.mu.Lock()
+			err := t.removeGCCandidateLocked(item.descriptor.Key)
+			t.mu.Unlock()
+			if err != nil {
+				return sizes, err
+			}
+		}
+	}
 	return sizes, nil
+}
+
+// Background age batches and direct pressure work share one retry gate;
+// publisher wakeups must not turn an object-store outage into a busy retry loop.
+func (t *fileS3Tier) noteCoverageResult(err error) {
+	if t.fs.dios.budget.Load() == nil && t.cfg.RemoteFlushMaxAge == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err == nil {
+		t.budgetRetryAt, t.budgetRetryDelay, t.budgetRetryErr = time.Time{}, 0, nil
+		return
+	}
+	if t.budgetRetryDelay == 0 {
+		t.budgetRetryDelay = t.cfg.RetryMin
+	} else if t.budgetRetryDelay < t.cfg.RetryMax/2 {
+		t.budgetRetryDelay *= 2
+	} else {
+		t.budgetRetryDelay = t.cfg.RetryMax
+	}
+	t.budgetRetryAt = time.Now().Add(t.budgetRetryDelay)
+	t.budgetRetryErr = err
 }
 
 // evictBlock uploads a sealed block when needed. reclaim determines whether
@@ -2181,23 +2313,7 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool, verified ...string) 
 			return 0, err
 		}
 		t.mu.Unlock()
-		defer func() {
-			t.mu.Lock()
-			defer t.mu.Unlock()
-			if resultErr == nil {
-				t.budgetRetryAt, t.budgetRetryDelay, t.budgetRetryErr = time.Time{}, 0, nil
-				return
-			}
-			if t.budgetRetryDelay == 0 {
-				t.budgetRetryDelay = t.cfg.RetryMin
-			} else if t.budgetRetryDelay < t.cfg.RetryMax/2 {
-				t.budgetRetryDelay *= 2
-			} else {
-				t.budgetRetryDelay = t.cfg.RetryMax
-			}
-			t.budgetRetryAt = time.Now().Add(t.budgetRetryDelay)
-			t.budgetRetryErr = resultErr
-		}()
+		defer func() { t.noteCoverageResult(resultErr) }()
 	}
 	record, err := t.ensureStreamRecord()
 	if err != nil {
@@ -2227,6 +2343,10 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool, verified ...string) 
 			return 0, fmt.Errorf("S3 tier descriptor write failed: %v; recording garbage candidate: %w", err, journalErr)
 		}
 		return 0, err
+	}
+	if t.coverageBatch != nil {
+		*t.coverageBatch = append(*t.coverageBatch, s3TierCoverage{block: mb, data: data, descriptor: d})
+		return uint64(len(data)), nil
 	}
 	if err := t.commitManifest(&d); err != nil {
 		t.stats.uploadErrors.Add(1)
@@ -2468,11 +2588,27 @@ func (t *fileS3Tier) flushAgedBlocks() error {
 		fs.dirty++
 	}
 	fs.mu.Unlock()
-	for _, candidate := range candidates {
-		size, err := t.evictBlock(candidate, false)
-		if err != nil || size == 0 {
+	reclaimAt := t.cfg.LocalHighBytes - min(t.cfg.LocalHighBytes-t.cfg.LocalLowBytes, uint64(fs.fcfg.BlockSize))
+	for len(candidates) > 0 {
+		// Age-based coverage is independent of residency. Yield as soon as
+		// pressure arrives so already committed blocks can free headroom before
+		// another remote write; otherwise one old backlog can fence publishers
+		// for the entire flush even while safe local victims are available.
+		if t.localPressure.Load() || t.residentSize() > reclaimAt {
+			t.kick()
+			return nil
+		}
+		n := min(s3TierUploadBatchSize, len(candidates))
+		sizes, err := t.coverBlocks(candidates[:n])
+		if err != nil {
 			return err
 		}
+		for _, size := range sizes {
+			if size == 0 {
+				return nil
+			}
+		}
+		candidates = candidates[n:]
 	}
 	return nil
 }

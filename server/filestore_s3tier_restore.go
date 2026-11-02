@@ -25,6 +25,7 @@ type s3TierRemoteRestoreMaterial struct {
 	checkpoint   s3TierRemoteRestoreCheckpoint
 	manifest     s3TierManifest
 	manifestData []byte
+	indexPages   map[string][]byte
 	streamRecord s3TierStreamRecord
 	streamData   []byte
 	messageData  []byte
@@ -71,15 +72,25 @@ func (t *fileS3Tier) loadRemoteRestoreMaterial(operationID string, expectedEpoch
 	ctx, cancel := t.ctx()
 	manifestData, err := t.cfg.Store.Get(ctx, messageCheckpoint.ManifestKey)
 	cancel()
-	if err != nil || checksumS3Block(manifestData) != messageCheckpoint.ManifestSHA256 {
-		return nil, fmt.Errorf("remote restore manifest verification failed: %w", err)
+	if err != nil {
+		return nil, fmt.Errorf("remote restore manifest read failed: %w", err)
+	}
+	if checksumS3Block(manifestData) != messageCheckpoint.ManifestSHA256 {
+		return nil, errors.New("remote restore manifest checksum mismatch")
 	}
 	var manifest s3TierManifest
-	if err := json.Unmarshal(manifestData, &manifest); err != nil || manifest.Version != 2 ||
+	if err := json.Unmarshal(manifestData, &manifest); err != nil || manifest.Version != 3 ||
 		manifest.Generation != messageCheckpoint.ManifestGeneration || manifest.Prefix != strings.Trim(t.cfg.Prefix, "/") ||
 		manifest.Incarnation != messageCheckpoint.Incarnation {
 		return nil, errors.New("remote restore manifest is invalid")
 	}
+	// Traverse only the immutable root pinned by this checkpoint. A newer root
+	// or an unreferenced uploaded page must never change the restored history.
+	blocks, indexPages, err := t.loadManifestIndex(manifest)
+	if err != nil {
+		return nil, fmt.Errorf("remote restore index verification failed: %w", err)
+	}
+	manifest.Blocks = blocks
 	// Empty channels still need a durable configuration and consumer checkpoint
 	// when their shard moves. Zero coverage is valid only for an empty stream
 	// and an empty manifest; it must never hide missing payload descriptors.
@@ -121,7 +132,10 @@ func (t *fileS3Tier) loadRemoteRestoreMaterial(operationID string, expectedEpoch
 	if err := json.Unmarshal(messageData, &storedMessageCheckpoint); err != nil || storedMessageCheckpoint != messageCheckpoint {
 		return nil, errors.New("remote restore message checkpoint is invalid")
 	}
-	return &s3TierRemoteRestoreMaterial{checkpoint, manifest, manifestData, streamRecord, streamData, messageData}, nil
+	return &s3TierRemoteRestoreMaterial{
+		checkpoint: checkpoint, manifest: manifest, manifestData: manifestData,
+		indexPages: indexPages, streamRecord: streamRecord, streamData: streamData, messageData: messageData,
+	}, nil
 }
 
 func writeS3TierRestoreFile(path string, data []byte) error {
@@ -159,6 +173,12 @@ func (t *fileS3Tier) stageRemoteRestore(dir string, material *s3TierRemoteRestor
 			filepath.Join(dir, msgDir, "s3-tier.stream.json"):     uint64(len(material.streamData)),
 			filepath.Join(dir, msgDir, "s3-tier.checkpoint.json"): uint64(len(material.messageData)),
 		}
+		if len(material.indexPages) > 0 {
+			sizes[filepath.Join(dir, msgDir, "s3-index")] = 4096
+			for hash, data := range material.indexPages {
+				sizes[filepath.Join(dir, msgDir, "s3-index", hash+".json")] = uint64(len(data))
+			}
+		}
 		// Include the directory allocations before any remote download too.
 		for path := filepath.Join(dir, msgDir); budget.owns(path); path = filepath.Dir(path) {
 			if _, err := os.Stat(path); err == nil {
@@ -194,6 +214,13 @@ func (t *fileS3Tier) stageRemoteRestore(dir string, material *s3TierRemoteRestor
 		return err
 	}
 	msgPath := filepath.Join(dir, msgDir)
+	// The local root is never published before its complete page set. A
+	// subsequent ordinary restart can validate it without contacting S3.
+	for hash, data := range material.indexPages {
+		if err := writeS3TierRestoreFile(filepath.Join(msgPath, "s3-index", hash+".json"), data); err != nil {
+			return err
+		}
+	}
 	if err := writeS3TierRestoreFile(filepath.Join(msgPath, "s3-tier.manifest.json"), material.manifestData); err != nil {
 		return err
 	}
@@ -207,8 +234,11 @@ func (t *fileS3Tier) stageRemoteRestore(dir string, material *s3TierRemoteRestor
 		ctx, cancel := t.ctx()
 		data, err := t.cfg.Store.Get(ctx, block.Key)
 		cancel()
-		if err != nil || len(data) != block.Size || checksumS3Block(data) != block.SHA256 {
-			return fmt.Errorf("remote restore block %d verification failed: %w", block.Index, err)
+		if err != nil {
+			return fmt.Errorf("remote restore block %d read failed: %w", block.Index, err)
+		}
+		if len(data) != block.Size || checksumS3Block(data) != block.SHA256 {
+			return fmt.Errorf("remote restore block %d checksum or size mismatch", block.Index)
 		}
 		descriptorData, err := json.Marshal(block)
 		if err != nil {
