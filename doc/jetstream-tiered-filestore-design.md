@@ -542,21 +542,28 @@ network I/O. The rejected message is not stored. After background reclamation
 succeeds, publishers can retry. Capacity errors do not poison the file store.
 
 Pressure reclamation prioritizes covered local blocks, then uploads and reclaims
-uncovered blocks individually. It does not first upload the complete remote
-backlog. Normal remote coverage resumes afterward independently of residency.
+at most four uncovered blocks under one durable root before reclaiming that
+batch. It does not first upload the complete remote backlog. Normal remote coverage resumes afterward independently of residency.
 Immutable payload, descriptor, index-page, and manifest-root verification applies before reclamation.
 
-### Bounded parallel payload coverage
+### Bounded parallel coverage
 
-Normal remote coverage and drain stage up to four sealed payloads concurrently
-per stream. Each payload is journaled as a potential GC candidate before PUT and
-read-back verification. Individual remote descriptors, index pages, small manifest
-roots, local descriptor files, and checkpoint publication retain their ordered
-commit protocol. Descriptors are also embedded in index leaves. On partial
-failure, the batch does not publish its remaining metadata; verified speculative
-payloads remain journaled for retry or existing GC. Retry re-reads and hashes each
-local block before reusing the verified payload. Local-pressure reclamation stays
-incremental so it can free disk without waiting for an entire backlog.
+Remote coverage, drain, and uncovered pressure reclamation stage at most four
+sealed payloads concurrently per stream. Each payload is journaled as a potential
+GC candidate before PUT and read-back verification. The batch then writes and
+verifies its independent remote descriptors concurrently under the same global
+upload gate. Only after every descriptor is verified does it publish index pages
+and one small manifest root, followed by durable local coverage evidence. This
+avoids a separate root commit per block when the disk is under pressure.
+Descriptors remain embedded in index leaves as well as separate remote objects.
+
+A partial payload or descriptor failure prevents the batch root from committing
+and retains local payloads. Verified speculative payloads remain journaled for
+retry or existing GC. Retry re-reads and hashes each local block before reusing
+verified payloads. Checkpoint publication still follows complete coverage. Already
+covered local victims are reclaimed immediately before starting an uncovered
+batch; newly covered victims are reclaimed before the next batch. No whole-backlog
+flush is required to free disk, and no verification or capacity fence is removed.
 
 Payload staging uses batches of at most four configured blocks per stream, plus
 verification buffers. A process-wide 16-operation gate bounds concurrent staging

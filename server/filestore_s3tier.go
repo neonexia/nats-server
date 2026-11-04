@@ -1902,9 +1902,23 @@ func (t *fileS3Tier) evictToBudget() error {
 		}
 		return candidates[i].mb.index < candidates[j].mb.index
 	})
-	for _, candidate := range candidates {
-		if used <= t.cfg.LocalLowBytes {
-			break
+	for i := 0; i < len(candidates) && used > t.cfg.LocalLowBytes; i++ {
+		candidate := candidates[i]
+		if !candidate.remote {
+			// Pressure must not fall back to a root commit per block. Cover a
+			// bounded batch, then reclaim it before doing more remote I/O.
+			// Already-covered victims sorted above never wait for this batch.
+			n := min(s3TierUploadBatchSize, len(candidates)-i)
+			blocks := make([]*msgBlock, n)
+			for j := range blocks {
+				blocks[j] = candidates[i+j].mb
+			}
+			if _, err := t.coverBlocks(blocks); err != nil {
+				return err
+			}
+			for j := 0; j < n; j++ {
+				candidates[i+j].remote = true
+			}
 		}
 		size, err := t.evictBlock(candidate.mb, true)
 		if err != nil {
@@ -2137,8 +2151,8 @@ func (t *fileS3Tier) acquireUploadSlot() (func(), error) {
 	}
 }
 
-// coverBlocks overlaps only immutable payload I/O, at most four blocks per
-// batch. Descriptors remain ordered and one immutable root commits the batch
+// coverBlocks overlaps immutable payload and descriptor I/O, at most four
+// blocks per batch. One immutable root commits the ordered descriptors
 // before local coverage is installed. Journal speculative payloads before remote writes
 // so a partial batch can be retried or garbage-collected after a crash.
 // Callers hold runMu and pass distinct, sealed blocks.
@@ -2218,6 +2232,33 @@ func (t *fileS3Tier) coverBlocks(blocks []*msgBlock) (sizes []uint64, resultErr 
 		}
 	}
 	t.coverageBatch = nil
+	// Each descriptor is independent. Retain the global upload bound, and
+	// verify every descriptor before any page/root can advertise the batch.
+	errs = make([]error, len(batch))
+	for i, item := range batch {
+		workers.Add(1)
+		go func(i int, d s3BlockDescriptor) {
+			defer workers.Done()
+			release, err := t.acquireUploadSlot()
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer release()
+			buf, err := json.Marshal(d)
+			if err == nil {
+				err = t.putImmutable(t.descriptorKey(d.Index), buf)
+			}
+			if err != nil {
+				t.stats.uploadErrors.Add(1)
+				errs[i] = err
+			}
+		}(i, item.descriptor)
+	}
+	workers.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return sizes, err
+	}
 	added := make([]s3BlockDescriptor, len(batch))
 	for i, item := range batch {
 		added[i] = item.descriptor
@@ -2333,6 +2374,10 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool, verified ...string) 
 			return 0, err
 		}
 	}
+	if t.coverageBatch != nil {
+		*t.coverageBatch = append(*t.coverageBatch, s3TierCoverage{block: mb, data: data, descriptor: d})
+		return uint64(len(data)), nil
+	}
 	buf, err := json.Marshal(d)
 	if err != nil {
 		return 0, err
@@ -2343,10 +2388,6 @@ func (t *fileS3Tier) evictBlock(mb *msgBlock, reclaim bool, verified ...string) 
 			return 0, fmt.Errorf("S3 tier descriptor write failed: %v; recording garbage candidate: %w", err, journalErr)
 		}
 		return 0, err
-	}
-	if t.coverageBatch != nil {
-		*t.coverageBatch = append(*t.coverageBatch, s3TierCoverage{block: mb, data: data, descriptor: d})
-		return uint64(len(data)), nil
 	}
 	if err := t.commitManifest(&d); err != nil {
 		t.stats.uploadErrors.Add(1)

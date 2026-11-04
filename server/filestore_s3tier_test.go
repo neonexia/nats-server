@@ -1504,42 +1504,48 @@ func TestFileStoreS3TierCollectsOnlyJournaledPayloadDebris(t *testing.T) {
 		t.Fatalf("descriptor failure removed local payload: %v", err)
 	}
 	fs.tier.mu.Lock()
-	if len(fs.tier.gc) != 1 {
+	if len(fs.tier.gc) != s3TierUploadBatchSize {
 		fs.tier.mu.Unlock()
-		t.Fatalf("garbage candidates=%d, want 1", len(fs.tier.gc))
+		t.Fatalf("garbage candidates=%d, want %d", len(fs.tier.gc), s3TierUploadBatchSize)
 	}
-	candidate := fs.tier.gc[0]
-	fs.tier.gc[0].Created = time.Now().Add(-2 * defaultS3TierGCGrace)
+	candidates := append([]s3TierGCCandidate(nil), fs.tier.gc...)
+	for i := range fs.tier.gc {
+		fs.tier.gc[i].Created = time.Now().Add(-2 * defaultS3TierGCGrace)
+	}
 	if err := fs.tier.writeGCJournalLocked(); err != nil {
 		fs.tier.mu.Unlock()
 		t.Fatal(err)
 	}
 	fs.tier.mu.Unlock()
-	if !strings.Contains(candidate.Key, "/blocks/") {
-		t.Fatalf("candidate key=%q", candidate.Key)
+	for _, candidate := range candidates {
+		if !strings.Contains(candidate.Key, "/blocks/") {
+			t.Fatalf("candidate key=%q", candidate.Key)
+		}
 	}
-	if result, err := fs.CollectS3TierGarbage(false); err != nil || result.Scanned != 1 || result.Eligible != 1 || result.Deleted != 0 {
+	if result, err := fs.CollectS3TierGarbage(false); err != nil || result.Scanned != s3TierUploadBatchSize || result.Eligible != s3TierUploadBatchSize || result.Deleted != 0 {
 		t.Fatalf("dry-run result=%+v err=%v", result, err)
 	}
 	store.mu.Lock()
-	_, stillRemote := store.objects[candidate.Key]
-	store.mu.Unlock()
-	if !stillRemote {
-		t.Fatal("dry run deleted payload")
+	for _, candidate := range candidates {
+		if _, present := store.objects[candidate.Key]; !present {
+			t.Errorf("dry run deleted payload %q", candidate.Key)
+		}
 	}
-	if result, err := fs.CollectS3TierGarbage(true); err != nil || result.Deleted != 1 {
+	store.mu.Unlock()
+	if result, err := fs.CollectS3TierGarbage(true); err != nil || result.Deleted != s3TierUploadBatchSize {
 		t.Fatalf("execute result=%+v err=%v", result, err)
 	}
 	store.mu.Lock()
-	_, stillRemote = store.objects[candidate.Key]
-	store.mu.Unlock()
-	if stillRemote {
-		t.Fatal("execute did not remove journaled orphan payload")
+	for _, candidate := range candidates {
+		if _, present := store.objects[candidate.Key]; present {
+			t.Errorf("execute did not remove journaled orphan %q", candidate.Key)
+		}
 	}
+	store.mu.Unlock()
 	if _, err := os.Stat(filepath.Join(fcfg.StoreDir, msgDir, "1.blk")); err != nil {
 		t.Fatalf("GC removed local payload: %v", err)
 	}
-	if stats := fs.tier.statsSnapshot(); stats.GCDeletes != 1 || stats.GCPending != 0 {
+	if stats := fs.tier.statsSnapshot(); stats.GCDeletes != s3TierUploadBatchSize || stats.GCPending != 0 {
 		t.Fatalf("GC stats=%+v", stats)
 	}
 }

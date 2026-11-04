@@ -81,7 +81,7 @@ func (s *indexFaultStore) List(ctx context.Context, key string) ([]string, error
 }
 func TestFileStoreS3TierIndexPublicationFailuresCompatibleEndpoint(t *testing.T) {
 	real := testS3TierCompatibleStore(t)
-	for _, stage := range []string{"page-put", "root-response", "local-root", "local-descriptor", "batch-root-response", "batch-local-descriptor", "pending-membership"} {
+	for _, stage := range []string{"descriptor-put", "descriptor-response", "page-put", "root-response", "local-root", "local-descriptor", "batch-root-response", "batch-local-descriptor", "pending-membership"} {
 		t.Run(stage, func(t *testing.T) {
 			store := &indexFaultStore{S3TierObjectStore: real, puts: make(map[string]int)}
 			dir := t.TempDir()
@@ -98,6 +98,9 @@ func TestFileStoreS3TierIndexPublicationFailuresCompatibleEndpoint(t *testing.T)
 			}
 			var localFault string
 			switch stage {
+			case "descriptor-put", "descriptor-response":
+				store.failPrefix = "/descriptors/"
+				store.loseResponse = stage == "descriptor-response"
 			case "page-put":
 				store.failPrefix = "/index/pages/"
 			case "root-response", "batch-root-response", "pending-membership":
