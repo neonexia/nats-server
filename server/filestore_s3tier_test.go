@@ -398,14 +398,14 @@ jetstream {
 	}
 }
 
-// storeS3TierReplayMessage retries only a confirmed capacity rejection while
-// preparing replay fixtures. Tight budgets do not promise offload within 100 ms.
-func storeS3TierReplayMessage(t *testing.T, fs *fileStore, payload []byte) uint64 {
+// storeS3TierFixtureMessage retries only a confirmed capacity rejection while
+// preparing storage fixtures. Tight budgets do not promise offload within 100 ms.
+func storeS3TierFixtureMessage(t *testing.T, fs *fileStore, subject string, payload []byte) uint64 {
 	t.Helper()
 	var seq uint64
 	checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
 		var err error
-		seq, _, err = fs.StoreMsg("events", nil, payload, 0)
+		seq, _, err = fs.StoreMsg(subject, nil, payload, 0)
 		if errors.Is(err, errS3TierLocalCapacity) {
 			return err
 		}
@@ -421,7 +421,7 @@ func TestFileStoreS3TierReplayAndRestart(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), "test/stream")
 	for i := 1; i <= 100; i++ {
-		if seq := storeS3TierReplayMessage(t, fs, []byte(fmt.Sprintf("message-%04d-%s", i, strings.Repeat("x", 1000)))); seq != uint64(i) {
+		if seq := storeS3TierFixtureMessage(t, fs, "events", []byte(fmt.Sprintf("message-%04d-%s", i, strings.Repeat("x", 1000)))); seq != uint64(i) {
 			t.Fatalf("store %d: seq=%d", i, seq)
 		}
 	}
@@ -465,7 +465,7 @@ func TestFileStoreS3TierColdReadFetchesOnlySelectedBlock(t *testing.T) {
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/selected-block")
 	defer fs.Stop()
 	for i := 0; i < 100; i++ {
-		storeS3TierReplayMessage(t, fs, []byte(strings.Repeat("x", 1000)))
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -485,7 +485,7 @@ func TestFileStoreS3TierRestartDoesNotContactObjectStore(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), "test/offline-restart")
 	for i := 0; i < 100; i++ {
-		storeS3TierReplayMessage(t, fs, []byte(strings.Repeat("x", 1000)))
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -512,9 +512,7 @@ func TestFileStoreS3TierCoalescesConcurrentColdReads(t *testing.T) {
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/coalesced-read")
 	defer fs.Stop()
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -558,9 +556,7 @@ func TestFileStoreS3TierReclaimsHydratedCacheBeforeLocalBlocks(t *testing.T) {
 	fs.tier.stop()
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 32*1024, 16*1024
 	if err := fs.tier.evictToBudget(); err != nil {
@@ -587,9 +583,7 @@ func TestFileStoreS3TierSeparatesRemoteCoverageFromLocalResidency(t *testing.T) 
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 256*1024, 128*1024
 	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 32*1024, 16*1024
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -615,9 +609,7 @@ func TestFileStoreS3TierDrainSealsAndCoversTail(t *testing.T) {
 	fs.tier.stop()
 	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1<<30, 1<<29
 	for i := 0; i < 10; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	drained, err := fs.DrainS3Tier()
 	if err != nil || drained != 1 {
@@ -647,9 +639,7 @@ func TestFileStoreS3TierDrainCreatesImmutableCheckpoint(t *testing.T) {
 	fs.tier.stop()
 	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1<<30, 1<<29
 	for i := 0; i < 10; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if drained, err := fs.DrainS3Tier(); err != nil || drained != 1 {
 		t.Fatalf("drain = (%d, %v), want (1, nil)", drained, err)
@@ -702,9 +692,7 @@ func TestFileStoreS3TierDrainCheckpointFailurePreservesLocalPayload(t *testing.T
 	fs.tier.stop()
 	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1<<30, 1<<29
 	for i := 0; i < 10; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if _, err := fs.DrainS3Tier(); err == nil {
 		t.Fatal("expected checkpoint failure")
@@ -734,9 +722,7 @@ func TestFileStoreS3TierRejectsConflictingStreamRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.objects[fs.tier.streamRecordKey()] = data
-	if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-		t.Fatal(err)
-	}
+	storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	if _, err := fs.DrainS3Tier(); err == nil {
 		t.Fatal("expected stream record conflict")
 	}
@@ -1451,9 +1437,7 @@ func TestFileStoreS3TierRejectsWritesWhenOffloadCannotRelievePressure(t *testing
 	fs.tier.stop()
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 32*1024, 16*1024
 	store.mu.Lock()
@@ -1482,9 +1466,7 @@ func TestFileStoreS3TierFailureKeepsLocalCopy(t *testing.T) {
 			fs.tier.stop()
 			fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 			for i := 0; i < 100; i++ {
-				if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-					t.Fatal(err)
-				}
+				storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 			}
 			store.mu.Lock()
 			store.failPut, store.failDescriptor = !failDescriptor, failDescriptor
@@ -1507,9 +1489,7 @@ func TestFileStoreS3TierCollectsOnlyJournaledPayloadDebris(t *testing.T) {
 	fs.tier.stop()
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 32*1024, 16*1024
 	if err := fs.tier.evictToBudget(); err == nil {
@@ -1572,9 +1552,7 @@ func TestFileStoreS3TierGarbageSkipsPayloadReferencedByDescriptor(t *testing.T) 
 	fs.tier.stop()
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -1608,9 +1586,7 @@ func TestFileStoreS3TierManifestCommitFailureKeepsLocalCopy(t *testing.T) {
 	fs.tier.stop()
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 32*1024, 16*1024
 	store.mu.Lock()
@@ -1629,9 +1605,7 @@ func TestFileStoreS3TierWritesImmutableManifest(t *testing.T) {
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/manifest")
 	defer fs.Stop()
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -1670,9 +1644,7 @@ func TestFileStoreS3TierStatsTrackPhysicalTierActivity(t *testing.T) {
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/stats")
 	defer fs.Stop()
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -1704,9 +1676,7 @@ func TestFileStoreS3TierRetriesUploadAndReportsBacklog(t *testing.T) {
 	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1, 0
 	fs.tier.cfg.RetryMin, fs.tier.cfg.RetryMax = 5*time.Millisecond, 20*time.Millisecond
 	for i := 0; i < 40; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	fs.tier.kick()
 	deadline := time.Now().Add(time.Second)
@@ -1744,9 +1714,7 @@ func TestFileStoreS3TierUploadTimeoutRetriesAndRecovers(t *testing.T) {
 	fs.tier.cfg.Timeout = 10 * time.Millisecond
 	fs.tier.cfg.RetryMin, fs.tier.cfg.RetryMax = 5*time.Millisecond, 20*time.Millisecond
 	for i := 0; i < 40; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	fs.tier.kick()
 	deadline := time.Now().Add(time.Second)
@@ -1776,7 +1744,7 @@ func TestFileStoreS3TierCorruptionAndMissingConfigFailClosed(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), "test/corruption")
 	for i := 0; i < 100; i++ {
-		storeS3TierReplayMessage(t, fs, []byte(strings.Repeat("x", 1000)))
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -1812,9 +1780,7 @@ func TestFileStoreS3TierColdReadDoesNotHoldWriteLock(t *testing.T) {
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/lock")
 	defer fs.Stop()
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -1864,9 +1830,7 @@ func TestFileStoreS3TierLastBySubjectColdFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 99; i++ {
-		if _, _, err := fs.StoreMsg("newer", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "newer", []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -1898,7 +1862,20 @@ func TestJetStreamS3TierNativePullConsumer(t *testing.T) {
 	nc := clientConnectToServer(t, s)
 	defer nc.Close()
 	for i := 1; i <= 100; i++ {
-		sendStreamMsg(t, nc, "tier.events", fmt.Sprintf("message-%04d-%s", i, strings.Repeat("x", 1000)))
+		checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+			resp, err := nc.Request("tier.events", []byte(fmt.Sprintf("message-%04d-%s", i, strings.Repeat("x", 1000))), time.Second)
+			if err != nil {
+				t.Fatalf("publish outcome unknown: %v", err)
+			}
+			ack := getPubAckResponse(resp.Data)
+			if ack != nil && ack.Error != nil && ack.Error.Description == errS3TierLocalCapacity.Error() {
+				return errS3TierLocalCapacity
+			}
+			if ack == nil || ack.Error != nil || ack.PubAck == nil || ack.Sequence != uint64(i) {
+				t.Fatalf("unexpected publish acknowledgement: %s", resp.Data)
+			}
+			return nil
+		})
 	}
 	fs := mset.store.(*fileStore)
 	if err := fs.tier.evictToBudget(); err != nil {
@@ -2524,9 +2501,7 @@ func TestFileStoreS3TierCapacityDoesNotWaitForUploadLock(t *testing.T) {
 	fs.tier.stop()
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 32*1024, 16*1024
 	// Model a remote pass stalled in network I/O while holding its batch lock.
@@ -2584,9 +2559,7 @@ func TestFileStoreS3TierDrainRecoversPartialParallelBatch(t *testing.T) {
 	fs.tier.stop()
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	if _, err := fs.DrainS3Tier(); err == nil {
 		t.Fatal("drain accepted a partial batch")
@@ -2614,9 +2587,7 @@ func TestFileStoreS3TierReclaimsBeforeHardCapacityLimit(t *testing.T) {
 	fs.tier.stop()
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 64*1024, 32*1024
 	for i := 0; i < 50; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	before := fs.S3TierStats()
 	if before.LocalBytes >= before.HighWatermark {
@@ -2670,9 +2641,7 @@ func TestFileStoreS3TierBoundsUploadsAcrossStreams(t *testing.T) {
 		fs.tier.stop()
 		fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 		for j := 0; j < 100; j++ {
-			if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-				t.Fatal(err)
-			}
+			storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 		}
 		go func() { _, err := fs.DrainS3Tier(); results <- err }()
 	}
