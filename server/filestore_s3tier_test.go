@@ -2686,3 +2686,72 @@ func TestFileStoreS3TierBoundsUploadsAcrossStreams(t *testing.T) {
 		t.Fatalf("simultaneous payload writes = %d, want bounded concurrency 16", peak)
 	}
 }
+
+// A crash can persist remote coverage before an empty replacement tail reaches
+// disk. Reopening must never append new messages to an immutable covered block.
+func TestFileStoreS3TierRecoveredCoveredTailRemainsImmutable(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	cfg := StreamConfig{Name: "RECOVER_TAIL", Storage: FileStorage, Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 16 * 1024, S3Tier: &S3TierConfig{Store: store, Prefix: "test/recover-covered-tail", LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29, RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29}}
+	fs, err := newFileStore(fcfg, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if _, _, err = fs.StoreMsg("events", nil, []byte("before restart"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = fs.DrainS3Tier(); err != nil {
+		t.Fatal(err)
+	}
+	if err = fs.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := filepath.Glob(filepath.Join(fcfg.StoreDir, msgDir, "*.blk"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) == 0 {
+			if err = os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err = os.Remove(filepath.Join(fcfg.StoreDir, msgDir, "index.db")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	fs, err = newFileStore(fcfg, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq, _, err := fs.StoreMsg("events", nil, []byte("after restart"), 0); err != nil || seq != 11 {
+		t.Fatalf("append after recovery: seq=%d err=%v", seq, err)
+	}
+	if err = fs.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	fs, err = newFileStore(fcfg, cfg)
+	if err != nil {
+		t.Fatalf("second recovery: %v", err)
+	}
+	defer fs.Stop()
+	for seq := uint64(1); seq <= 11; seq++ {
+		msg, err := fs.LoadMsg(seq, nil)
+		if err != nil {
+			t.Fatalf("load %d: %v", seq, err)
+		}
+		expected := "before restart"
+		if seq == 11 {
+			expected = "after restart"
+		}
+		if string(msg.msg) != expected {
+			t.Fatalf("message %d: got %q, want %q", seq, msg.msg, expected)
+		}
+	}
+}

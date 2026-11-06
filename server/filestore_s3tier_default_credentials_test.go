@@ -279,11 +279,32 @@ func TestJetStreamS3TierDefaultCredentialRefreshAndRecovery(t *testing.T) {
 	mu.Unlock()
 	unavailable.Store(false)
 	invalid.Store(true)
-	if _, err := cfg.store.PutIfAbsent(context.Background(), "expired", []byte("payload")); err == nil {
-		t.Fatal("accepted expired credentials")
+	// The AWS cache shares a refresh that can outlive one caller's timeout.
+	// Observe the expired credential result, not a still-pending provider outage.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		_, err := cfg.store.PutIfAbsent(context.Background(), "expired", []byte("payload"))
+		if err == nil {
+			t.Fatal("accepted expired credentials")
+		}
+		if strings.Contains(err.Error(), "missing or expired") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expired credentials were not exercised: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	invalid.Store(false)
-	if _, err := cfg.store.PutIfAbsent(context.Background(), "recovered", []byte("payload")); err != nil {
-		t.Fatalf("credential recovery required restart: %v", err)
+	deadline = time.Now().Add(20 * time.Second)
+	for {
+		_, err := cfg.store.PutIfAbsent(context.Background(), "recovered", []byte("payload"))
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("credential recovery required restart: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

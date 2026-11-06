@@ -8167,7 +8167,10 @@ func (fs *fileStore) checkLastBlock(rl uint64) (lmb *msgBlock, err error) {
 	// Grab our current last message block.
 	lmb = fs.lmb
 	rbytes := lmb.blkSize()
-	if lmb == nil || (rbytes > 0 && rbytes+rl > fs.fcfg.BlockSize) {
+	// A crash can lose the empty replacement tail after remote coverage commits.
+	// The recovered last block is then immutable even when it has spare capacity.
+	covered := lmb != nil && fs.tier != nil && fs.tier.hasDescriptor(lmb.index)
+	if lmb == nil || covered || (rbytes > 0 && rbytes+rl > fs.fcfg.BlockSize) {
 		if lmb, err = fs.newMsgBlockForWrite(); err != nil {
 			return nil, err
 		}
