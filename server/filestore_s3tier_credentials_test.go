@@ -19,12 +19,15 @@ import (
 )
 
 func TestJetStreamS3TierCredentialProviderSelection(t *testing.T) {
+	isolateS3DefaultCredentials(t)
 	for _, test := range []struct {
 		name, config, wantError string
 	}{
 		{"iam", "provider: iam", ""},
+		{"default", "provider: default", ""},
+		{"mixed default", "provider: default, access_key_env: AWS_ACCESS_KEY_ID", "does not accept"},
 		{"unsupported", "provider: automatic", "is not supported"},
-		{"missing", "", "is not supported"},
+		{"omitted defaults to chain", "", ""},
 		{"mixed access key", "provider: iam, access_key_env: AWS_ACCESS_KEY_ID", "does not accept"},
 		{"mixed secret key", "provider: iam, secret_key_env: AWS_SECRET_ACCESS_KEY", "does not accept"},
 		{"mixed token", "provider: iam, session_token_env: AWS_SESSION_TOKEN", "does not accept"},

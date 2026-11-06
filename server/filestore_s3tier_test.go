@@ -1956,12 +1956,12 @@ func testS3TierCompatibleStore(t *testing.T) *S3TierMinIOStore {
 		t.Skip("set TEST_S3_TIER_ENDPOINT to an S3-compatible endpoint")
 	}
 	provider := os.Getenv("TEST_S3_TIER_PROVIDER")
-	if provider == "iam" || provider == "env" {
+	if provider == "iam" || provider == "env" || provider == "default" {
 		bucket, region := os.Getenv("TEST_S3_TIER_BUCKET"), os.Getenv("TEST_S3_TIER_REGION")
 		if bucket == "" || region == "" {
 			t.Fatal("AWS integration requires TEST_S3_TIER_BUCKET and TEST_S3_TIER_REGION")
 		}
-		credentialConfig := "provider: iam"
+		credentialConfig := "provider: " + provider
 		if provider == "env" {
 			credentialConfig = `provider: env
 				access_key_env: "TEST_S3_TIER_ACCESS_KEY"
@@ -1972,10 +1972,10 @@ func testS3TierCompatibleStore(t *testing.T) *S3TierMinIOStore {
 			endpoint: %q
 			bucket: %q
 			region: %q
-			tls: true
+			tls: %t
 			prefix: "integration"
 			credentials { %s }
-		} }`, endpoint, bucket, region, credentialConfig)))
+		} }`, endpoint, bucket, region, os.Getenv("TEST_S3_TIER_TLS") != "false", credentialConfig)))
 		opts, err := ProcessConfigFile(config)
 		if err != nil {
 			t.Fatal(err)

@@ -600,3 +600,27 @@ local pressure bypasses this delay. Age flush and retry timers remain independen
 Remote coverage checks residency between bounded payload batches and yields to
 covered-block reclamation when pressure develops during a flush. This prevents a
 large background coverage pass from starving local reclamation.
+
+## 2026-11-06: AWS default credential chain
+
+Server `s3_tier.credentials.provider` now defaults to `default`, using the AWS SDK
+for Go v2 credential chain (profiles/SSO, environment, web identity, container and
+instance roles). The existing explicit `env` provider remains for local RustFS and
+other compatible stores, and explicit `iam` remains available to direct engine
+users. `default` rejects named key references to avoid mixing selection modes.
+Credentials are resolved in each engine, not by its caller. The SDK cache owns
+refresh; the MinIO signing adapter consults it every time rather than retaining a
+second stale cache. Credential retrieval is bounded by the tier timeout; no signing
+request proceeds with missing or expired credentials. Errors returned from identity
+providers are sanitized so external profile/credential-process output cannot expose
+secrets through normal tier error logs.
+
+Validation distinguishes controlled container identity endpoints from actual cloud
+trust configuration. The default-provider tests cover profiles, static environment
+keys/session tokens, concurrent signing across refresh, provider failure, timeout,
+expired credential rejection and recovery. The real RustFS STS integration test
+uses genuine issued keys and a deliberately shortened advertised cache lifetime;
+it verifies drain, retained local data during identity outage and restart recovery.
+It does not stand in for an AWS role-expiry soak. Existing cold-read, immutable-write,
+orphan-GC and remote-restore compatible-endpoint tests can select `default` using
+TEST_S3_TIER_PROVIDER; TEST_S3_TIER_TLS=false is only for a local test endpoint.

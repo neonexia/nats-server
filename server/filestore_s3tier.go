@@ -169,16 +169,17 @@ type s3TierObjectDeleter interface {
 
 func newS3TierServerConfig() *S3TierServerConfig {
 	return &S3TierServerConfig{
-		BlockSize:         defaultS3TierBlockSize,
-		LocalHighBytes:    defaultS3TierLocalHigh,
-		LocalLowBytes:     defaultS3TierLocalLow,
-		RemoteHighBytes:   defaultS3TierRemoteHigh,
-		RemoteLowBytes:    defaultS3TierRemoteLow,
-		RemoteFlushMaxAge: 5 * time.Minute,
-		Timeout:           defaultS3TierTimeout,
-		RetryMin:          defaultS3TierRetryMin,
-		RetryMax:          defaultS3TierRetryMax,
-		GCGrace:           defaultS3TierGCGrace,
+		CredentialProvider: "default",
+		BlockSize:          defaultS3TierBlockSize,
+		LocalHighBytes:     defaultS3TierLocalHigh,
+		LocalLowBytes:      defaultS3TierLocalLow,
+		RemoteHighBytes:    defaultS3TierRemoteHigh,
+		RemoteLowBytes:     defaultS3TierRemoteLow,
+		RemoteFlushMaxAge:  5 * time.Minute,
+		Timeout:            defaultS3TierTimeout,
+		RetryMin:           defaultS3TierRetryMin,
+		RetryMax:           defaultS3TierRetryMax,
+		GCGrace:            defaultS3TierGCGrace,
 	}
 }
 
@@ -200,6 +201,11 @@ func (c *S3TierServerConfig) resolveStore() error {
 
 func (c *S3TierServerConfig) credentials() (*credentials.Credentials, error) {
 	switch c.CredentialProvider {
+	case "default":
+		if c.AccessKeyEnv != "" || c.SecretKeyEnv != "" || c.SessionTokenEnv != "" {
+			return nil, errors.New("S3 tier default credential provider does not accept environment credential references")
+		}
+		return newS3TierAWSCredentials(c.Region, c.Timeout)
 	case "iam":
 		if c.AccessKeyEnv != "" || c.SecretKeyEnv != "" || c.SessionTokenEnv != "" {
 			return nil, errors.New("S3 tier IAM credential provider does not accept environment credential references")
