@@ -398,12 +398,31 @@ jetstream {
 	}
 }
 
+// storeS3TierReplayMessage retries only a confirmed capacity rejection while
+// preparing replay fixtures. Tight budgets do not promise offload within 100 ms.
+func storeS3TierReplayMessage(t *testing.T, fs *fileStore, payload []byte) uint64 {
+	t.Helper()
+	var seq uint64
+	checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+		var err error
+		seq, _, err = fs.StoreMsg("events", nil, payload, 0)
+		if errors.Is(err, errS3TierLocalCapacity) {
+			return err
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return nil
+	})
+	return seq
+}
+
 func TestFileStoreS3TierReplayAndRestart(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), "test/stream")
 	for i := 1; i <= 100; i++ {
-		if seq, _, err := fs.StoreMsg("events", nil, []byte(fmt.Sprintf("message-%04d-%s", i, strings.Repeat("x", 1000))), 0); err != nil || seq != uint64(i) {
-			t.Fatalf("store %d: seq=%d err=%v", i, seq, err)
+		if seq := storeS3TierReplayMessage(t, fs, []byte(fmt.Sprintf("message-%04d-%s", i, strings.Repeat("x", 1000)))); seq != uint64(i) {
+			t.Fatalf("store %d: seq=%d", i, seq)
 		}
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
@@ -446,9 +465,7 @@ func TestFileStoreS3TierColdReadFetchesOnlySelectedBlock(t *testing.T) {
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/selected-block")
 	defer fs.Stop()
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierReplayMessage(t, fs, []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -468,9 +485,7 @@ func TestFileStoreS3TierRestartDoesNotContactObjectStore(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), "test/offline-restart")
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierReplayMessage(t, fs, []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -1761,9 +1776,7 @@ func TestFileStoreS3TierCorruptionAndMissingConfigFailClosed(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), "test/corruption")
 	for i := 0; i < 100; i++ {
-		if _, _, err := fs.StoreMsg("events", nil, []byte(strings.Repeat("x", 1000)), 0); err != nil {
-			t.Fatal(err)
-		}
+		storeS3TierReplayMessage(t, fs, []byte(strings.Repeat("x", 1000)))
 	}
 	if err := fs.tier.evictToBudget(); err != nil {
 		t.Fatal(err)
@@ -2732,6 +2745,76 @@ func TestFileStoreS3TierRecoveredCoveredTailRemainsImmutable(t *testing.T) {
 	}
 	if seq, _, err := fs.StoreMsg("events", nil, []byte("after restart"), 0); err != nil || seq != 11 {
 		t.Fatalf("append after recovery: seq=%d err=%v", seq, err)
+	}
+	if err = fs.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	fs, err = newFileStore(fcfg, cfg)
+	if err != nil {
+		t.Fatalf("second recovery: %v", err)
+	}
+	defer fs.Stop()
+	for seq := uint64(1); seq <= 11; seq++ {
+		msg, err := fs.LoadMsg(seq, nil)
+		if err != nil {
+			t.Fatalf("load %d: %v", seq, err)
+		}
+		expected := "before restart"
+		if seq == 11 {
+			expected = "after restart"
+		}
+		if string(msg.msg) != expected {
+			t.Fatalf("message %d: got %q, want %q", seq, msg.msg, expected)
+		}
+	}
+}
+
+func TestFileStoreS3TierRecoveredUncommittedTailRemainsImmutable(t *testing.T) {
+	store := &indexFaultStore{S3TierObjectStore: &testS3BlockStore{objects: make(map[string][]byte)}, puts: make(map[string]int), failPrefix: "/manifests/"}
+	cfg := StreamConfig{Name: "RECOVER_TAIL", Storage: FileStorage, Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 16 * 1024, S3Tier: &S3TierConfig{Store: store, Prefix: "test/recover-uncommitted-tail", LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29, RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29}}
+	fs, err := newFileStore(fcfg, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if _, _, err = fs.StoreMsg("events", nil, []byte("before restart"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = fs.DrainS3Tier(); err == nil {
+		t.Fatal("expected failure after immutable descriptor publication")
+	}
+	if err = fs.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := filepath.Glob(filepath.Join(fcfg.StoreDir, msgDir, "*.blk"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) == 0 {
+			if err = os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err = os.Remove(filepath.Join(fcfg.StoreDir, msgDir, "index.db")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	fs, err = newFileStore(fcfg, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq, _, err := fs.StoreMsg("events", nil, []byte("after restart"), 0); err != nil || seq != 11 {
+		t.Fatalf("append after recovery: seq=%d err=%v", seq, err)
+	}
+	if _, err = fs.DrainS3Tier(); err != nil {
+		t.Fatalf("complete remote coverage after restart: %v", err)
 	}
 	if err = fs.Stop(); err != nil {
 		t.Fatal(err)

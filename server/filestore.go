@@ -591,6 +591,15 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 		}
 	}()
 
+	// A remote descriptor can be durable before its local coverage root. After a
+	// crash, even an apparently uncovered tail may already be immutable remotely.
+	// Seal recovered nonempty tails without making startup depend on S3 reads.
+	if fs.tier != nil && fs.lmb != nil && fs.lmb.blkSize() > 0 {
+		if _, err = fs.newMsgBlockForWrite(); err != nil {
+			return nil, err
+		}
+	}
+
 	// Recover per-message state like TTLs and schedules.
 	if err = fs.recoverPerMessageState(); err != nil {
 		fs.mu.Unlock()
