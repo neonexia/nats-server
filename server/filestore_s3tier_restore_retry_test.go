@@ -11,6 +11,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -22,15 +23,23 @@ import (
 
 type delayedRestoreStore struct {
 	S3TierObjectStore
+	activation       bool
 	once             sync.Once
 	entered, release chan struct{}
 }
 
 func (s *delayedRestoreStore) Get(ctx context.Context, key string) ([]byte, error) {
-	if strings.Contains(key, "/manifests/") {
+	if !s.activation && strings.Contains(key, "/manifests/") {
 		s.once.Do(func() { close(s.entered); <-s.release })
 	}
 	return s.S3TierObjectStore.Get(ctx, key)
+}
+
+func (s *delayedRestoreStore) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+	if s.activation && strings.HasSuffix(key, "/activation.json") {
+		s.once.Do(func() { close(s.entered); <-s.release })
+	}
+	return s.S3TierObjectStore.PutIfAbsent(ctx, key, data)
 }
 
 func TestJetStreamS3TierConcurrentRestoreRetries(t *testing.T) {
@@ -40,7 +49,12 @@ func TestJetStreamS3TierConcurrentRestoreRetriesCompatibleEndpoint(t *testing.T)
 	testConcurrentRestoreRetries(t, testS3TierCompatibleStore(t))
 }
 func testConcurrentRestoreRetries(t *testing.T, base S3TierObjectStore) {
-	store := &delayedRestoreStore{S3TierObjectStore: base, entered: make(chan struct{}), release: make(chan struct{})}
+	for _, lostReply := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lost_reply_%t", lostReply), func(t *testing.T) { testConcurrentRestoreRetry(t, base, lostReply) })
+	}
+}
+func testConcurrentRestoreRetry(t *testing.T, base S3TierObjectStore, lostReply bool) {
+	store := &delayedRestoreStore{activation: lostReply, S3TierObjectStore: base, entered: make(chan struct{}), release: make(chan struct{})}
 	var release sync.Once
 	defer release.Do(func() { close(store.release) })
 	prefix := fmt.Sprintf("integration/concurrent-restore/%d", time.Now().UnixNano())
@@ -88,11 +102,24 @@ func testConcurrentRestoreRetries(t *testing.T, base S3TierObjectStore) {
 		}
 		results <- err
 	}
-	go request()
+	first := make(chan error, 1)
+	if lostReply {
+		go func() {
+			_, err := tn.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "RETRY"), body, time.Second)
+			first <- err
+		}()
+	} else {
+		go request()
+	}
 	select {
 	case <-store.entered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("restore did not reach delayed storage read")
+	}
+	if lostReply {
+		if err := <-first; !errors.Is(err, nats.ErrTimeout) {
+			t.Fatalf("first restore error = %v, want timeout", err)
+		}
 	}
 	for i := 0; i < 8; i++ {
 		go request()
@@ -100,7 +127,11 @@ func testConcurrentRestoreRetries(t *testing.T, base S3TierObjectStore) {
 	// Repeated client requests overlap the still-running target activation.
 	time.Sleep(100 * time.Millisecond)
 	release.Do(func() { close(store.release) })
-	for i := 0; i < 9; i++ {
+	count := 9
+	if lostReply {
+		count = 8
+	}
+	for i := 0; i < count; i++ {
 		require_NoError(t, <-results)
 	}
 	msg, err := js.GetMsg("RETRY", 1)
