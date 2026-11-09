@@ -632,7 +632,7 @@ func TestFileStoreS3TierReclaimsHydratedCacheBeforeLocalBlocks(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/cache-bound")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -658,7 +658,7 @@ func TestFileStoreS3TierSeparatesRemoteCoverageFromLocalResidency(t *testing.T) 
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/overlap")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 256*1024, 128*1024
 	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 32*1024, 16*1024
 	for i := 0; i < 100; i++ {
@@ -685,7 +685,7 @@ func TestFileStoreS3TierDrainSealsAndCoversTail(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/drain")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1<<30, 1<<29
 	for i := 0; i < 10; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -715,7 +715,7 @@ func TestFileStoreS3TierDrainCreatesImmutableCheckpoint(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/checkpoint")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1<<30, 1<<29
 	for i := 0; i < 10; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -768,7 +768,7 @@ func TestFileStoreS3TierDrainCheckpointFailurePreservesLocalPayload(t *testing.T
 	store := &testS3BlockStore{objects: make(map[string][]byte), failCheckpoint: true}
 	fs, fcfg, _ := testTieredFileStore(t, store, t.TempDir(), "test/checkpoint-failure")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.RemoteHighBytes, fs.tier.cfg.RemoteLowBytes = 1<<30, 1<<29
 	for i := 0; i < 10; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -1513,7 +1513,7 @@ func TestFileStoreS3TierRejectsWritesWhenOffloadCannotRelievePressure(t *testing
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/local-pressure")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -1542,7 +1542,7 @@ func TestFileStoreS3TierFailureKeepsLocalCopy(t *testing.T) {
 			store := &testS3BlockStore{objects: make(map[string][]byte)}
 			fs, fcfg, _ := testTieredFileStore(t, store, t.TempDir(), "test/stream")
 			defer fs.Stop()
-			fs.tier.stop()
+			stopS3TierWorker(t, fs.tier)
 			fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 			for i := 0; i < 100; i++ {
 				storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -1565,7 +1565,7 @@ func TestFileStoreS3TierCollectsOnlyJournaledPayloadDebris(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte), failDescriptor: true}
 	fs, fcfg, _ := testTieredFileStore(t, store, t.TempDir(), "test/gc")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -1628,7 +1628,7 @@ func TestFileStoreS3TierGarbageSkipsPayloadReferencedByDescriptor(t *testing.T) 
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/gc-referenced")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -1662,7 +1662,7 @@ func TestFileStoreS3TierManifestCommitFailureKeepsLocalCopy(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/manifest-failure")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -2577,7 +2577,7 @@ func TestFileStoreS3TierCapacityDoesNotWaitForUploadLock(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/bounded-capacity")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -2635,7 +2635,7 @@ func TestFileStoreS3TierDrainRecoversPartialParallelBatch(t *testing.T) {
 	store := &failOnePayloadStore{testS3BlockStore: &testS3BlockStore{objects: make(map[string][]byte)}, fail: true}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/partial-batch")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	for i := 0; i < 100; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -2663,7 +2663,7 @@ func TestFileStoreS3TierReclaimsBeforeHardCapacityLimit(t *testing.T) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/reclamation-headroom")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<20, 1<<19
 	for i := 0; i < 950; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
@@ -2717,7 +2717,7 @@ func TestFileStoreS3TierBoundsUploadsAcrossStreams(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		fs, _, _ := testTieredFileStore(t, store, t.TempDir(), fmt.Sprintf("test/upload-cap/%d", i))
 		defer fs.Stop()
-		fs.tier.stop()
+		stopS3TierWorker(t, fs.tier)
 		fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 		for j := 0; j < 100; j++ {
 			storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))

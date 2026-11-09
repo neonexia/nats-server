@@ -52,7 +52,7 @@ func TestFileStoreS3TierPressureBatchCompatibleEndpoint(t *testing.T) {
 	store := &descriptorBarrierStore{S3TierObjectStore: testS3TierCompatibleStore(t), entered: make(chan string, 4), release: make(chan struct{})}
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), fmt.Sprintf("pressure-batch/%d", time.Now().UnixNano()))
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	payload := bytes.Repeat([]byte("batch"), 3277)
 	for i := 0; i < 5; i++ {

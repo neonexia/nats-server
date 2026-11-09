@@ -48,7 +48,7 @@ func TestFileStoreS3TierShouldReclaimCoveredBlocksWhenPressureArrivesDuringCover
 	remote := &pressureYieldS3Store{testS3BlockStore: &testS3BlockStore{objects: make(map[string][]byte)}, entered: make(chan struct{}, s3TierUploadBatchSize), release: make(chan struct{}), nextPayload: make(chan bool, 1), firstPayload: filepath.Join(dir, msgDir, "1.blk")}
 	fs, _, _ := testTieredFileStore(t, remote, dir, "test/pressure-yield")
 	defer fs.Stop()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes = 256 * 1024
 	fs.tier.cfg.LocalLowBytes = 16 * 1024
 	fs.tier.cfg.RemoteHighBytes = 16 * 1024

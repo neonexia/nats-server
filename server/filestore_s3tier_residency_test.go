@@ -16,7 +16,7 @@ import (
 func TestFileStoreS3TierResidencyAdmissionSurvivesRestartAndColdReplay(t *testing.T) {
 	remote := &testS3BlockStore{objects: make(map[string][]byte)}
 	fs, fcfg, cfg := testTieredFileStore(t, remote, t.TempDir(), "test/residency-admission")
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	// Stop reclamation to observe admission independently of upload timing.
 	fs.tier.cfg.LocalHighBytes = 32 * 1024
 	fs.tier.cfg.LocalLowBytes = 16 * 1024
