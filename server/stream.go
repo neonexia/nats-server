@@ -7474,6 +7474,10 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		}
 
 		switch err {
+		case errS3TierLocalCapacity:
+			// Local residency pressure rejects admission before storage. Offload
+			// can restore capacity; do not permanently poison stream health.
+			s.RateLimitDebugf("JetStream local residency pressure on stream '%s > %s': %v", accName, name, err)
 		case ErrMaxMsgs, ErrMaxBytes, ErrMaxMsgsPerSubject, ErrMsgTooLarge:
 			s.RateLimitDebugf("JetStream failed to store a msg on stream '%s > %s': %v", accName, name, err)
 		case ErrStoreClosed:

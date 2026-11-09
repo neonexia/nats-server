@@ -426,7 +426,7 @@ The file store needs a tier manager with an object-store interface. Use a real S
 ### Offload state machine
 
 1. A block becomes eligible only after the next block is active, pending writes are flushed and synced according to the stream's durability policy, and compression/rewrite tasks have completed. Keep the active block and a configurable recent reserve local.
-2. When local bytes reach the reclamation trigger one block before the high watermark, choose eligible local blocks until usage is below the low watermark. Coalesce concurrent work per block; bound background I/O so live writes are not starved.
+2. When local bytes reach the reclamation trigger below the high watermark (10% of the high watermark or one block, whichever is larger, bounded by the low watermark), choose eligible local blocks until usage is below the low watermark. Coalesce concurrent work per block; bound background I/O so live writes are not starved.
 3. Upload a new immutable object key containing a generation or content digest. Verify object length and checksum by an independent read or equivalent strong checksum check. An upload alone does not make a block remote-readable.
 4. Commit an immutable remote descriptor with stream identity, block index, sequence bounds, object key/version, checksum, key-material reference, and format version. Commit an immutable manifest generation that includes the descriptor. The local synced descriptor and manifest sidecars speed restart. Commit ordering is **block bytes → verification → remote descriptor → remote manifest → local manifest and descriptor → local unlink**. A crash between steps leaves either a still-local block or an orphan remote object, never a local deletion with no committed remote reference.
 5. Reclaim the local payload only after the descriptor is durable and the block has no active readers or writers. Keep logical stream/account byte counters unchanged. Record separate local payload, local cache, remote retained, and transfer backlog metrics.
@@ -624,3 +624,7 @@ it verifies drain, retained local data during identity outage and restart recove
 It does not stand in for an AWS role-expiry soak. Existing cold-read, immutable-write,
 orphan-GC and remote-restore compatible-endpoint tests can select `default` using
 TEST_S3_TIER_PROVIDER; TEST_S3_TIER_TLS=false is only for a local test endpoint.
+
+### Temporary residency pressure and health
+
+The local residency cap remains a hard admission boundary. Reclamation starts early enough to leave a proportional reserve for writes while background I/O runs; it does not increase that cap or change the independent remote-flush thresholds. If the reserve is exhausted, a publication is rejected before storage. This temporary admission failure must not latch a permanent stream write error: after reclamation, publishing and health recover without restarting the engine. Genuine write failures retain their existing error behavior.

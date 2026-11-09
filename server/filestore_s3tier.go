@@ -1605,7 +1605,7 @@ func (t *fileS3Tier) loop() {
 		wakeScan := false
 		select {
 		case <-t.wake:
-			reclaimAt := t.cfg.LocalHighBytes - min(t.cfg.LocalHighBytes-t.cfg.LocalLowBytes, uint64(t.fs.fcfg.BlockSize))
+			reclaimAt := t.reclaimThreshold()
 			if !t.localPressure.Load() && t.residentSize() <= reclaimAt && time.Now().Before(nextScan) {
 				// Coalesce normal publisher wakes, but keep a timer so the final
 				// write is processed even when no later publisher arrives.
@@ -1654,7 +1654,7 @@ func (t *fileS3Tier) loop() {
 		}
 		// An age flush can consume the remaining local headroom. Do not make
 		// reclamation wait for another publisher wake after that flush yields.
-		reclaimAt := t.cfg.LocalHighBytes - min(t.cfg.LocalHighBytes-t.cfg.LocalLowBytes, uint64(t.fs.fcfg.BlockSize))
+		reclaimAt := t.reclaimThreshold()
 		if err == nil && (!ageTick || t.localPressure.Load() || t.residentSize() > reclaimAt) {
 			err = t.evictToBudget()
 			// Explicit drains and pressure work remain outside this normal-wake
@@ -1806,6 +1806,14 @@ func (t *fileS3Tier) fetchBlock(d s3BlockDescriptor, path string) error {
 	return nil
 }
 
+// Leave at least one block or 10% of the local budget for background
+// reclamation. A single small block gives too little headroom under sustained
+// traffic. Never start below the operator's low watermark or raise the hard cap.
+func (t *fileS3Tier) reclaimThreshold() uint64 {
+	headroom := max(uint64(t.fs.fcfg.BlockSize), t.cfg.LocalHighBytes/10)
+	return t.cfg.LocalHighBytes - min(t.cfg.LocalHighBytes-t.cfg.LocalLowBytes, headroom)
+}
+
 // evictToBudget first gives old sealed blocks remote coverage, then separately
 // reclaims local copies only when the node-local budget requires it. The two
 // watermark pairs intentionally allow an online stream to overlap local and
@@ -1817,9 +1825,8 @@ func (t *fileS3Tier) evictToBudget() error {
 		return ErrStoreClosed
 	}
 	fs := t.fs
-	// Begin reclamation one block before the hard publish fence. This gives
-	// background I/O headroom at steady rates without increasing the budget.
-	reclaimAt := t.cfg.LocalHighBytes - min(t.cfg.LocalHighBytes-t.cfg.LocalLowBytes, uint64(fs.fcfg.BlockSize))
+	// Leave headroom for publishes arriving while the background pass runs.
+	reclaimAt := t.reclaimThreshold()
 	fs.mu.RLock()
 	var used, uncovered uint64
 	t.mu.Lock()
@@ -2634,7 +2641,7 @@ func (t *fileS3Tier) flushAgedBlocks() error {
 		fs.dirty++
 	}
 	fs.mu.Unlock()
-	reclaimAt := t.cfg.LocalHighBytes - min(t.cfg.LocalHighBytes-t.cfg.LocalLowBytes, uint64(fs.fcfg.BlockSize))
+	reclaimAt := t.reclaimThreshold()
 	for len(candidates) > 0 {
 		// Age-based coverage is independent of residency. Yield as soon as
 		// pressure arrives so already committed blocks can free headroom before

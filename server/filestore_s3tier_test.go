@@ -92,6 +92,73 @@ func TestJetStreamS3TierRespondsToCriticalLocalWriteError(t *testing.T) {
 	}
 }
 
+func TestJetStreamS3TierCapacityRejectionRecoversWithoutRestart(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	cfg := &StreamConfig{Name: "PRESSURE", Subjects: []string{"pressure.events"}, Storage: FileStorage,
+		Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
+	fcfg := &FileStoreConfig{BlockSize: 16 * 1024, S3Tier: &S3TierConfig{
+		Store: store, Prefix: "test/pressure-recovery", LocalHighBytes: 32 * 1024, LocalLowBytes: 16 * 1024,
+	}}
+	mset, err := s.GlobalAccount().addStreamWithStore(cfg, fcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := mset.store.(*fileStore)
+	// Hold off background offload to exhaust the budget deterministically.
+	fs.tier.stop()
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+	js, err := nc.JetStream(nats.MaxWait(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var accepted uint64
+	rejected := false
+	for i := 0; i < 100; i++ {
+		ack, err := js.Publish("pressure.events", []byte(strings.Repeat("x", 1000)))
+		if err != nil {
+			if !strings.Contains(err.Error(), errS3TierLocalCapacity.Error()) {
+				t.Fatal(err)
+			}
+			rejected = true
+			break
+		}
+		accepted = ack.Sequence
+	}
+	if !rejected {
+		t.Fatal("expected capacity rejection")
+	}
+	if err := fs.tier.evictToBudget(); err != nil {
+		t.Fatal(err)
+	}
+	ack, err := js.Publish("pressure.events", []byte("recovered"))
+	if err != nil || ack.Sequence != accepted+1 {
+		t.Fatalf("publish after reclamation: %+v, %v", ack, err)
+	}
+	if health := s.Healthz(&HealthzOptions{Account: "$G", Stream: "PRESSURE"}); health.Status != "ok" {
+		t.Fatalf("stream health after reclamation: %+v", health)
+	}
+	info, err := js.StreamInfo("PRESSURE")
+	if err != nil {
+		t.Fatalf("stream health after reclamation: %v", err)
+	}
+	if info.State.Msgs != accepted+1 {
+		t.Fatalf("stored messages = %d, want %d", info.State.Msgs, accepted+1)
+	}
+	for seq := uint64(1); seq <= accepted+1; seq++ {
+		msg, err := js.GetMsg("PRESSURE", seq)
+		want := strings.Repeat("x", 1000)
+		if seq == accepted+1 {
+			want = "recovered"
+		}
+		if err != nil || string(msg.Data) != want {
+			t.Fatalf("read %d after reclamation: %v", seq, err)
+		}
+	}
+}
+
 type testS3BlockStore struct {
 	mu             sync.Mutex
 	objects        map[string][]byte
@@ -2585,8 +2652,8 @@ func TestFileStoreS3TierReclaimsBeforeHardCapacityLimit(t *testing.T) {
 	fs, _, _ := testTieredFileStore(t, store, t.TempDir(), "test/reclamation-headroom")
 	defer fs.Stop()
 	fs.tier.stop()
-	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 64*1024, 32*1024
-	for i := 0; i < 50; i++ {
+	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<20, 1<<19
+	for i := 0; i < 950; i++ {
 		storeS3TierFixtureMessage(t, fs, "events", []byte(strings.Repeat("x", 1000)))
 	}
 	before := fs.S3TierStats()
