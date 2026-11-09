@@ -13,12 +13,14 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 type s3TierRemoteRestoreMaterial struct {
@@ -233,26 +235,68 @@ func (t *fileS3Tier) stageRemoteRestore(dir string, material *s3TierRemoteRestor
 	if err := writeS3TierRestoreFile(filepath.Join(msgPath, "s3-tier.checkpoint.json"), material.messageData); err != nil {
 		return err
 	}
+	// A small fixed pipeline bounds memory and object-store pressure while
+	// overlapping independent block downloads and file syncs. Wait for every
+	// worker before returning: cleanup and disk-reservation release must never
+	// race a write into the private staging tree.
+	parent := t.remoteCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	blocks := make(chan s3BlockDescriptor)
+	var workers sync.WaitGroup
+	var failed sync.Once
+	var restoreErr error
+	for range min(4, len(material.manifest.Blocks)) {
+		workers.Go(func() {
+			for block := range blocks {
+				if err := t.stageRemoteRestoreBlock(ctx, msgPath, block); err != nil {
+					failed.Do(func() { restoreErr = err; cancel() })
+					return
+				}
+			}
+		})
+	}
+dispatch:
 	for _, block := range material.manifest.Blocks {
-		ctx, cancel := t.ctx()
-		data, err := t.cfg.Store.Get(ctx, block.Key)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("remote restore block %d read failed: %w", block.Index, err)
-		}
-		if len(data) != block.Size || checksumS3Block(data) != block.SHA256 {
-			return fmt.Errorf("remote restore block %d checksum or size mismatch", block.Index)
-		}
-		descriptorData, err := json.Marshal(block)
-		if err != nil {
-			return err
-		}
-		if err := writeS3TierRestoreFile(filepath.Join(msgPath, fmt.Sprintf(blkScan, block.Index)), data); err != nil {
-			return err
-		}
-		if err := writeS3TierRestoreFile(filepath.Join(msgPath, fmt.Sprintf("%d.tier.json", block.Index)), descriptorData); err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			break dispatch
+		case blocks <- block:
 		}
 	}
+	close(blocks)
+	workers.Wait()
+	if restoreErr != nil {
+		return restoreErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return syncDir(dir)
+}
+
+func (t *fileS3Tier) stageRemoteRestoreBlock(parent context.Context, dir string, block s3BlockDescriptor) error {
+	ctx, cancel := context.WithTimeout(parent, t.cfg.Timeout)
+	data, err := t.cfg.Store.Get(ctx, block.Key)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("remote restore block %d read failed: %w", block.Index, err)
+	}
+	if len(data) != block.Size || checksumS3Block(data) != block.SHA256 {
+		return fmt.Errorf("remote restore block %d checksum or size mismatch", block.Index)
+	}
+	if err := parent.Err(); err != nil {
+		return err
+	}
+	descriptorData, err := json.Marshal(block)
+	if err != nil {
+		return err
+	}
+	if err := writeS3TierRestoreFile(filepath.Join(dir, fmt.Sprintf(blkScan, block.Index)), data); err != nil {
+		return err
+	}
+	return writeS3TierRestoreFile(filepath.Join(dir, fmt.Sprintf("%d.tier.json", block.Index)), descriptorData)
 }
