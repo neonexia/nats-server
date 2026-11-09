@@ -32,6 +32,9 @@ type s3TierRemoteRestoreMaterial struct {
 }
 
 func s3TierStreamConfigSHA256(cfg StreamConfig) (string, error) {
+	// Sealing is a durable admission fence, not a change of stream identity.
+	// Active uploads, archival and recovery must share the same fingerprint.
+	cfg.Sealed = false
 	buf, err := json.Marshal(cfg)
 	if err != nil {
 		return "", err

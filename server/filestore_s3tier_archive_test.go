@@ -334,3 +334,47 @@ func TestJetStreamS3TierArchiveWaitsForColdReadBeforeRemovingFiles(t *testing.T)
 		t.Fatalf("late hydration: %v", err)
 	}
 }
+
+func TestJetStreamS3TierSealedStreamRestartsBeforeArchive(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	s, opts, nc, js := archiveTestServer(t, store)
+	for i := 0; i < 20; i++ {
+		_, err := js.Publish("archive", []byte(fmt.Sprintf("message-%d", i)))
+		require_NoError(t, err)
+	}
+	// Active streams upload before they are sealed. A restart must retain that
+	// immutable identity while the independently durable archive is pending.
+	msg, err := nc.Request(fmt.Sprintf(JSApiStreamDrainRemoteT, "ARCHIVE"), nil, 5*time.Second)
+	require_NoError(t, err)
+	if strings.Contains(string(msg.Data), `"error"`) {
+		t.Fatalf("drain: %s", msg.Data)
+	}
+	sealArchiveTestStream(t, js)
+	nc.Close()
+	s.Shutdown()
+	s.WaitForShutdown()
+	s = RunServer(&opts)
+	defer s.Shutdown()
+	nc = clientConnectToServer(t, s)
+	defer nc.Close()
+	js, err = nc.JetStream()
+	require_NoError(t, err)
+	info, err := js.StreamInfo("ARCHIVE")
+	require_NoError(t, err)
+	if !info.Config.Sealed || info.State.Msgs != 20 {
+		t.Fatalf("restored stream: %+v", info)
+	}
+	for seq := uint64(1); seq <= 20; seq++ {
+		message, err := js.GetMsg("ARCHIVE", seq)
+		require_NoError(t, err)
+		if string(message.Data) != fmt.Sprintf("message-%d", seq-1) {
+			t.Fatalf("message %d: %q", seq, message.Data)
+		}
+	}
+	response := archiveTestRequest(t, nc, "after-restart")
+	if response.Error != nil || !response.Success || response.CoveredThrough != 20 {
+		t.Fatalf("archive after restart: %+v", response)
+	}
+	_, err = js.Publish("sibling", []byte("still available"))
+	require_NoError(t, err)
+}

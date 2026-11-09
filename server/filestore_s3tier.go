@@ -678,8 +678,11 @@ func (fs *fileStore) prepareS3Tier() error {
 	}
 	if buf, err := os.ReadFile(t.streamRecordFile()); err == nil {
 		var record s3TierStreamRecord
-		if err := json.Unmarshal(buf, &record); err != nil || !t.validStreamRecord(&record) {
-			return fmt.Errorf("invalid local S3 tier stream record: %v", err)
+		if err := json.Unmarshal(buf, &record); err != nil {
+			return fmt.Errorf("invalid local S3 tier stream record: %w", err)
+		}
+		if !t.validStreamRecord(&record) {
+			return errors.New("local S3 tier stream record does not match stream identity or configuration")
 		}
 		t.record = &record
 		if manifestIncarnation != "" && manifestIncarnation != record.Incarnation {
@@ -866,11 +869,7 @@ func validS3BlockDescriptor(d s3BlockDescriptor) bool {
 }
 
 func (t *fileS3Tier) configSHA256() (string, error) {
-	buf, err := json.Marshal(t.fs.cfg.StreamConfig)
-	if err != nil {
-		return "", err
-	}
-	return checksumS3Block(buf), nil
+	return s3TierStreamConfigSHA256(t.fs.cfg.StreamConfig)
 }
 
 func (t *fileS3Tier) validStreamRecord(record *s3TierStreamRecord) bool {
