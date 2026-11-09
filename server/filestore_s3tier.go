@@ -495,6 +495,7 @@ type fileS3Tier struct {
 	stats            s3TierCounters
 	wake             chan struct{}
 	quit             chan struct{}
+	stopped          chan struct{} // Closed after the worker stops reading immutable configuration.
 	once             sync.Once
 }
 
@@ -527,7 +528,7 @@ func newFileS3Tier(fs *fileStore, cfg S3TierConfig) *fileS3Tier {
 		cfg.RemoteHighBytes, cfg.RemoteLowBytes = cfg.LocalHighBytes, cfg.LocalLowBytes
 	}
 	remoteCtx, remoteCancel := context.WithCancel(context.Background())
-	return &fileS3Tier{fs: fs, remoteCtx: remoteCtx, remoteCancel: remoteCancel, cfg: cfg, resident: make(map[uint32]uint64), desc: make(map[uint32]s3BlockDescriptor), fetch: make(map[uint32]*s3TierFetch), wake: make(chan struct{}, 1), quit: make(chan struct{})}
+	return &fileS3Tier{fs: fs, remoteCtx: remoteCtx, remoteCancel: remoteCancel, cfg: cfg, resident: make(map[uint32]uint64), desc: make(map[uint32]s3BlockDescriptor), fetch: make(map[uint32]*s3TierFetch), wake: make(chan struct{}, 1), quit: make(chan struct{}), stopped: make(chan struct{})}
 }
 
 func validateS3Tier(fcfg FileStoreConfig, cfg StreamConfig) error {
@@ -1576,6 +1577,7 @@ func (t *fileS3Tier) hasDescriptor(index uint32) bool {
 }
 
 func (t *fileS3Tier) loop() {
+	defer close(t.stopped)
 	var ageC <-chan time.Time
 	if t.cfg.RemoteFlushMaxAge > 0 {
 		// Polling is bounded even for tiny configured ages. The due decision

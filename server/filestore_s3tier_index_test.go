@@ -87,7 +87,7 @@ func TestFileStoreS3TierIndexPublicationFailuresCompatibleEndpoint(t *testing.T)
 			dir := t.TempDir()
 			prefix := fmt.Sprintf("paged-failure/%d/%s", time.Now().UnixNano(), stage)
 			fs, fcfg, cfg := testTieredFileStore(t, store, dir, prefix)
-			fs.tier.stop()
+			stopS3TierWorker(t, fs.tier)
 			fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 			fcfg.S3Tier.LocalHighBytes, fcfg.S3Tier.LocalLowBytes = 1<<30, 1<<29
 			payload := bytes.Repeat([]byte("x"), 16*1024)
@@ -173,7 +173,7 @@ func TestFileStoreS3TierIndexPublicationFailuresCompatibleEndpoint(t *testing.T)
 				t.Fatalf("offline restart: %v", err)
 			}
 			defer reopened.Stop()
-			reopened.tier.stop()
+			stopS3TierWorker(t, reopened.tier)
 			store.mu.Lock()
 			if store.gets != gets {
 				t.Errorf("same-node restart contacted object store: %d reads", store.gets-gets)
@@ -245,7 +245,7 @@ func testFileStoreS3TierPagedIndexBounds(t *testing.T, count int, minimumLevel u
 	store := testS3TierCompatibleStore(t)
 	fs, fcfg, cfg := testTieredFileStore(t, store, t.TempDir(), fmt.Sprintf("paged-bounds/%d", time.Now().UnixNano()))
 	defer func() { fs.Stop() }()
-	fs.tier.stop()
+	stopS3TierWorker(t, fs.tier)
 	fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 	fcfg.S3Tier.LocalHighBytes, fcfg.S3Tier.LocalLowBytes = 1<<30, 1<<29
 	payload := bytes.Repeat([]byte("b"), 16*1024)
@@ -305,7 +305,7 @@ func testFileStoreS3TierPagedIndexBounds(t *testing.T, count int, minimumLevel u
 		if err != nil {
 			t.Fatal(err)
 		}
-		fs.tier.stop()
+		stopS3TierWorker(t, fs.tier)
 	}
 	for _, seq := range []uint64{1, 64, 65, uint64(count - 1), uint64(count)} {
 		m, err := fs.LoadMsg(seq, nil)
@@ -322,7 +322,7 @@ func TestFileStoreS3TierIndexConflictKeepsLocalCompatibleEndpoint(t *testing.T) 
 			store := &indexFaultStore{S3TierObjectStore: real, failPrefix: kind, conflict: true, puts: make(map[string]int)}
 			fs, _, _ := testTieredFileStore(t, store, t.TempDir(), fmt.Sprintf("paged-conflict/%d", time.Now().UnixNano()))
 			defer fs.Stop()
-			fs.tier.stop()
+			stopS3TierWorker(t, fs.tier)
 			fs.tier.cfg.LocalHighBytes, fs.tier.cfg.LocalLowBytes = 1<<30, 1<<29
 			payload := bytes.Repeat([]byte("conflict"), 4096)
 			for i := 0; i < 3; i++ {

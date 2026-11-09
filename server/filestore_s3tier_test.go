@@ -335,6 +335,18 @@ func (s *testS3BlockStore) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+// Fault fixtures change immutable configuration only after the background
+// worker exits. Closing quit alone still permits an already selected wake.
+func stopS3TierWorker(t *testing.T, tier *fileS3Tier) {
+	t.Helper()
+	tier.stop()
+	select {
+	case <-tier.stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("S3 tier worker did not stop")
+	}
+}
+
 func testTieredFileStore(t *testing.T, store S3TierObjectStore, dir, prefix string) (*fileStore, FileStoreConfig, StreamConfig) {
 	t.Helper()
 	fcfg := FileStoreConfig{StoreDir: dir, BlockSize: 16 * 1024, S3Tier: &S3TierConfig{
