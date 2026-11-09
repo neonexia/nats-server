@@ -5111,6 +5111,15 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		}
 	}
 	checkpointKey := tier.remoteRestoreCheckpointKey(req.OperationID)
+	// Staging verifies the complete checkpoint locally. Reclaim its covered
+	// payloads before advertising an active target, otherwise the first publish
+	// can hit the residency fence while background eviction is still pending.
+	if err := fs.tier.evictToBudget(); err != nil {
+		cleanupRemoteRestoreTarget(mset)
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 	activation, err := fs.tier.claimRemoteRestoreActivation(req.OperationID, req.ExpectedEpoch, req.TargetID, checkpointKey)
 	if err != nil {
 		cleanupRemoteRestoreTarget(mset)
