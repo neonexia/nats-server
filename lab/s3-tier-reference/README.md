@@ -5,6 +5,9 @@ remote recovery protocol. It starts a local RustFS S3-compatible server and
 independent source and target `nats-server` processes. The client uses only normal NATS publishing,
 durable consumers, and the public remote-restore management subjects.
 
+The harness explicitly enables and verifies `s3_tier` on its streams; server
+configuration alone does not enable remote storage.
+
 The run exercises:
 
 - concurrent raw-message publishers;

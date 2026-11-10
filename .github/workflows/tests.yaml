@@ -160,6 +160,29 @@ jobs:
           -run 'Test(FileStoreS3TierCompatibleEndpoint|FileStoreS3TierGarbageCompatibleEndpoint|JetStreamS3TierRemoteRestoreCompatibleEndpoint)$'
           -count=1
 
+      - name: Qualify AWS chain refresh and failures with real RustFS
+        env:
+          TEST_S3_TIER_ENDPOINT: 127.0.0.1:19000
+        run: >-
+          go test -race ./server
+          -run '^TestJetStreamS3Tier(DefaultCredential|DefaultRefreshCompatibleEndpoint|CredentialProviderSelection)'
+          -count=1 -timeout=4m
+
+      - name: Qualify default-chain object operations
+        env:
+          TEST_S3_TIER_ENDPOINT: 127.0.0.1:19000
+          TEST_S3_TIER_PROVIDER: default
+          TEST_S3_TIER_TLS: 'false'
+          TEST_S3_TIER_REGION: us-east-1
+          TEST_S3_TIER_BUCKET: tier-test
+          AWS_ACCESS_KEY_ID: testaccess
+          AWS_SECRET_ACCESS_KEY: testsecret123
+          AWS_EC2_METADATA_DISABLED: 'true'
+        run: >-
+          go test -race ./server
+          -run '^Test(JetStreamS3TierImmutableCompatibleEndpoint|FileStoreS3TierCompatibleEndpoint|JetStreamS3TierRemoteRestoreCompatibleEndpoint)$'
+          -count=1 -timeout=4m
+
       - name: Run S3-tier disk-full integration test
         env:
           TEST_S3_TIER_DISK_FULL: 1

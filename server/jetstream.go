@@ -172,11 +172,14 @@ type jsAccount struct {
 	// Serializes archive cleanup with stream creation. Serving existing
 	// streams does not take this lock, so sibling traffic remains independent.
 	archiveMu sync.Mutex
-	js        *jetStream
-	account   *Account
-	storeDir  string
-	inflight  sync.Map
-	streams   map[string]*stream
+	// Async status uses a separate lock so polling never waits for object I/O.
+	archiveTaskMu sync.Mutex
+	archiveTask   *s3TierArchiveTask
+	js            *jetStream
+	account       *Account
+	storeDir      string
+	inflight      sync.Map
+	streams       map[string]*stream
 
 	// From server
 	sendq *ipQueue[*pubMsg]
@@ -2637,6 +2640,10 @@ func (jsa *jsAccount) acc() *Account {
 
 // Delete the JetStream resources.
 func (jsa *jsAccount) delete() {
+	// Account shutdown must not stop a store while an archive is committing its
+	// receipt and removing files. Archives observe server shutdown between I/O.
+	jsa.archiveMu.Lock()
+	defer jsa.archiveMu.Unlock()
 	var streams []*stream
 
 	jsa.mu.Lock()

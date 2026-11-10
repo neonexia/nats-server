@@ -32,7 +32,7 @@ func archiveTestRequest(t *testing.T, nc *nats.Conn, operation string) JSApiStre
 	return response
 }
 
-func archiveTestServer(t *testing.T, store S3TierObjectStore) (*Server, Options, *nats.Conn, nats.JetStreamContext) {
+func archiveTestServer(t *testing.T, store S3TierObjectStore, timeout ...time.Duration) (*Server, Options, *nats.Conn, nats.JetStreamContext) {
 	t.Helper()
 	opts := DefaultTestOptions
 	opts.Port, opts.JetStream, opts.StoreDir = -1, true, t.TempDir()
@@ -40,6 +40,9 @@ func archiveTestServer(t *testing.T, store S3TierObjectStore) (*Server, Options,
 		Store: store, Prefix: "test/archive", BlockSize: 16 * 1024,
 		LocalHighBytes: 1 << 30, LocalLowBytes: 1 << 29, RemoteHighBytes: 1 << 30, RemoteLowBytes: 1 << 29,
 	}}
+	if len(timeout) > 0 {
+		opts.JetStreamS3Tiers["$G/ARCHIVE"].Timeout = timeout[0]
+	}
 	s := RunServer(&opts)
 	t.Cleanup(s.Shutdown)
 	nc := clientConnectToServer(t, s)
@@ -105,7 +108,12 @@ func TestJetStreamS3TierArchiveRemovesOnlyRetiredFiles(t *testing.T) {
 			require_NoError(t, json.Unmarshal(store.objects[response.ArchiveKey], &receipt))
 			var manifest s3TierManifest
 			require_NoError(t, json.Unmarshal(store.objects[receipt.Checkpoint.ManifestKey], &manifest))
-			for _, block := range manifest.Blocks {
+			store.mu.Unlock()
+			reader := &fileS3Tier{cfg: S3TierConfig{Store: store, Prefix: receipt.Prefix, Timeout: time.Second}}
+			blocks, _, err := reader.loadManifestIndex(manifest)
+			require_NoError(t, err)
+			store.mu.Lock()
+			for _, block := range blocks {
 				if checksumS3Block(store.objects[block.Key]) != block.SHA256 {
 					t.Errorf("lost remote block %s", block.Key)
 				}
@@ -138,7 +146,7 @@ func TestJetStreamS3TierArchiveRemovesOnlyRetiredFiles(t *testing.T) {
 }
 
 func TestJetStreamS3TierArchiveFailurePreservesLocalData(t *testing.T) {
-	for _, failure := range []string{"object-store", "corrupt-block", "tombstone-directory"} {
+	for _, failure := range []string{"object-store", "corrupt-block", "missing-index-page", "corrupt-index-page", "tombstone-directory"} {
 		t.Run(failure, func(t *testing.T) {
 			store := &testS3BlockStore{objects: make(map[string][]byte)}
 			s, _, nc, js := archiveTestServer(t, store)
@@ -154,7 +162,7 @@ func TestJetStreamS3TierArchiveFailurePreservesLocalData(t *testing.T) {
 				store.failPut = true
 				store.mu.Unlock()
 			}
-			if failure == "corrupt-block" {
+			if failure == "corrupt-block" || strings.Contains(failure, "index-page") {
 				msg, err := nc.Request(fmt.Sprintf(JSApiStreamDrainRemoteT, "ARCHIVE"), nil, 5*time.Second)
 				require_NoError(t, err)
 				var r JSApiStreamDrainRemoteResponse
@@ -164,15 +172,20 @@ func TestJetStreamS3TierArchiveFailurePreservesLocalData(t *testing.T) {
 				}
 				store.mu.Lock()
 				for key, data := range store.objects {
-					if strings.HasSuffix(key, ".blk") {
+					if (failure == "corrupt-block" && strings.HasSuffix(key, ".blk")) ||
+						(strings.Contains(failure, "index-page") && strings.Contains(key, "/index/pages/")) {
 						savedKey, saved = key, append([]byte(nil), data...)
-						store.objects[key] = []byte("corrupt")
+						if failure == "missing-index-page" {
+							delete(store.objects, key)
+						} else {
+							store.objects[key] = []byte("corrupt")
+						}
 						break
 					}
 				}
 				store.mu.Unlock()
 				if savedKey == "" {
-					t.Fatal("no uploaded payload")
+					t.Fatal("no uploaded object to fault")
 				}
 			}
 			parent := filepath.Dir(jsa.archiveTombstoneFile("ARCHIVE"))
@@ -320,4 +333,48 @@ func TestJetStreamS3TierArchiveWaitsForColdReadBeforeRemovingFiles(t *testing.T)
 	if _, err := fs.LoadMsg(1, nil); err != ErrStoreClosed {
 		t.Fatalf("late hydration: %v", err)
 	}
+}
+
+func TestJetStreamS3TierSealedStreamRestartsBeforeArchive(t *testing.T) {
+	store := &testS3BlockStore{objects: make(map[string][]byte)}
+	s, opts, nc, js := archiveTestServer(t, store)
+	for i := 0; i < 20; i++ {
+		_, err := js.Publish("archive", []byte(fmt.Sprintf("message-%d", i)))
+		require_NoError(t, err)
+	}
+	// Active streams upload before they are sealed. A restart must retain that
+	// immutable identity while the independently durable archive is pending.
+	msg, err := nc.Request(fmt.Sprintf(JSApiStreamDrainRemoteT, "ARCHIVE"), nil, 5*time.Second)
+	require_NoError(t, err)
+	if strings.Contains(string(msg.Data), `"error"`) {
+		t.Fatalf("drain: %s", msg.Data)
+	}
+	sealArchiveTestStream(t, js)
+	nc.Close()
+	s.Shutdown()
+	s.WaitForShutdown()
+	s = RunServer(&opts)
+	defer s.Shutdown()
+	nc = clientConnectToServer(t, s)
+	defer nc.Close()
+	js, err = nc.JetStream()
+	require_NoError(t, err)
+	info, err := js.StreamInfo("ARCHIVE")
+	require_NoError(t, err)
+	if !info.Config.Sealed || info.State.Msgs != 20 {
+		t.Fatalf("restored stream: %+v", info)
+	}
+	for seq := uint64(1); seq <= 20; seq++ {
+		message, err := js.GetMsg("ARCHIVE", seq)
+		require_NoError(t, err)
+		if string(message.Data) != fmt.Sprintf("message-%d", seq-1) {
+			t.Fatalf("message %d: %q", seq, message.Data)
+		}
+	}
+	response := archiveTestRequest(t, nc, "after-restart")
+	if response.Error != nil || !response.Success || response.CoveredThrough != 20 {
+		t.Fatalf("archive after restart: %+v", response)
+	}
+	_, err = js.Publish("sibling", []byte("still available"))
+	require_NoError(t, err)
 }

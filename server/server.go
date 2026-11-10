@@ -174,6 +174,7 @@ type Server struct {
 	stats
 	scStats
 	staleStats
+	placement           *placementState
 	mu                  sync.RWMutex
 	reloadMu            sync.RWMutex // Write-locked when a config reload is taking place ONLY
 	kp                  nkeys.KeyPair
@@ -962,6 +963,10 @@ func NewServer(opts *Options) (*Server, error) {
 	// Used to setup Authorization.
 	s.configureAuthorization()
 
+	if opts.Placement != nil {
+		s.placement = &placementState{bootID: pub}
+	}
+
 	// Start signal handler
 	s.handleSignals()
 
@@ -1165,6 +1170,9 @@ func validatePinnedCerts(pinned PinnedCertSet) error {
 }
 
 func validateOptions(o *Options) error {
+	if err := validatePlacementConfig(o); err != nil {
+		return err
+	}
 	if o.LameDuckDuration > 0 && o.LameDuckGracePeriod >= o.LameDuckDuration {
 		return fmt.Errorf("lame duck grace period (%v) should be strictly lower than lame duck duration (%v)",
 			o.LameDuckGracePeriod, o.LameDuckDuration)
@@ -2345,6 +2353,12 @@ func (s *Server) Start() {
 	s.grRunning = true
 	s.grMu.Unlock()
 
+	if err := s.startPlacementControl(); err != nil {
+		s.Errorf("Placement control: %v", err)
+		s.Shutdown()
+		return
+	}
+
 	s.startRateLimitLogExpiration()
 
 	// Pprof http endpoint for the profiler.
@@ -2620,6 +2634,7 @@ func (s *Server) Shutdown() {
 	if !s.shutdown.CompareAndSwap(false, true) {
 		return
 	}
+	s.stopPlacementControl()
 	// This is for JetStream R1 Pull Consumers to allow signaling
 	// that pending pull requests are invalid.
 	s.signalPullConsumers()

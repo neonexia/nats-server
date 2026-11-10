@@ -4974,12 +4974,23 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	// A timed-out caller can retry while activation is still running. Serialize
+	// the existence check with activation so retries observe its durable receipt
+	// instead of staging another copy or seeing a partially restored stream.
+	_, jsa, err := acc.checkForJetStream()
+	if err != nil {
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	jsa.archiveMu.Lock()
+	defer jsa.archiveMu.Unlock()
 	if existing, err := acc.lookupStream(stream); err == nil {
 		fs, ok := existing.store.(*fileStore)
 		if ok && fs.tier != nil {
 			activation := fs.tier.remoteRestoreActivation()
 			if activation != nil && activation.OperationID == req.OperationID && activation.Epoch == req.ExpectedEpoch && activation.TargetID == req.TargetID {
-				if err := existing.completeRestore(); err == nil {
+				if err = existing.completeRestore(); err == nil {
 					err = existing.completeRemoteRestoreConsumers()
 				}
 				if err == nil {
@@ -5014,14 +5025,6 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
-	_, jsa, err := acc.checkForJetStream()
-	if err != nil {
-		resp.Error = NewJSStreamGeneralError(err, Unless(err))
-		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
-		return
-	}
-	jsa.archiveMu.Lock()
-	defer jsa.archiveMu.Unlock()
 	stageDir := filepath.Join(jsa.storeDir, "__remote_restore__", stream, req.OperationID)
 	if _, err := os.Stat(jsa.archiveTombstoneFile(stream)); err == nil || !os.IsNotExist(err) {
 		resp.Error = NewJSStreamNameExistRestoreFailedError()
@@ -5108,6 +5111,15 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		}
 	}
 	checkpointKey := tier.remoteRestoreCheckpointKey(req.OperationID)
+	// Staging verifies the complete checkpoint locally. Reclaim its covered
+	// payloads before advertising an active target, otherwise the first publish
+	// can hit the residency fence while background eviction is still pending.
+	if err := fs.tier.evictToBudget(); err != nil {
+		cleanupRemoteRestoreTarget(mset)
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 	activation, err := fs.tier.claimRemoteRestoreActivation(req.OperationID, req.ExpectedEpoch, req.TargetID, checkpointKey)
 	if err != nil {
 		cleanupRemoteRestoreTarget(mset)

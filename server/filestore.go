@@ -489,6 +489,7 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 	defer func() {
 		if err != nil {
 			if fs != nil && fs.tier != nil {
+				fs.tier.remoteCancel()
 				fs.tier.stop()
 			}
 			ats.Unregister()
@@ -589,6 +590,15 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 			fs.mu.Unlock()
 		}
 	}()
+
+	// A remote descriptor can be durable before its local coverage root. After a
+	// crash, even an apparently uncovered tail may already be immutable remotely.
+	// Seal recovered nonempty tails without making startup depend on S3 reads.
+	if fs.tier != nil && fs.lmb != nil && fs.lmb.blkSize() > 0 {
+		if _, err = fs.newMsgBlockForWrite(); err != nil {
+			return nil, err
+		}
+	}
 
 	// Recover per-message state like TTLs and schedules.
 	if err = fs.recoverPerMessageState(); err != nil {
@@ -5377,7 +5387,7 @@ func (fs *fileStore) genEncryptionKeysForBlock(mb *msgBlock) error {
 // Stores a raw message with expected sequence number and timestamp.
 // Lock should be held.
 func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, ttl int64, discardNewCheck bool) (err error) {
-	if fs.tier != nil && fs.dios.budget.Load() != nil {
+	if fs.tier != nil {
 		if err := fs.tier.ensureProjectedLocalCapacity(fileStoreMsgSize(subj, hdr, msg)); err != nil {
 			return err
 		}
@@ -7863,6 +7873,9 @@ func (mb *msgBlock) writeMsgRecord(rl, seq uint64, subj string, mhdr, msg []byte
 // filestore lock will be held.
 // mb lock should be held.
 func (mb *msgBlock) writeMsgRecordLocked(rl, seq uint64, subj string, mhdr, msg []byte, ts int64, flush, kick bool) (rerr error) {
+	if tier := mb.fs.tier; tier != nil {
+		tier.accountResidentAppend(mb.index, addSaturate(mb.rbytes, rl))
+	}
 	if budget := mb.fs.dios.budget.Load(); budget != nil {
 		rollback, err := budget.reserveGrowth(mb.mfn, addSaturate(mb.rbytes, rl), false)
 		if err != nil {
@@ -8163,7 +8176,10 @@ func (fs *fileStore) checkLastBlock(rl uint64) (lmb *msgBlock, err error) {
 	// Grab our current last message block.
 	lmb = fs.lmb
 	rbytes := lmb.blkSize()
-	if lmb == nil || (rbytes > 0 && rbytes+rl > fs.fcfg.BlockSize) {
+	// A crash can lose the empty replacement tail after remote coverage commits.
+	// The recovered last block is then immutable even when it has spare capacity.
+	covered := lmb != nil && fs.tier != nil && fs.tier.hasDescriptor(lmb.index)
+	if lmb == nil || covered || (rbytes > 0 && rbytes+rl > fs.fcfg.BlockSize) {
 		if lmb, err = fs.newMsgBlockForWrite(); err != nil {
 			return nil, err
 		}
@@ -13060,6 +13076,8 @@ func (fs *fileStore) stop(delete, writeState bool) error {
 	// so we don't end up with this function running more than once.
 	fs.closing = true
 	if fs.tier != nil {
+		// Cancel remote waits before joining workers outside the store lock.
+		fs.tier.remoteCancel()
 		fs.tier.stop()
 	}
 
@@ -13106,6 +13124,17 @@ func (fs *fileStore) stop(delete, writeState bool) error {
 	// syncMu before fs.mu.
 	fs.syncMu.Lock()
 	fs.syncMu.Unlock() //nolint:staticcheck // Only waiting for in-flight syncBlocks.
+
+	if fs.tier != nil {
+		// Remote commits and cold fetches write local files outside fs.mu.
+		// A caller may reopen or remove this directory immediately after Stop;
+		// join these writes before returning. Waiting while holding fs.mu would
+		// deadlock workers that need it to finish their publication checks.
+		fs.tier.runMu.Lock()
+		fs.tier.runMu.Unlock() //nolint:staticcheck // Only waiting for in-flight tier commits.
+		fs.tier.hydrateMu.Lock()
+		fs.tier.hydrateMu.Unlock()
+	}
 
 	fs.cmu.Lock()
 	var _cfs [256]ConsumerStore
