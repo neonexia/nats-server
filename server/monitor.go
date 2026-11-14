@@ -3753,7 +3753,8 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 		fis, _ := os.ReadDir(sdir)
 		var accFound, streamFound, consumerFound bool
 		for _, fi := range fis {
-			if fi.Name() == snapStagingDir {
+			// Engine journals are files beside account directories, not accounts.
+			if !fi.IsDir() || fi.Name() == snapStagingDir {
 				continue
 			}
 			if opts.Account != _EMPTY_ {

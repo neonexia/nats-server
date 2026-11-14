@@ -156,3 +156,42 @@ func TestJetStreamS3TierRestoreCancelsPayloadReadsBeforeRetry(t *testing.T) {
 		}
 	})
 }
+
+func TestJetStreamS3TierRestorePayloadLimitsCompatibleEndpoint(t *testing.T) {
+	testRemoteRestoreLocalBudget(t, testS3TierCompatibleStore(t), func(nc *nats.Conn, body []byte) {
+		var request JSApiStreamRestoreRemoteRequest
+		require_NoError(t, json.Unmarshal(body, &request))
+		for _, limits := range []S3TierRestoreLimits{
+			{PayloadBytes: 1, BytesPerSecond: 1 << 20, BurstBytes: 4096, Concurrency: 1},
+			{PayloadBytes: 1 << 20, BytesPerSecond: 0, BurstBytes: 4096, Concurrency: 1},
+			{PayloadBytes: 1 << 20, BytesPerSecond: 1 << 20, BurstBytes: 4096, Concurrency: 5},
+		} {
+			request.RestoreLimits = &limits
+			encoded, err := json.Marshal(request)
+			require_NoError(t, err)
+			m, err := nc.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "BUDGET"), encoded, 5*time.Second)
+			require_NoError(t, err)
+			var result JSApiStreamRemoteRestoreResponse
+			require_NoError(t, json.Unmarshal(m.Data, &result))
+			if result.Success || result.Error == nil {
+				t.Fatalf("unsafe limit accepted: %+v", result)
+			}
+		}
+		request.RestoreLimits = &S3TierRestoreLimits{PayloadBytes: 1 << 20, BytesPerSecond: 1 << 20, BurstBytes: 4096, Concurrency: 1}
+		encoded, err := json.Marshal(request)
+		require_NoError(t, err)
+		started := time.Now()
+		m, err := nc.Request(fmt.Sprintf(JSApiStreamRestoreRemoteT, "BUDGET"), encoded, 10*time.Second)
+		require_NoError(t, err)
+		var result JSApiStreamRemoteRestoreResponse
+		require_NoError(t, json.Unmarshal(m.Data, &result))
+		if result.Error != nil || !result.Success {
+			t.Fatalf("limited restore failed: %+v", result)
+		}
+		// 512 KiB payload plus record overhead, less one 4 KiB initial burst,
+		// at 1 MiB/s cannot finish in less than 490 ms.
+		if elapsed := time.Since(started); elapsed < 490*time.Millisecond {
+			t.Fatalf("restore bypassed download rate: %s", elapsed)
+		}
+	})
+}

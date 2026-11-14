@@ -171,7 +171,8 @@ type jsAccount struct {
 	mu sync.RWMutex
 	// Serializes archive cleanup with stream creation. Serving existing
 	// streams does not take this lock, so sibling traffic remains independent.
-	archiveMu sync.Mutex
+	archiveMu sync.RWMutex
+	restoreMu [64]sync.Mutex
 	// Async status uses a separate lock so polling never waits for object I/O.
 	archiveTaskMu sync.Mutex
 	archiveTask   *s3TierArchiveTask

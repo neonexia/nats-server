@@ -1246,7 +1246,7 @@ func (a *Account) addStreamWithAssignmentAndModeLocked(config *StreamConfig, fsC
 	jsa.mu.Lock()
 	jsa.streams[cfg.Name] = mset
 	jsa.mu.Unlock()
-	if recovering && !restoring {
+	if recovering && !mset.restoring {
 		mset.store.Ready()
 	}
 
@@ -5604,7 +5604,14 @@ func (mset *stream) setupStore(fsCfg *FileStoreConfig, recovering bool) error {
 		mset.store = fs
 		if fs.tier != nil {
 			mset.remoteRestore = fs.tier.remoteRestoreState()
-			mset.remoteRestoreFence.Store(mset.remoteRestore.fenced())
+			stage := fs.tier.remoteRestoreTargetStage()
+			staged := stage != nil && !stage.Activated
+			mset.remoteRestoreFence.Store(mset.remoteRestore.fenced() || staged)
+			// A restart must not turn a verified-but-uncommitted target into a
+			// leader. This is established before setLeader installs ingress.
+			if staged {
+				mset.restoring = true
+			}
 		}
 	}
 	// This will fire the callback but we do not require the lock since md will be 0 here.

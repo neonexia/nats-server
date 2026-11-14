@@ -1047,6 +1047,11 @@ func (mset *stream) addConsumerForRestore(config *ConsumerConfig) (*consumer, er
 }
 
 func (mset *stream) addConsumerWithAssignmentAndMode(config *ConsumerConfig, oname string, ca *consumerAssignment, isRecovering bool, action ConsumerAction, pedantic, restoring bool) (*consumer, error) {
+	if isRecovering {
+		mset.mu.RLock()
+		restoring = restoring || mset.restoring
+		mset.mu.RUnlock()
+	}
 	if !restoring {
 		mset.remoteConsumerMu.RLock()
 		defer mset.remoteConsumerMu.RUnlock()
@@ -1060,7 +1065,10 @@ func (mset *stream) addConsumerWithAssignmentAndMode(config *ConsumerConfig, ona
 	s, js, jsa, cfg, acc, lseq := mset.srv, mset.js, mset.jsa, mset.cfg, mset.acc, mset.lseq
 	fenced := mset.remoteRestore.fenced()
 	mset.mu.RUnlock()
-	if fenced && !restoring {
+	// Recovery must load existing consumer state even on a fenced source.
+	// Rejecting it would omit durable readers from the later handoff checkpoint.
+	// The stream fence still blocks delivery, ACKs and ordinary consumer creation.
+	if fenced && !restoring && !isRecovering {
 		return nil, NewJSConsumerCreateError(errS3TierRemoteRestoreFenced, Unless(errS3TierRemoteRestoreFenced))
 	}
 

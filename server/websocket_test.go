@@ -4757,7 +4757,18 @@ func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
 	createSub(nc2)
 	createSub(nc3)
 
-	checkSubInterest(t, s1, globalAccountName, "foo", time.Second)
+	// Both remote subscriptions must reach the publisher before this core-NATS
+	// delivery test starts; any interest only proves that one recipient is ready.
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		acc, err := s1.LookupAccount(globalAccountName)
+		if err != nil {
+			return err
+		}
+		if n := len(acc.sl.Match("foo").psubs); n != 2 {
+			return fmt.Errorf("expected two subscriber routes, got %d", n)
+		}
+		return nil
+	})
 
 	nc1 := natsConnect(t, s1.WebsocketURL())
 	defer nc1.Close()
@@ -4776,8 +4787,24 @@ func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
 		s.mu.RUnlock()
 	}
 
+	// Exercise frame splitting with bounded outstanding traffic. An unbounded
+	// flood can disconnect a reader at max_pending before framing is checked.
+	// Keep the complete delivery run within the original ten-second budget.
+	deadline := time.Now().Add(10 * time.Second)
 	for i := 0; i < total; i++ {
 		natsPub(t, nc1, "foo", payload)
+		if (i+1)%1000 == 0 {
+			for atomic.LoadInt32(&count) < int32(2*(i+1)) && time.Now().Before(deadline) {
+				select {
+				case err := <-errCh:
+					t.Fatalf("Error: %v", err)
+				case <-time.After(time.Millisecond):
+				}
+			}
+			if !time.Now().Before(deadline) {
+				break
+			}
+		}
 		if i%100 == 0 {
 			select {
 			case err := <-errCh:
@@ -4791,8 +4818,11 @@ func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
 		t.Fatalf("Error: %v", err)
 	case <-doneCh:
 		return
-	case <-time.After(10 * time.Second):
-		t.Fatalf("Test timed out")
+	case <-time.After(time.Until(deadline)):
+		t.Fatalf("Test timed out: received %d of %d messages; slow consumers=%d/%d/%d; client errors=%v/%v/%v",
+			atomic.LoadInt32(&count), 2*total,
+			s1.NumSlowConsumers(), s2.NumSlowConsumers(), s3.NumSlowConsumers(),
+			nc1.LastError(), nc2.LastError(), nc3.LastError())
 	}
 }
 
