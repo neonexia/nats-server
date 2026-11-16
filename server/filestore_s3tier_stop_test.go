@@ -13,22 +13,22 @@ import (
 	"time"
 )
 
-// A remote operation can be cancelled while its result is still returning.
+// A remote operation can be canceled while its result is still returning.
 // Stop must cancel the wait and join the caller before its directory is reused.
 type stoppingS3Store struct {
 	*testS3BlockStore
-	mode      string
-	blocked   atomic.Bool
-	entered   chan struct{}
-	cancelled chan struct{}
-	release   chan struct{}
+	mode     string
+	blocked  atomic.Bool
+	entered  chan struct{}
+	canceled chan struct{}
+	release  chan struct{}
 }
 
 func (s *stoppingS3Store) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
 	if s.mode == "payload_outage" && strings.HasSuffix(key, ".blk") && s.blocked.CompareAndSwap(false, true) {
 		close(s.entered)
 		<-ctx.Done()
-		close(s.cancelled)
+		close(s.canceled)
 		return false, ctx.Err()
 	}
 	return s.testS3BlockStore.PutIfAbsent(ctx, key, data)
@@ -39,7 +39,7 @@ func (s *stoppingS3Store) Get(ctx context.Context, key string) ([]byte, error) {
 	if err == nil && s.mode == "committed_root_response" && strings.Contains(key, "/manifests/") && s.blocked.CompareAndSwap(false, true) {
 		close(s.entered)
 		<-ctx.Done()
-		close(s.cancelled)
+		close(s.canceled)
 		<-s.release
 	}
 	return data, err
@@ -48,7 +48,7 @@ func (s *stoppingS3Store) Get(ctx context.Context, key string) ([]byte, error) {
 func TestFileStoreS3TierShouldCancelAndJoinRemoteWritesBeforeStopReturns(t *testing.T) {
 	for _, mode := range []string{"payload_outage", "committed_root_response"} {
 		t.Run(mode, func(t *testing.T) {
-			remote := &stoppingS3Store{testS3BlockStore: &testS3BlockStore{objects: make(map[string][]byte)}, mode: mode, entered: make(chan struct{}), cancelled: make(chan struct{}), release: make(chan struct{})}
+			remote := &stoppingS3Store{testS3BlockStore: &testS3BlockStore{objects: make(map[string][]byte)}, mode: mode, entered: make(chan struct{}), canceled: make(chan struct{}), release: make(chan struct{})}
 			fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 16 * 1024, S3Tier: &S3TierConfig{Store: remote, Prefix: "stop/" + mode, LocalHighBytes: 1024 * 1024, LocalLowBytes: 512 * 1024, RemoteFlushMaxAge: time.Millisecond, Timeout: 30 * time.Second}}
 			cfg := StreamConfig{Name: "STOP", Subjects: []string{"events"}, Storage: FileStorage, Retention: LimitsPolicy, Discard: DiscardNew, DenyDelete: true, DenyPurge: true}
 			fs, err := newFileStore(fcfg, cfg)
@@ -77,7 +77,7 @@ func TestFileStoreS3TierShouldCancelAndJoinRemoteWritesBeforeStopReturns(t *test
 			stopped := make(chan error, 1)
 			go func() { stopped <- fs.Stop() }()
 			select {
-			case <-remote.cancelled:
+			case <-remote.canceled:
 			case <-time.After(time.Second):
 				t.Fatal("Stop did not cancel the remote wait before its 30-second request timeout")
 			}

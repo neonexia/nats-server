@@ -8,10 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/nats-io/nats.go"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 func TestJetStreamS3TierPreparedSourceRecoversConsumersAfterCrashCompatibleEndpoint(t *testing.T) {

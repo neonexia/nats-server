@@ -19,6 +19,9 @@ concurrency:
 jobs:
   lint:
     name: Lint
+    timeout-minutes: 15
+    env:
+      GOMEMLIMIT: 5GiB
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -34,10 +37,10 @@ jobs:
         # Commit 82606bf257cbaff209d206a39f5134f0cfbfd2ee = tag v9.2.1
         uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee
         with:
-          version: v2.13.0
+          version: v2.14.0
           skip-cache: true
           skip-save-cache: true
-          args: --timeout=5m --config=.golangci.yml
+          args: --timeout=10m --concurrency=2 --config=.golangci.yml
 
   build-latest:
     name: Build (Latest Go)
