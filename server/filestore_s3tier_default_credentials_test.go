@@ -55,13 +55,13 @@ func TestJetStreamS3TierDefaultRefreshCompatibleEndpoint(t *testing.T) {
 	var unavailable atomic.Bool
 	identity := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if unavailable.Load() {
-			http.Error(w, "identity unavailable", 503)
+			http.Error(w, "identity unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		result, err := stsClient.AssumeRole(r.Context(), &sts.AssumeRoleInput{RoleArn: aws.String("arn:aws:iam::123456789012:role/test"), RoleSessionName: aws.String("credential-test"), DurationSeconds: aws.Int32(900)})
 		if err != nil {
 			t.Errorf("RustFS STS: %v", err)
-			http.Error(w, "STS failed", 503)
+			http.Error(w, "STS failed", http.StatusServiceUnavailable)
 			return
 		}
 		rotations.Add(1)
@@ -188,7 +188,7 @@ func TestJetStreamS3TierDefaultCredentialTimeout(t *testing.T) {
 			case <-release:
 			case <-r.Context().Done():
 			}
-			http.Error(w, "unavailable", 503)
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		objectRequests.Add(1)
@@ -219,7 +219,7 @@ func TestJetStreamS3TierDefaultCredentialRefreshAndRecovery(t *testing.T) {
 		defer mu.Unlock()
 		if r.URL.Path == "/credentials" {
 			if unavailable.Load() {
-				http.Error(w, "provider failure with secret material", 503)
+				http.Error(w, "provider failure with secret material", http.StatusServiceUnavailable)
 				return
 			}
 			generation++

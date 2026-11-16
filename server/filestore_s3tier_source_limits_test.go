@@ -7,10 +7,11 @@ package server
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/nats-io/nats.go"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 func TestJetStreamS3TierSourceLimitsSurviveRestartAndIsolateSibling(t *testing.T) {
@@ -118,10 +119,10 @@ func TestJetStreamS3TierSourceLimitsSurviveRestartAndIsolateSibling(t *testing.T
 	cancelRequest := JSApiStreamRemoteRestoreRequest{OperationID: "cancel", SourceLimits: &S3TierSourceLimits{BytesPerSecond: 32, BurstBytes: 4096}}
 	_, err = call("CANCEL", true, cancelRequest)
 	require_NoError(t, err)
-	cancelled := make(chan error, 1)
+	canceled := make(chan error, 1)
 	go func() {
 		_, err := call("CANCEL", false, JSApiStreamRemoteRestoreRequest{OperationID: "cancel"})
-		cancelled <- err
+		canceled <- err
 	}()
 	time.Sleep(100 * time.Millisecond)
 	stopped := make(chan struct{})
@@ -132,8 +133,8 @@ func TestJetStreamS3TierSourceLimitsSurviveRestartAndIsolateSibling(t *testing.T
 		t.Fatal("shutdown blocked on source upload limiter")
 	}
 	nc.Close()
-	if err := <-cancelled; err == nil {
-		t.Fatal("cancelled checkpoint reported success")
+	if err := <-canceled; err == nil {
+		t.Fatal("canceled checkpoint reported success")
 	}
 }
 

@@ -13133,7 +13133,7 @@ func (fs *fileStore) stop(delete, writeState bool) error {
 		fs.tier.runMu.Lock()
 		fs.tier.runMu.Unlock() //nolint:staticcheck // Only waiting for in-flight tier commits.
 		fs.tier.hydrateMu.Lock()
-		fs.tier.hydrateMu.Unlock()
+		fs.tier.hydrateMu.Unlock() //nolint:staticcheck // Wait for admitted cold reads before filesystem teardown.
 	}
 
 	fs.cmu.Lock()

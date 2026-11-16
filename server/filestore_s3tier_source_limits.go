@@ -6,8 +6,9 @@ package server
 import (
 	"context"
 	"errors"
-	"golang.org/x/time/rate"
 	"sync"
+
+	"golang.org/x/time/rate"
 )
 
 // S3TierSourceLimits bounds checkpoint uploads, including metadata. Streams of

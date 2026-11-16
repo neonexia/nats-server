@@ -336,7 +336,7 @@ func (s *Server) archiveStream(acc *Account, name, operation string) (*s3TierArc
 		// Archive lets admitted cold reads finish before stop cancels remote
 		// requests. Do not hold this barrier across stop, which joins readers.
 		fs.tier.hydrateMu.Lock()
-		fs.tier.hydrateMu.Unlock()
+		fs.tier.hydrateMu.Unlock() //nolint:staticcheck // Wait for admitted cold reads before filesystem teardown.
 		// File-store stop quiesces uploads and cold reads before returning,
 		// so cleanup cannot race a late sidecar, index-page or payload write.
 		if err = mset.stop(false, false); err != nil {

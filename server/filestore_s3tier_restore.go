@@ -17,11 +17,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"golang.org/x/time/rate"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"golang.org/x/time/rate"
 )
 
 type s3TierRemoteRestoreMaterial struct {
