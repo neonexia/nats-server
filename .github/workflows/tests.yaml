@@ -2,6 +2,7 @@ name: NATS Server Tests
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -256,6 +257,7 @@ jobs:
         run: ./scripts/runTestsOnTravis.sh js_consumer_tests
 
   js-cluster-1:
+    if: github.repository == 'nats-io/nats-server'
     name: Test JetStream Cluster 1
     needs: [build-latest, build-supported, lint]
     runs-on: ${{ vars.GHA_WORKER_LARGE || 'ubuntu-latest' }}
@@ -273,6 +275,7 @@ jobs:
         run: ./scripts/runTestsOnTravis.sh js_cluster_tests_1
 
   js-cluster-2:
+    if: github.repository == 'nats-io/nats-server'
     name: Test JetStream Cluster 2
     needs: [build-latest, build-supported, lint]
     runs-on: ${{ vars.GHA_WORKER_LARGE || 'ubuntu-latest' }}
@@ -290,6 +293,7 @@ jobs:
         run: ./scripts/runTestsOnTravis.sh js_cluster_tests_2
 
   js-cluster-3:
+    if: github.repository == 'nats-io/nats-server'
     name: Test JetStream Cluster 3
     needs: [build-latest, build-supported, lint]
     runs-on: ${{ vars.GHA_WORKER_LARGE || 'ubuntu-latest' }}
@@ -307,6 +311,7 @@ jobs:
         run: ./scripts/runTestsOnTravis.sh js_cluster_tests_3
 
   js-cluster-4:
+    if: github.repository == 'nats-io/nats-server'
     name: Test JetStream Cluster 4
     needs: [build-latest, build-supported, lint]
     runs-on: ${{ vars.GHA_WORKER_LARGE || 'ubuntu-latest' }}
@@ -324,6 +329,7 @@ jobs:
         run: ./scripts/runTestsOnTravis.sh js_cluster_tests_4
 
   js-supercluster:
+    if: github.repository == 'nats-io/nats-server'
     name: Test JetStream Supercluster
     needs: [build-latest, build-supported, lint]
     runs-on: ${{ vars.GHA_WORKER_LARGE || 'ubuntu-latest' }}

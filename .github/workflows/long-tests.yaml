@@ -3,9 +3,6 @@ name: NATS Server Long Tests
 on:
   # Allow manual trigger (any branch)
   workflow_dispatch:
-  # Run daily at 12:30 on default branch
-  schedule:
-    - cron: "30 12 * * *"
 
 permissions:
   contents: read
