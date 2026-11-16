@@ -55,6 +55,93 @@ func TestDiskBudgetPreservesBufferedReservationsAcrossScan(t *testing.T) {
 	}
 }
 
+func TestDiskBudgetScanDoesNotBlockWritersOrReplaceNewerAccounting(t *testing.T) {
+	for _, migration := range []bool{false, true} {
+		for _, action := range []string{"reserve", "flush", "delete", "rename", "cancel"} {
+			t.Run(fmt.Sprintf("migration=%v/%s", migration, action), func(t *testing.T) {
+				root := t.TempDir()
+				dir := filepath.Join(root, "stream")
+				if err := os.Mkdir(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(dir, "data.blk")
+				if err := os.WriteFile(path, make([]byte, 4096), 0600); err != nil {
+					t.Fatal(err)
+				}
+				b, err := newFileDiskBudget(root, DiskBudgetConfig{LimitBytes: 1 << 20, ReserveBytes: 128 << 10, MinFreeBytes: 1})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if migration {
+					if err := b.reserveMigration(diskMigrationReservation{Version: 1, OperationID: "scan-move", Roots: []string{"stream"}, LimitBytes: 256 << 10}, 128<<10); err != nil {
+						t.Fatal(err)
+					}
+				}
+				observed, resume, scanned := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+				var once sync.Once
+				unblock := func() { once.Do(func() { close(resume) }) }
+				t.Cleanup(unblock)
+				go func() {
+					scanned <- b.reconcileWithWalk(func(root string, visit filepath.WalkFunc) error {
+						err := filepath.Walk(root, visit)
+						close(observed)
+						<-resume
+						return err
+					})
+				}()
+				<-observed
+				mutated := make(chan error, 1)
+				go func() {
+					var err error
+					switch action {
+					case "reserve", "flush", "cancel":
+						var cancel func()
+						cancel, err = b.reserveGrowth(path, 64<<10, false)
+						if err == nil && action == "flush" {
+							err = os.WriteFile(path, make([]byte, 64<<10), 0600)
+							if err == nil {
+								b.completed(path)
+							}
+						}
+						if err == nil && action == "cancel" {
+							cancel()
+						}
+					case "delete":
+						err = os.Remove(path)
+						if err == nil {
+							b.completed(path)
+						}
+					case "rename":
+						target := filepath.Join(dir, "renamed.blk")
+						err = os.Rename(path, target)
+						if err == nil {
+							b.renamedTree(path, target)
+						}
+					}
+					mutated <- err
+				}()
+				select {
+				case err := <-mutated:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("publisher accounting blocked behind filesystem enumeration")
+				}
+				want := b.snapshot()
+				unblock()
+				if err := <-scanned; err != nil {
+					t.Fatal(err)
+				}
+				got := b.snapshot()
+				if got.UsedBytes != want.UsedBytes || got.ReservedBytes != want.ReservedBytes || got.MigrationUsedBytes != want.MigrationUsedBytes || got.MigrationReservedBytes != want.MigrationReservedBytes {
+					t.Fatalf("stale scan replaced newer accounting: got=%+v want=%+v", got, want)
+				}
+			})
+		}
+	}
+}
+
 func TestDiskBudgetConcurrentReservationsCannotOverspend(t *testing.T) {
 	root := t.TempDir()
 	b, err := newFileDiskBudget(root, DiskBudgetConfig{LimitBytes: 128 * 1024, ReserveBytes: 16 * 1024, MinFreeBytes: 1})
@@ -442,5 +529,65 @@ func TestDiskBudgetColdDownloadReservesBeforeRemoteRead(t *testing.T) {
 	}
 	if stats := b.snapshot(); stats.ReservedBytes != 0 {
 		t.Fatalf("cold rejection leaked reservation: %+v", stats)
+	}
+}
+
+// File-store metadata replacement and archive cleanup can unlink entries while
+// the budget scan enumerates them. This must not fence unrelated publications.
+func TestDiskBudgetDirectoryChurnDoesNotCloseAdmission(t *testing.T) {
+	root := t.TempDir()
+	b, err := newFileDiskBudget(root, DiskBudgetConfig{LimitBytes: 64 << 20, ReserveBytes: 8 << 20, MinFreeBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := make([]string, 128)
+	for i := range paths {
+		paths[i] = filepath.Join(root, fmt.Sprintf("meta-%03d", i))
+		if err := os.WriteFile(paths[i], []byte("metadata"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			for _, path := range paths {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = os.Remove(path)
+				_ = os.WriteFile(path, []byte("replacement"), 0600)
+			}
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	for i := 0; i < 100; i++ {
+		if err := b.reconcile(); err != nil {
+			t.Fatalf("ordinary metadata churn fenced storage: %v", err)
+		}
+		if got := b.snapshot(); !got.Admission {
+			t.Fatalf("admission closed below budget: %+v", got)
+		}
+	}
+}
+
+func TestDiskBudgetJournalDoesNotFailServerHealth(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	if err := os.WriteFile(filepath.Join(s.StoreDir(), migrationBudgetFile), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if status := s.Healthz(nil); status.Status != "ok" {
+		t.Fatalf("engine journal changed server health: %+v", status)
+	}
+	// An actual unresolved account directory must still fail readiness.
+	if err := os.Mkdir(filepath.Join(s.StoreDir(), "unresolved-account"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if status := s.Healthz(nil); status.Status != "unavailable" || status.StatusCode != 503 {
+		t.Fatalf("unresolved account was hidden: %+v", status)
 	}
 }

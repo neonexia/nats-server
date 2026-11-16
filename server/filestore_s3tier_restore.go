@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"golang.org/x/time/rate"
 )
 
 type s3TierRemoteRestoreMaterial struct {
@@ -164,12 +166,42 @@ func writeS3TierRestoreFile(path string, data []byte) error {
 // points at it until the caller verifies the staged state and completes the
 // activation receipt protocol.
 func (t *fileS3Tier) stageRemoteRestore(dir string, material *s3TierRemoteRestoreMaterial, budgets ...*fileDiskBudget) error {
+	return t.stageRemoteRestoreLimited(dir, material, nil, budgets...)
+}
+
+func (t *fileS3Tier) stageRemoteRestoreLimited(dir string, material *s3TierRemoteRestoreMaterial, limits *S3TierRestoreLimits, budgets ...*fileDiskBudget) error {
 	if material == nil {
 		return errors.New("remote restore material is required")
+	}
+	// A live warmup is only a cache. Remove blocks absent from the final pinned
+	// manifest before file-store recovery can discover them as extra messages.
+	if err := pruneRemoteRestoreBlocks(filepath.Join(dir, msgDir), material.manifest.Blocks); err != nil {
+		return err
+	}
+
+	var limiter *rate.Limiter
+	concurrency := 4
+	if limits != nil {
+		if err := limits.admit(material.manifest.Blocks); err != nil {
+			return err
+		}
+		limiter = rate.NewLimiter(rate.Limit(limits.BytesPerSecond), limits.BurstBytes)
+		concurrency = limits.Concurrency
 	}
 	var budget *fileDiskBudget
 	if len(budgets) > 0 {
 		budget = budgets[0]
+	}
+	var downloadSlots chan struct{}
+	if limits != nil && limits.operationID != "" {
+		if budget == nil {
+			return errors.New("shared migration download budget required")
+		}
+		shared, err := budget.migrationDownloadBudget(*limits)
+		if err != nil {
+			return err
+		}
+		limiter, downloadSlots = shared.limiter, shared.slots
 	}
 	if budget != nil {
 		sizes := map[string]uint64{
@@ -249,10 +281,31 @@ func (t *fileS3Tier) stageRemoteRestore(dir string, material *s3TierRemoteRestor
 	var workers sync.WaitGroup
 	var failed sync.Once
 	var restoreErr error
-	for range min(4, len(material.manifest.Blocks)) {
+	for range min(concurrency, len(material.manifest.Blocks)) {
 		workers.Go(func() {
 			for block := range blocks {
-				if err := t.stageRemoteRestoreBlock(ctx, msgPath, block); err != nil {
+				var err error
+				acquired := false
+				if !validStagedRemoteBlock(msgPath, block) {
+					if downloadSlots != nil {
+						select {
+						case downloadSlots <- struct{}{}:
+							acquired = true
+						case <-ctx.Done():
+							err = ctx.Err()
+						}
+					}
+					if err == nil {
+						err = waitRestoreDownload(ctx, limiter, block.Size)
+					}
+				}
+				if err == nil {
+					err = t.stageRemoteRestoreBlock(ctx, msgPath, block)
+				}
+				if acquired {
+					<-downloadSlots
+				}
+				if err != nil {
 					failed.Do(func() { restoreErr = err; cancel() })
 					return
 				}
@@ -279,6 +332,9 @@ dispatch:
 }
 
 func (t *fileS3Tier) stageRemoteRestoreBlock(parent context.Context, dir string, block s3BlockDescriptor) error {
+	if validStagedRemoteBlock(dir, block) {
+		return parent.Err()
+	}
 	ctx, cancel := context.WithTimeout(parent, t.cfg.Timeout)
 	data, err := t.cfg.Store.Get(ctx, block.Key)
 	cancel()
@@ -299,4 +355,43 @@ func (t *fileS3Tier) stageRemoteRestoreBlock(parent context.Context, dir string,
 		return err
 	}
 	return writeS3TierRestoreFile(filepath.Join(dir, fmt.Sprintf("%d.tier.json", block.Index)), descriptorData)
+}
+
+// Reuse requires both immutable identity and payload verification. Neither a
+// matching filename nor length proves a cache survived a crash intact.
+func validStagedRemoteBlock(dir string, block s3BlockDescriptor) bool {
+	descriptor, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("%d.tier.json", block.Index)))
+	if err != nil {
+		return false
+	}
+	var stored s3BlockDescriptor
+	if json.Unmarshal(descriptor, &stored) != nil || stored != block {
+		return false
+	}
+	payload, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf(blkScan, block.Index)))
+	return err == nil && len(payload) == block.Size && checksumS3Block(payload) == block.SHA256
+}
+
+func pruneRemoteRestoreBlocks(dir string, blocks []s3BlockDescriptor) error {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	keep := make(map[string]bool, len(blocks)*2)
+	for _, block := range blocks {
+		keep[fmt.Sprintf(blkScan, block.Index)] = true
+		keep[fmt.Sprintf("%d.tier.json", block.Index)] = true
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if (strings.HasSuffix(name, ".blk") || strings.HasSuffix(name, ".tier.json")) && !keep[name] {
+			if err := os.Remove(filepath.Join(dir, name)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

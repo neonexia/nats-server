@@ -13133,7 +13133,7 @@ func (fs *fileStore) stop(delete, writeState bool) error {
 		fs.tier.runMu.Lock()
 		fs.tier.runMu.Unlock() //nolint:staticcheck // Only waiting for in-flight tier commits.
 		fs.tier.hydrateMu.Lock()
-		fs.tier.hydrateMu.Unlock()
+		fs.tier.hydrateMu.Unlock() //nolint:staticcheck // Wait for admitted cold reads before filesystem teardown.
 	}
 
 	fs.cmu.Lock()
@@ -13769,22 +13769,23 @@ func deleteBlockContentsEqual(a, b DeleteBlock) bool {
 ////////////////////////////////////////////////////////////////////////////////
 
 type consumerFileStore struct {
-	mu      sync.Mutex
-	fs      *fileStore
-	cfg     *FileConsumerInfo
-	prf     keyGen
-	aek     cipher.AEAD
-	name    string
-	odir    string
-	ifn     string
-	hh      *highwayhash.Digest64
-	state   ConsumerState
-	fch     chan struct{}
-	qch     chan struct{}
-	flusher bool
-	writing bool
-	dirty   bool
-	closed  bool
+	restoreGeneration uint64
+	mu                sync.Mutex
+	fs                *fileStore
+	cfg               *FileConsumerInfo
+	prf               keyGen
+	aek               cipher.AEAD
+	name              string
+	odir              string
+	ifn               string
+	hh                *highwayhash.Digest64
+	state             ConsumerState
+	fch               chan struct{}
+	qch               chan struct{}
+	flusher           bool
+	writing           bool
+	dirty             bool
+	closed            bool
 }
 
 func (fs *fileStore) ConsumerStore(name string, created time.Time, cfg *ConsumerConfig) (ConsumerStore, error) {
@@ -14055,12 +14056,13 @@ func (o *consumerFileStore) flushLoop(fch, qch chan struct{}) {
 				return
 			}
 			buf, err := o.encodeState()
+			generation := o.restoreGeneration
 			o.mu.Unlock()
 			if err != nil {
 				return
 			}
 			// TODO(dlc) - if we error should start failing upwards.
-			if err := o.writeState(buf); err == nil {
+			if err := o.writeState(buf, generation); err == nil {
 				lastWrite = time.Now()
 			}
 		case <-qch:
@@ -14441,8 +14443,14 @@ func (o *consumerFileStore) encryptState(buf []byte) ([]byte, error) {
 	return o.aek.Seal(nonce, nonce, buf, nil), nil
 }
 
-func (o *consumerFileStore) writeState(buf []byte) error {
+func (o *consumerFileStore) writeState(buf []byte, restoreGeneration ...uint64) error {
 	o.mu.Lock()
+	// A queued background encoding from before a restore barrier must never
+	// overwrite the newer checkpoint after its synchronous durability receipt.
+	if len(restoreGeneration) != 0 && restoreGeneration[0] != o.restoreGeneration {
+		o.mu.Unlock()
+		return nil
+	}
 	// Don't write after being stopped or deleted, otherwise we could recreate the state file.
 	if o.closed {
 		o.mu.Unlock()

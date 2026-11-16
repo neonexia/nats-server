@@ -393,12 +393,13 @@ const (
 // fence; the immutable remote markers make a completed checkpoint discoverable
 // when the source disk is later retired.
 type s3TierRemoteRestoreState struct {
-	Version     uint8     `json:"version"`
-	OperationID string    `json:"operation_id"`
-	Epoch       uint64    `json:"epoch"`
-	State       string    `json:"state"`
-	Created     time.Time `json:"created"`
-	Updated     time.Time `json:"updated"`
+	SourceLimits *S3TierSourceLimits `json:"source_limits,omitempty"`
+	Version      uint8               `json:"version"`
+	OperationID  string              `json:"operation_id"`
+	Epoch        uint64              `json:"epoch"`
+	State        string              `json:"state"`
+	Created      time.Time           `json:"created"`
+	Updated      time.Time           `json:"updated"`
 
 	CheckpointKey    string `json:"checkpoint_key,omitempty"`
 	CheckpointSHA256 string `json:"checkpoint_sha256,omitempty"`
@@ -462,6 +463,7 @@ type S3TierGCResult struct {
 }
 
 type fileS3Tier struct {
+	sourceBudget atomic.Pointer[s3SourceBudget]
 	// Append-only payload residency includes accepted buffered growth. Separate
 	// from logical stream bytes, which also include remotely retained blocks.
 	// Lock order is stream/block -> resident -> disk budget; a resident holder
@@ -490,6 +492,7 @@ type fileS3Tier struct {
 	record           *s3TierStreamRecord
 	checkpoint       *s3TierCheckpoint
 	restore          *s3TierRemoteRestoreState
+	targetStage      *s3TierRemoteRestoreTargetStage
 	activation       *s3TierRemoteRestoreActivation
 	gc               []s3TierGCCandidate
 	stats            s3TierCounters
@@ -528,7 +531,9 @@ func newFileS3Tier(fs *fileStore, cfg S3TierConfig) *fileS3Tier {
 		cfg.RemoteHighBytes, cfg.RemoteLowBytes = cfg.LocalHighBytes, cfg.LocalLowBytes
 	}
 	remoteCtx, remoteCancel := context.WithCancel(context.Background())
-	return &fileS3Tier{fs: fs, remoteCtx: remoteCtx, remoteCancel: remoteCancel, cfg: cfg, resident: make(map[uint32]uint64), desc: make(map[uint32]s3BlockDescriptor), fetch: make(map[uint32]*s3TierFetch), wake: make(chan struct{}, 1), quit: make(chan struct{}), stopped: make(chan struct{})}
+	tier := &fileS3Tier{fs: fs, remoteCtx: remoteCtx, cfg: cfg, resident: make(map[uint32]uint64), desc: make(map[uint32]s3BlockDescriptor), fetch: make(map[uint32]*s3TierFetch), wake: make(chan struct{}, 1), quit: make(chan struct{}), stopped: make(chan struct{})}
+	tier.remoteCancel = func() { remoteCancel(); tier.clearSourceBudget() }
+	return tier
 }
 
 func validateS3Tier(fcfg FileStoreConfig, cfg StreamConfig) error {
@@ -713,6 +718,18 @@ func (fs *fileStore) prepareS3Tier() error {
 			return fmt.Errorf("invalid local S3 tier remote restore state: %v", err)
 		}
 		t.restore = &restore
+		if err := t.configureSourceBudget(&restore); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if buf, err := os.ReadFile(t.remoteRestoreStageFile()); err == nil {
+		var stage s3TierRemoteRestoreTargetStage
+		if err := json.Unmarshal(buf, &stage); err != nil || !stage.valid() {
+			return errors.New("invalid local S3 tier staged target")
+		}
+		t.targetStage = &stage
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -1018,6 +1035,9 @@ func validS3TierRemoteRestoreState(state *s3TierRemoteRestoreState) bool {
 	if state == nil || state.Version != 1 || !validS3TierRemoteRestoreOperationID(state.OperationID) || state.Epoch == 0 || state.Created.IsZero() || state.Updated.IsZero() {
 		return false
 	}
+	if state.SourceLimits != nil && state.SourceLimits.validate() != nil {
+		return false
+	}
 	switch state.State {
 	case s3TierRemoteRestorePrepared, s3TierRemoteRestoreAborted:
 		return state.CheckpointKey == "" && state.CheckpointSHA256 == ""
@@ -1062,12 +1082,21 @@ func (t *fileS3Tier) writeRemoteRestoreState(state *s3TierRemoteRestoreState) er
 	if err != nil {
 		return err
 	}
+	// Install an active ceiling before the durable fence permits checkpointing.
+	if state.fenced() {
+		if err := t.configureSourceBudget(state); err != nil {
+			return err
+		}
+	}
 	if err := writeAtomically(t.fs.dios, t.remoteRestoreFile(), buf, defaultFilePerms, true); err != nil {
 		return err
 	}
 	t.mu.Lock()
 	stateCopy := *state
 	t.restore = &stateCopy
+	if !stateCopy.fenced() {
+		t.clearSourceBudget()
+	}
 	t.mu.Unlock()
 	return nil
 }
@@ -1094,8 +1123,32 @@ func (t *fileS3Tier) writeRemoteRestoreActivation(activation *s3TierRemoteRestor
 // rejecting publishes. An operation ID makes retried control requests
 // idempotent after a lost response or a source restart.
 func (t *fileS3Tier) prepareRemoteRestore(operationID string) (*s3TierRemoteRestoreState, error) {
+	return t.prepareRemoteRestoreLimited(operationID, nil)
+}
+
+func (t *fileS3Tier) prepareRemoteRestoreLimited(operationID string, limits *S3TierSourceLimits) (*s3TierRemoteRestoreState, error) {
+	// Reject an unenforceable aggregate ceiling before writing immutable intent;
+	// a rejected configuration must not occupy the caller's operation ID.
+	if limits != nil && limits.Concurrency > 0 && (t.fs == nil || t.fs.dios == nil || t.fs.dios.budget.Load() == nil) {
+		return nil, errors.New("shared source migration budget required")
+	}
+	if limits != nil {
+		if err := limits.validate(); err != nil {
+			return nil, err
+		}
+	}
 	if !validS3TierRemoteRestoreOperationID(operationID) {
 		return nil, errors.New("remote restore operation ID must contain only letters, digits, '-' or '_'")
+	}
+	// A later operation can replace local state; the remote tombstone must
+	// still prevent a delayed prepare from resurrecting an older aborted ID.
+	if buf, found, err := t.getImmutableIfPresent(t.remoteRestoreActivationKey(operationID)); err != nil {
+		return nil, err
+	} else if found {
+		var aborted s3TierRemoteRestoreState
+		if json.Unmarshal(buf, &aborted) == nil && aborted.State == s3TierRemoteRestoreAborted {
+			return nil, errors.New("remote restore operation was aborted; use a new operation ID")
+		}
 	}
 	t.mu.Lock()
 	if current := t.restore; current != nil {
@@ -1103,6 +1156,9 @@ func (t *fileS3Tier) prepareRemoteRestore(operationID string) (*s3TierRemoteRest
 			state := *current
 			t.mu.Unlock()
 			if state.fenced() {
+				if !sameSourceLimits(state.SourceLimits, limits) {
+					return nil, errors.New("source limits differ from prepared operation")
+				}
 				return &state, nil
 			}
 			return nil, errors.New("remote restore operation was aborted; use a new operation ID")
@@ -1125,13 +1181,16 @@ func (t *fileS3Tier) prepareRemoteRestore(operationID string) (*s3TierRemoteRest
 		if err := json.Unmarshal(buf, &state); err != nil || !validS3TierRemoteRestoreState(&state) || state.OperationID != operationID || state.State != s3TierRemoteRestorePrepared {
 			return nil, errors.New("remote restore intent conflicts with local operation")
 		}
+		if !sameSourceLimits(state.SourceLimits, limits) {
+			return nil, errors.New("source limits differ from durable intent")
+		}
 		if err := t.writeRemoteRestoreState(&state); err != nil {
 			return nil, err
 		}
 		return &state, nil
 	}
 	now := time.Now().UTC()
-	state := &s3TierRemoteRestoreState{Version: 1, OperationID: operationID, Epoch: epoch, State: s3TierRemoteRestorePrepared, Created: now, Updated: now}
+	state := &s3TierRemoteRestoreState{SourceLimits: limits, Version: 1, OperationID: operationID, Epoch: epoch, State: s3TierRemoteRestorePrepared, Created: now, Updated: now}
 	buf, err := json.Marshal(state)
 	if err != nil {
 		return nil, err
@@ -1146,34 +1205,59 @@ func (t *fileS3Tier) prepareRemoteRestore(operationID string) (*s3TierRemoteRest
 }
 
 func (t *fileS3Tier) abortRemoteRestore(operationID string) (*s3TierRemoteRestoreState, error) {
-	t.mu.Lock()
-	if t.restore == nil || t.restore.OperationID != operationID {
-		t.mu.Unlock()
-		return nil, errors.New("remote restore operation is not prepared")
+	if !validS3TierRemoteRestoreOperationID(operationID) {
+		return nil, errors.New("invalid remote restore operation")
 	}
-	state := *t.restore
+	t.mu.Lock()
+	var state s3TierRemoteRestoreState
+	if t.restore != nil {
+		state = *t.restore
+	}
 	t.mu.Unlock()
+	if state.OperationID != operationID {
+		if state.fenced() {
+			return nil, errors.New("another remote restore operation fences this stream")
+		}
+		// A prepare may be delayed or its reply lost. Persist the abort even when
+		// local prepare has not happened, so that late command cannot pause traffic.
+		now := time.Now().UTC()
+		state = s3TierRemoteRestoreState{Version: 1, OperationID: operationID, Epoch: state.Epoch + 1, State: s3TierRemoteRestorePrepared, Created: now, Updated: now}
+		if data, found, err := t.getImmutableIfPresent(t.remoteRestoreIntentKey(operationID)); err != nil {
+			return nil, err
+		} else if found {
+			var intent s3TierRemoteRestoreState
+			if json.Unmarshal(data, &intent) != nil || !validS3TierRemoteRestoreState(&intent) || intent.OperationID != operationID {
+				return nil, errors.New("invalid remote restore intent")
+			}
+			state = intent
+		}
+	}
 	if state.State == s3TierRemoteRestoreAborted {
 		return &state, nil
 	}
-	if state.State != s3TierRemoteRestorePrepared {
+	if !state.fenced() {
 		return nil, errors.New("remote restore operation is not prepared")
 	}
 	state.State, state.Updated = s3TierRemoteRestoreAborted, time.Now().UTC()
-	if buf, found, err := t.getImmutableIfPresent(t.remoteRestoreAbortKey(operationID)); err != nil {
+	state.CheckpointKey, state.CheckpointSHA256 = "", ""
+	// Abort and activation compete for the SAME immutable object. A separate
+	// abort flag checked before activation would leave a dual-writer race.
+	decisionKey := t.remoteRestoreActivationKey(operationID)
+	if buf, found, err := t.getImmutableIfPresent(decisionKey); err != nil {
 		return nil, err
 	} else if found {
-		if err := json.Unmarshal(buf, &state); err != nil || !validS3TierRemoteRestoreState(&state) || state.OperationID != operationID || state.State != s3TierRemoteRestoreAborted {
-			return nil, errors.New("remote restore abort conflicts with local operation")
+		var previous s3TierRemoteRestoreState
+		if json.Unmarshal(buf, &previous) != nil || !validS3TierRemoteRestoreState(&previous) || previous.State != s3TierRemoteRestoreAborted || previous.OperationID != operationID || previous.Epoch != state.Epoch {
+			return nil, errors.New("remote restore ownership already decided; source cannot resume")
 		}
-		if err := t.writeRemoteRestoreState(&state); err != nil {
-			return nil, err
-		}
-		return &state, nil
+		state = previous
 	}
 	buf, err := json.Marshal(&state)
 	if err != nil {
 		return nil, err
+	}
+	if err := t.putImmutable(decisionKey, buf); err != nil {
+		return nil, fmt.Errorf("S3 tier remote restore abort decision failed: %w", err)
 	}
 	if err := t.putImmutable(t.remoteRestoreAbortKey(operationID), buf); err != nil {
 		return nil, fmt.Errorf("S3 tier remote restore abort verification failed: %w", err)
@@ -1238,6 +1322,9 @@ func (t *fileS3Tier) checkpointRemoteRestore(operationID string, checkpoint *s3T
 }
 
 func (t *fileS3Tier) putImmutable(key string, data []byte) error {
+	if err := t.waitSourceUpload(len(data)); err != nil {
+		return err
+	}
 	kind := 3
 	switch {
 	case strings.Contains(key, "/blocks/"):
@@ -1417,6 +1504,9 @@ func (t *fileS3Tier) ensureStreamRecord() (*s3TierStreamRecord, error) {
 	record := &s3TierStreamRecord{Version: 1, Incarnation: hex.EncodeToString(incarnation), Prefix: strings.Trim(t.cfg.Prefix, "/"), StreamName: t.fs.cfg.Name, Created: t.fs.cfg.Created.UnixNano(), ConfigSHA256: digest}
 	buf, err := json.Marshal(record)
 	if err != nil {
+		return nil, err
+	}
+	if err := t.waitSourceUpload(len(buf)); err != nil {
 		return nil, err
 	}
 	ctx, cancel := t.ctx()
@@ -2157,10 +2247,15 @@ func (t *fileS3Tier) backlog() (uint64, uint64) {
 func (t *fileS3Tier) acquireUploadSlot() (func(), error) {
 	ctx, cancel := t.ctx()
 	defer cancel()
+	releaseSource, err := t.acquireSourceUpload(ctx)
+	if err != nil {
+		return nil, err
+	}
 	select {
 	case s3TierUploads <- struct{}{}:
-		return func() { <-s3TierUploads }, nil
+		return func() { <-s3TierUploads; releaseSource() }, nil
 	case <-ctx.Done():
+		releaseSource()
 		return nil, fmt.Errorf("S3 tier upload capacity: %w", ctx.Err())
 	}
 }

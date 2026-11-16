@@ -84,6 +84,12 @@ func TestLeafNodeRandomIP(t *testing.T) {
 	o.LeafNode.ReconnectInterval = 50 * time.Millisecond
 	o.LeafNode.resolver = resolver
 	o.LeafNode.DialTimeout = 15 * time.Millisecond
+	// This test observes address selection across failed connection attempts.
+	// Never dial a developer's unrelated service on the fixed example port:
+	// a successful TCP connection would wait for INFO instead of retrying.
+	o.LeafNode.dialer = func(string, string, time.Duration) (net.Conn, error) {
+		return nil, fmt.Errorf("test destination unavailable")
+	}
 	s := RunServer(o)
 	defer s.Shutdown()
 

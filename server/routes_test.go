@@ -2195,6 +2195,26 @@ func TestRoutePool(t *testing.T) {
 	disconnectRoute(s2, 1)
 }
 
+// Reserve the whole address set before releasing it for simultaneous server
+// startup. Fixed example ports can belong to unrelated developer services.
+func routeTestAddresses(t *testing.T) ([]int, []string) {
+	t.Helper()
+	listeners := make([]net.Listener, 3)
+	ports, addresses := make([]int, 3), make([]string, 3)
+	for i := range listeners {
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		require_NoError(t, err)
+		listeners[i] = listener
+		t.Cleanup(func() { listener.Close() })
+		ports[i] = listener.Addr().(*net.TCPAddr).Port
+		addresses[i] = "nats://" + listener.Addr().String()
+	}
+	for _, listener := range listeners {
+		require_NoError(t, listener.Close())
+	}
+	return ports, addresses
+}
+
 func TestRoutePoolConnectRace(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -2209,23 +2229,25 @@ func TestRoutePoolConnectRace(t *testing.T) {
 			// each one to attempt to connect routes to each other which should lead
 			// to connections needing to be dropped. We make sure that there is still
 			// resolution and there is the expected number of routes.
+			ports, addresses := routeTestAddresses(t)
 			createSrv := func(name string, port int) *Server {
 				o := DefaultOptions()
 				o.Port = -1
 				o.ServerName = name
 				o.Cluster.PoolSize = test.poolSize
 				o.Cluster.Name = "local"
+				o.Cluster.Host = "127.0.0.1"
 				o.Cluster.Port = port
-				o.Routes = RoutesFromStr("nats://127.0.0.1:1234,nats://127.0.0.1:1235,nats://127.0.0.1:1236")
+				o.Routes = RoutesFromStr(strings.Join(addresses, ","))
 				s, err := NewServer(o)
 				if err != nil {
 					t.Fatalf("Error creating server: %v", err)
 				}
 				return s
 			}
-			s1 := createSrv("A", 1234)
-			s2 := createSrv("B", 1235)
-			s3 := createSrv("C", 1236)
+			s1 := createSrv("A", ports[0])
+			s2 := createSrv("B", ports[1])
+			s3 := createSrv("C", ports[2])
 
 			l := &captureDebugLogger{dbgCh: make(chan string, 100)}
 			s1.SetLogger(l, true, false)
@@ -2967,6 +2989,7 @@ func TestRoutePerAccountConnectRace(t *testing.T) {
 	// each one to attempt to connect routes to each other which should lead
 	// to connections needing to be dropped. We make sure that there is still
 	// resolution and there is the expected number of routes.
+	ports, addresses := routeTestAddresses(t)
 	createSrv := func(name string, port int) *Server {
 		o := DefaultOptions()
 		o.Port = -1
@@ -2976,17 +2999,18 @@ func TestRoutePerAccountConnectRace(t *testing.T) {
 		o.Cluster.PoolSize = 1
 		o.Cluster.PinnedAccounts = []string{"A"}
 		o.Cluster.Name = "local"
+		o.Cluster.Host = "127.0.0.1"
 		o.Cluster.Port = port
-		o.Routes = RoutesFromStr("nats://127.0.0.1:1234,nats://127.0.0.1:1235,nats://127.0.0.1:1236")
+		o.Routes = RoutesFromStr(strings.Join(addresses, ","))
 		s, err := NewServer(o)
 		if err != nil {
 			t.Fatalf("Error creating server: %v", err)
 		}
 		return s
 	}
-	s1 := createSrv("A", 1234)
-	s2 := createSrv("B", 1235)
-	s3 := createSrv("C", 1236)
+	s1 := createSrv("A", ports[0])
+	s2 := createSrv("B", ports[1])
+	s3 := createSrv("C", ports[2])
 
 	l := &captureDebugLogger{dbgCh: make(chan string, 100)}
 	s1.SetLogger(l, true, false)
@@ -3035,6 +3059,7 @@ func TestRoutePerAccountConnectRace(t *testing.T) {
 }
 
 func TestRoutePerAccountGossipWorks(t *testing.T) {
+	// Keep gossiped endpoints reachable on the same loopback interface as seeds.
 	tmplA := `
 		port: -1
 		server_name: "A"
@@ -3043,6 +3068,7 @@ func TestRoutePerAccountGossipWorks(t *testing.T) {
 			B { users: [{user: "B", password: "pwd"}] }
 		}
 		cluster {
+			host: "127.0.0.1"
 			port: %d
 			name: "local"
 			accounts: ["A"]
@@ -3061,6 +3087,7 @@ func TestRoutePerAccountGossipWorks(t *testing.T) {
 			B { users: [{user: "B", password: "pwd"}] }
 		}
 		cluster {
+			host: "127.0.0.1"
 			port: -1
 			name: "local"
 			%s
@@ -5051,6 +5078,8 @@ func TestRouteImplicitNotTooManyDuplicates(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			o := DefaultOptions()
 			o.ServerName = "SEED"
+			// The seed and gossiped peers must use the same local interface.
+			o.Cluster.Host = "127.0.0.1"
 			if !test.pooling {
 				o.Cluster.PoolSize = -1
 			}
@@ -5066,6 +5095,7 @@ func TestRouteImplicitNotTooManyDuplicates(t *testing.T) {
 			for i := 0; i < cap(servers); i++ {
 				io := DefaultOptions()
 				io.ServerName = fmt.Sprintf("IMPLICIT_%d", i+1)
+				io.Cluster.Host = "127.0.0.1"
 				io.NoLog = false
 				io.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o.Cluster.Port))
 				if !test.pooling {

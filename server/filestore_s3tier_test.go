@@ -1090,6 +1090,15 @@ func TestJetStreamS3TierRemoteRestoreCheckpointFailureRetries(t *testing.T) {
 }
 
 func TestJetStreamS3TierRemoteRestoreAbortResumesSource(t *testing.T) {
+	testRemoteRestoreAbortResumesSource(t, false, false)
+}
+func TestJetStreamS3TierRemoteRestoreAbortCheckpointResumesSource(t *testing.T) {
+	testRemoteRestoreAbortResumesSource(t, true, false)
+}
+func TestJetStreamS3TierRemoteRestoreAbortBeforePrepare(t *testing.T) {
+	testRemoteRestoreAbortResumesSource(t, false, true)
+}
+func testRemoteRestoreAbortResumesSource(t *testing.T, checkpoint, beforePrepare bool) {
 	store := &testS3BlockStore{objects: make(map[string][]byte)}
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -1117,8 +1126,15 @@ func TestJetStreamS3TierRemoteRestoreAbortResumesSource(t *testing.T) {
 		}
 		return resp
 	}
-	if resp := call(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "ABORT")); resp.Error != nil || resp.State != s3TierRemoteRestorePrepared {
-		t.Fatalf("prepare response: %+v", resp)
+	if !beforePrepare {
+		if resp := call(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "ABORT")); resp.Error != nil || resp.State != s3TierRemoteRestorePrepared {
+			t.Fatalf("prepare response: %+v", resp)
+		}
+	}
+	if checkpoint {
+		if resp := call(fmt.Sprintf(JSApiStreamCheckpointRemoteRestoreT, "ABORT")); resp.Error != nil || resp.State != s3TierRemoteRestoreCheckpointed {
+			t.Fatalf("checkpoint response: %+v", resp)
+		}
 	}
 	if resp := call(fmt.Sprintf(JSApiStreamAbortRemoteRestoreT, "ABORT")); resp.Error != nil || resp.State != s3TierRemoteRestoreAborted || resp.NextAction != "prepare_remote_restore" {
 		t.Fatalf("abort response: %+v", resp)
@@ -1127,6 +1143,31 @@ func TestJetStreamS3TierRemoteRestoreAbortResumesSource(t *testing.T) {
 		t.Fatalf("idempotent abort response: %+v", resp)
 	}
 	sendStreamMsg(t, nc, "abort.events", "accepted-after-abort")
+	if resp := call(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "ABORT")); resp.Error == nil {
+		t.Fatal("delayed prepare revived an aborted operation")
+	}
+	// Replace local operation state, then verify the older ID is still fenced
+	// by its immutable decision rather than only the latest in-memory state.
+	body, _ := json.Marshal(JSApiStreamRemoteRestoreRequest{OperationID: "abort_2"})
+	msg, err := nc.Request(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "ABORT"), body, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var next JSApiStreamRemoteRestoreResponse
+	if err := json.Unmarshal(msg.Data, &next); err != nil || next.Error != nil {
+		t.Fatalf("new operation: %+v %v", next, err)
+	}
+	msg, err = nc.Request(fmt.Sprintf(JSApiStreamAbortRemoteRestoreT, "ABORT"), body, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(msg.Data, &next); err != nil || next.Error != nil {
+		t.Fatalf("new abort: %+v %v", next, err)
+	}
+	if resp := call(fmt.Sprintf(JSApiStreamPrepareRemoteRestoreT, "ABORT")); resp.Error == nil {
+		t.Fatal("old operation revived after a newer abort")
+	}
+	sendStreamMsg(t, nc, "abort.events", "accepted-after-stale-command")
 }
 
 func TestJetStreamS3TierRemoteRestoreCheckpointsConsumers(t *testing.T) {

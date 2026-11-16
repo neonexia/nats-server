@@ -25,6 +25,9 @@ type DiskBudgetConfig struct {
 
 // DiskBudgetStats exposes admission separately from server liveness.
 type DiskBudgetStats struct {
+	MigrationReservedBytes uint64 `json:"migration_reserved_bytes"`
+	MigrationUsedBytes     uint64 `json:"migration_used_bytes"`
+	MigrationLimitBytes    uint64 `json:"migration_limit_bytes"`
 	DiskBudgetConfig
 	UsedBytes       uint64 `json:"used_bytes"`
 	ReservedBytes   uint64 `json:"reserved_bytes"`
@@ -42,7 +45,14 @@ var ErrDiskBudgetExceeded = errors.New("local disk budget or filesystem headroom
 type diskBudgetFile struct{ actual, planned uint64 }
 
 type fileDiskBudget struct {
+	migrationDownloads                *s3MigrationDownloads
+	sourceBudgets                     map[string]*s3SourceBudget
+	migration                         *diskMigrationReservation
+	migrationRoots                    map[string]struct{}
+	migrationUsed                     uint64
 	mu                                sync.Mutex
+	scanMu                            sync.Mutex
+	scanChanges                       map[string]struct{}
 	root                              string
 	cfg                               DiskBudgetConfig
 	files                             map[string]diskBudgetFile
@@ -73,6 +83,9 @@ func newFileDiskBudget(root string, cfg DiskBudgetConfig) (*fileDiskBudget, erro
 		return nil, err
 	}
 	b := &fileDiskBudget{root: root, cfg: cfg, files: make(map[string]diskBudgetFile), tiers: make(map[*fileS3Tier]struct{}), wake: make(chan struct{}, 1)}
+	if err = b.loadMigrationReservation(); err != nil {
+		return nil, err
+	}
 	if err = b.reconcile(); err != nil {
 		return nil, err
 	}
@@ -117,7 +130,10 @@ func (b *fileDiskBudget) reserveGrowth(path string, size uint64, maintenance boo
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	old := b.files[path]
-	if !maintenance && (b.blocked || b.measurementErr != nil) {
+	if !maintenance && b.measurementErr != nil {
+		return nil, b.rejectLocked(b.measurementErr)
+	}
+	if !maintenance && b.blocked {
 		return nil, b.rejectLocked(ErrDiskBudgetExceeded)
 	}
 	planned := max(old.planned, diskBudgetRound(size))
@@ -126,6 +142,18 @@ func (b *fileDiskBudget) reserveGrowth(path string, size uint64, maintenance boo
 		growth = 0
 	}
 	if growth > 0 {
+		inMigration := b.migrationOwnsLocked(path)
+		hold := b.migrationHoldLocked()
+		if inMigration && (b.migrationUsed > b.migration.LimitBytes || growth > hold) {
+			// A migration overrun must not globally block unrelated publishers.
+			b.rejections++
+			return nil, ErrMigrationBudgetExceeded
+		}
+		additional := growth
+		if inMigration {
+			additional = 0
+		}
+
 		if err := b.refreshFreeLocked(); err != nil {
 			return nil, b.rejectLocked(err)
 		}
@@ -133,13 +161,13 @@ func (b *fileDiskBudget) reserveGrowth(path string, size uint64, maintenance boo
 		if !maintenance {
 			ceiling -= b.cfg.ReserveBytes
 		}
-		total := addSaturate(b.used, b.reserved)
-		freeNeed := addSaturate(b.cfg.MinFreeBytes, addSaturate(b.reserved, growth))
-		if (!maintenance && b.blocked) || total > ceiling || growth > ceiling-total || b.available < freeNeed {
+		total := addSaturate(addSaturate(b.used, b.reserved), hold)
+		freeNeed := addSaturate(b.cfg.MinFreeBytes, addSaturate(addSaturate(b.reserved, hold), additional))
+		if (!maintenance && b.blocked) || total > ceiling || additional > ceiling-total || b.available < freeNeed {
 			return nil, b.rejectLocked(ErrDiskBudgetExceeded)
 		}
 	}
-	b.files[path] = diskBudgetFile{actual: old.actual, planned: planned}
+	b.recordFileLocked(path, diskBudgetFile{actual: old.actual, planned: planned})
 	b.reserved += growth
 	b.updatePressureLocked()
 	return func() {
@@ -147,7 +175,7 @@ func (b *fileDiskBudget) reserveGrowth(path string, size uint64, maintenance boo
 		e := b.files[path]
 		before := max(e.actual, e.planned) - e.actual
 		e.planned = max(old.planned, e.actual)
-		b.files[path] = e
+		b.recordFileLocked(path, e)
 		b.reserved -= before - (max(e.actual, e.planned) - e.actual)
 		b.mu.Unlock()
 	}, nil
@@ -166,7 +194,7 @@ func (b *fileDiskBudget) refreshFreeLocked() error {
 	return err
 }
 func (b *fileDiskBudget) updatePressureLocked() {
-	total := addSaturate(b.used, b.reserved)
+	total := addSaturate(addSaturate(b.used, b.reserved), b.migrationHoldLocked())
 	if total >= b.cfg.LimitBytes/5*4 {
 		b.pressure = true
 	}
@@ -193,12 +221,12 @@ func (b *fileDiskBudget) completed(paths ...string) {
 		b.reserved -= max(old.actual, old.planned) - old.actual
 		if info, err := os.Stat(path); err == nil {
 			n := diskBudgetAllocated(info)
-			b.files[path] = diskBudgetFile{actual: n, planned: n}
+			b.recordFileLocked(path, diskBudgetFile{actual: n, planned: n})
 			b.used += n
 		} else if os.IsNotExist(err) {
-			delete(b.files, path)
+			b.forgetFileLocked(path)
 		} else {
-			b.files[path] = old
+			b.recordFileLocked(path, old)
 			b.used += old.actual
 			b.reserved += max(old.actual, old.planned) - old.actual
 			b.measurementErr = err
@@ -208,10 +236,25 @@ func (b *fileDiskBudget) completed(paths ...string) {
 }
 
 func (b *fileDiskBudget) reconcile() error {
+	return b.reconcileWithWalk(filepath.Walk)
+}
+
+func (b *fileDiskBudget) reconcileWithWalk(walk func(string, filepath.WalkFunc) error) error {
+	// Serialize scans, not publishers. Enumeration grows with stream count;
+	// mutations during a scan must win over its older filesystem observations.
+	b.scanMu.Lock()
+	defer b.scanMu.Unlock()
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.scanChanges = make(map[string]struct{})
+	b.mu.Unlock()
 	observed := make(map[string]uint64)
-	err := filepath.Walk(b.root, func(path string, info os.FileInfo, err error) error {
+	err := walk(b.root, func(path string, info os.FileInfo, err error) error {
+		// Metadata replacement and remote eviction can remove an enumerated
+		// child before stat. Missing children consume no measured space; pending
+		// reservations below are still preserved. A missing root fails closed.
+		if path != b.root && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -221,6 +264,10 @@ func (b *fileDiskBudget) reconcile() error {
 		observed[path] = diskBudgetAllocated(info)
 		return nil
 	})
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	changed := b.scanChanges
+	b.scanChanges = nil
 	if err != nil {
 		b.measurementErr = err
 		b.blocked = true
@@ -229,17 +276,26 @@ func (b *fileDiskBudget) reconcile() error {
 	// Preserve projected growth even when a newly reserved file has not yet
 	// been created. A scan cannot grant another writer those bytes.
 	for path, old := range b.files {
+		if _, newer := changed[path]; newer {
+			delete(observed, path)
+			continue
+		}
 		actual, exists := observed[path]
 		if !exists && old.planned <= old.actual {
-			delete(b.files, path)
+			b.forgetFileLocked(path)
 			continue
 		}
 		old.actual = actual
-		b.files[path] = old
+		b.recordFileLocked(path, old)
 		delete(observed, path)
 	}
 	for path, actual := range observed {
-		b.files[path] = diskBudgetFile{actual: actual, planned: actual}
+		// Includes deletion tombstones: an old scan must not resurrect a file
+		// removed while enumeration ran, or overwrite a new reservation.
+		if _, newer := changed[path]; newer {
+			continue
+		}
+		b.recordFileLocked(path, diskBudgetFile{actual: actual, planned: actual})
 	}
 	b.used, b.reserved = 0, 0
 	for _, e := range b.files {
@@ -274,7 +330,12 @@ func (b *fileDiskBudget) snapshot() *DiskBudgetStats {
 	if b.measurementErr != nil {
 		state = "unavailable"
 	}
-	value := &DiskBudgetStats{DiskBudgetConfig: b.cfg, UsedBytes: b.used, ReservedBytes: b.reserved, AvailableBytes: b.available, AvailableInodes: b.inodes, Pressure: b.pressure, Admission: !b.blocked && b.measurementErr == nil, State: state, Rejections: b.rejections}
+	value := &DiskBudgetStats{DiskBudgetConfig: b.cfg, UsedBytes: b.used, ReservedBytes: addSaturate(b.reserved, b.migrationHoldLocked()), AvailableBytes: b.available, AvailableInodes: b.inodes, Pressure: b.pressure, Admission: !b.blocked && b.measurementErr == nil, State: state, Rejections: b.rejections}
+	if b.migration != nil {
+		value.MigrationReservedBytes = b.migrationHoldLocked()
+		value.MigrationUsedBytes = b.migrationUsed
+		value.MigrationLimitBytes = b.migration.LimitBytes
+	}
 	if b.measurementErr != nil {
 		value.Error = b.measurementErr.Error()
 	}
@@ -357,7 +418,7 @@ func (b *fileDiskBudget) observed(path string) {
 	b.used -= e.actual
 	b.reserved -= max(e.actual, e.planned) - e.actual
 	e.actual = diskBudgetAllocated(info)
-	b.files[path] = e
+	b.recordFileLocked(path, e)
 	b.used += e.actual
 	b.reserved += max(e.actual, e.planned) - e.actual
 	b.updatePressureLocked()
@@ -379,8 +440,8 @@ func (b *fileDiskBudget) renamedTree(oldDir, newDir string) {
 			// A scan may already have observed the renamed destination.
 			b.used -= previous.actual
 			b.reserved -= max(previous.actual, previous.planned) - previous.actual
-			b.files[destination] = entry
-			delete(b.files, path)
+			b.recordFileLocked(destination, entry)
+			b.forgetFileLocked(path)
 		}
 	}
 }
@@ -395,7 +456,7 @@ func (b *fileDiskBudget) forgetTree(dir string) {
 		if path == dir || strings.HasPrefix(path, dir+string(os.PathSeparator)) {
 			b.used -= e.actual
 			b.reserved -= max(e.actual, e.planned) - e.actual
-			delete(b.files, path)
+			b.forgetFileLocked(path)
 		}
 	}
 	b.updatePressureLocked()

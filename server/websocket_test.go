@@ -4807,8 +4807,24 @@ func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
 		s.mu.RUnlock()
 	}
 
+	// Exercise frame splitting with bounded outstanding traffic. An unbounded
+	// flood can disconnect a reader at max_pending before framing is checked.
+	// Keep the complete delivery run within the original ten-second budget.
+	deadline := time.Now().Add(10 * time.Second)
 	for i := 0; i < total; i++ {
 		natsPub(t, nc1, "foo", payload)
+		if (i+1)%1000 == 0 {
+			for atomic.LoadInt32(&count) < int32(2*(i+1)) && time.Now().Before(deadline) {
+				select {
+				case err := <-errCh:
+					t.Fatalf("Error: %v", err)
+				case <-time.After(time.Millisecond):
+				}
+			}
+			if !time.Now().Before(deadline) {
+				break
+			}
+		}
 		if i%100 == 0 {
 			select {
 			case err := <-errCh:
@@ -4822,8 +4838,11 @@ func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
 		t.Fatalf("Error: %v", err)
 	case <-doneCh:
 		return
-	case <-time.After(10 * time.Second):
-		t.Fatalf("Test timed out: received %d of %d messages; slow consumers: %d/%d/%d", atomic.LoadInt32(&count), 2*total, s1.NumSlowConsumers(), s2.NumSlowConsumers(), s3.NumSlowConsumers())
+	case <-time.After(time.Until(deadline)):
+		t.Fatalf("Test timed out: received %d of %d messages; slow consumers=%d/%d/%d; client errors=%v/%v/%v",
+			atomic.LoadInt32(&count), 2*total,
+			s1.NumSlowConsumers(), s2.NumSlowConsumers(), s3.NumSlowConsumers(),
+			nc1.LastError(), nc2.LastError(), nc3.LastError())
 	}
 }
 

@@ -2,6 +2,7 @@ name: NATS Server Tests
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -18,6 +19,9 @@ concurrency:
 jobs:
   lint:
     name: Lint
+    timeout-minutes: 15
+    env:
+      GOMEMLIMIT: 5GiB
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -33,10 +37,10 @@ jobs:
         # Commit 82606bf257cbaff209d206a39f5134f0cfbfd2ee = tag v9.2.1
         uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee
         with:
-          version: v2.13.0
+          version: v2.14.0
           skip-cache: true
           skip-save-cache: true
-          args: --timeout=5m --config=.golangci.yml
+          args: --timeout=10m --concurrency=2 --config=.golangci.yml
 
   build-latest:
     name: Build (Latest Go)
@@ -256,6 +260,7 @@ jobs:
         run: ./scripts/runTestsOnTravis.sh js_consumer_tests
 
   js-cluster-1:
+    if: github.repository == 'nats-io/nats-server'
     name: Test JetStream Cluster 1
     needs: [build-latest, build-supported, lint]
     runs-on: ${{ vars.GHA_WORKER_LARGE || 'ubuntu-latest' }}
@@ -273,6 +278,7 @@ jobs:
         run: ./scripts/runTestsOnTravis.sh js_cluster_tests_1
 
   js-cluster-2:
+    if: github.repository == 'nats-io/nats-server'
     name: Test JetStream Cluster 2
     needs: [build-latest, build-supported, lint]
     runs-on: ${{ vars.GHA_WORKER_LARGE || 'ubuntu-latest' }}
@@ -290,6 +296,7 @@ jobs:
         run: ./scripts/runTestsOnTravis.sh js_cluster_tests_2
 
   js-cluster-3:
+    if: github.repository == 'nats-io/nats-server'
     name: Test JetStream Cluster 3
     needs: [build-latest, build-supported, lint]
     runs-on: ${{ vars.GHA_WORKER_LARGE || 'ubuntu-latest' }}
@@ -307,6 +314,7 @@ jobs:
         run: ./scripts/runTestsOnTravis.sh js_cluster_tests_3
 
   js-cluster-4:
+    if: github.repository == 'nats-io/nats-server'
     name: Test JetStream Cluster 4
     needs: [build-latest, build-supported, lint]
     runs-on: ${{ vars.GHA_WORKER_LARGE || 'ubuntu-latest' }}
@@ -324,6 +332,7 @@ jobs:
         run: ./scripts/runTestsOnTravis.sh js_cluster_tests_4
 
   js-supercluster:
+    if: github.repository == 'nats-io/nats-server'
     name: Test JetStream Supercluster
     needs: [build-latest, build-supported, lint]
     runs-on: ${{ vars.GHA_WORKER_LARGE || 'ubuntu-latest' }}
