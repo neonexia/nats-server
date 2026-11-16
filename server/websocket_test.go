@@ -4684,8 +4684,12 @@ func TestWSWithPartialWrite(t *testing.T) {
 }
 
 func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
+	// The 50,000-message variant can queue more than the default 64 MiB
+	// while a subscriber is descheduled. Test frame integrity, not the
+	// intentional disconnect used to enforce slow-consumer budgets.
 	tmpl := `
                listen: "127.0.0.1:-1"
+               max_pending: 1GB
                cluster {
                        name: "local"
                        port: -1
@@ -4724,6 +4728,20 @@ func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
 	errCh := make(chan error, 1)
 	doneCh := make(chan struct{}, 1)
 	count := int32(0)
+	for _, nc := range []*nats.Conn{nc2, nc3} {
+		nc.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+			select {
+			case errCh <- err:
+			default:
+			}
+		})
+		nc.SetClosedHandler(func(nc *nats.Conn) {
+			select {
+			case errCh <- fmt.Errorf("subscriber closed: %v", nc.LastError()):
+			default:
+			}
+		})
+	}
 
 	createSub := func(nc *nats.Conn) {
 		sub := natsSub(t, nc, "foo", func(m *nats.Msg) {
@@ -4757,15 +4775,17 @@ func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
 	createSub(nc2)
 	createSub(nc3)
 
-	// Both remote subscriptions must reach the publisher before this core-NATS
-	// delivery test starts; any interest only proves that one recipient is ready.
+	// Wait for both routed subscriptions; any interest alone can let the
+	// publisher race the second subscriber and lose its first messages.
+	natsFlush(t, nc2)
+	natsFlush(t, nc3)
 	checkFor(t, time.Second, 15*time.Millisecond, func() error {
 		acc, err := s1.LookupAccount(globalAccountName)
 		if err != nil {
 			return err
 		}
 		if n := len(acc.sl.Match("foo").psubs); n != 2 {
-			return fmt.Errorf("expected two subscriber routes, got %d", n)
+			return fmt.Errorf("expected two routed subscriptions, got %d", n)
 		}
 		return nil
 	})
