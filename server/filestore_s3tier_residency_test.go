@@ -78,11 +78,11 @@ func TestFileStoreS3TierResidencyAdmissionSurvivesRestartAndColdReplay(t *testin
 			t.Fatalf("replay %d: %v", seq, err)
 		}
 	}
-	if _, _, err := fs.StoreMsg("events", nil, payload, 0); !errors.Is(err, errS3TierLocalCapacity) {
-		t.Fatalf("cold replay did not consume residency: %v", err)
+	if seq, _, err := fs.StoreMsg("events", nil, payload, 0); err != nil || seq != 6 {
+		t.Fatalf("durable read cache blocked publish: seq=%d err=%v", seq, err)
 	}
-	if state := fs.State(); state.Msgs != 5 || state.LastSeq != 5 {
-		t.Fatalf("capacity rejection changed state: %+v", state)
+	if state := fs.State(); state.Msgs != 6 || state.LastSeq != 6 {
+		t.Fatalf("cache reclamation changed history: %+v", state)
 	}
 }
 

@@ -1848,6 +1848,14 @@ func (t *fileS3Tier) fetchBlock(d s3BlockDescriptor, path string) error {
 		}
 		defer budget.completed(path+".tmp", path)
 	}
+	// Leave room for incoming writes before admitting another historical block.
+	// Serialize this check and residency reservation with publishers. Reclamation
+	// uses only durable copies and never performs remote I/O under fs.mu.
+	t.fs.mu.Lock()
+	if err := t.reclaimCoveredCacheLocked(uint64(d.Size), t.reclaimThreshold(), d.Index); err != nil {
+		t.fs.mu.Unlock()
+		return err
+	}
 	// An in-flight cold fetch will become resident. Publish admission must see
 	// that claim before network I/O, even while no local payload exists yet.
 	t.residentMu.Lock()
@@ -1855,6 +1863,8 @@ func (t *fileS3Tier) fetchBlock(d s3BlockDescriptor, path string) error {
 	reserved := max(previous, uint64(d.Size))
 	t.setResidentLocked(d.Index, reserved)
 	t.residentMu.Unlock()
+	t.fs.mu.Unlock()
+	t.kick()
 	installAttempted := false
 	defer func() {
 		if !installAttempted {
@@ -2121,11 +2131,85 @@ func (t *fileS3Tier) drain(coveredThrough uint64) (uint64, error) {
 	return drained, nil
 }
 
+// reclaimCoveredCacheLocked frees only immutable payloads whose remote descriptor
+// is already committed. fs.mu is held, but runMu is deliberately not acquired:
+// an in-flight remote upload must not prevent reclaiming disposable read cache.
+// Missing headroom is left to normal admission; uncovered data is never deleted.
+func (t *fileS3Tier) reclaimCoveredCacheLocked(additional, limit uint64, exclude uint32) error {
+	used := t.residentSize()
+	if addSaturate(used, additional) <= limit {
+		return nil
+	}
+	// Scan the bounded resident set, not the entire remote history, on the
+	// publish path. Oldest blocks are preferred; active/in-flight blocks stay put.
+	t.residentMu.Lock()
+	indices := make([]uint32, 0, len(t.resident))
+	for index := range t.resident {
+		indices = append(indices, index)
+	}
+	t.residentMu.Unlock()
+	sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
+	for _, index := range indices {
+		mb := t.fs.bim[index]
+		if mb == nil || mb == t.fs.lmb || mb.index == exclude {
+			continue
+		}
+		t.residentMu.Lock()
+		resident := t.resident[mb.index] != 0
+		t.residentMu.Unlock()
+		if !resident {
+			continue
+		}
+		t.mu.Lock()
+		_, covered := t.desc[mb.index]
+		fetching := t.fetch[mb.index] != nil
+		t.mu.Unlock()
+		if !covered || fetching {
+			continue
+		}
+		mb.mu.Lock()
+		if mb.pendingWriteSizeLocked() != 0 {
+			mb.mu.Unlock()
+			continue
+		}
+		mb.closeFDsLockedNoCheck()
+		t.residentMu.Lock()
+		err := os.Remove(mb.mfn)
+		if err == nil || os.IsNotExist(err) {
+			t.setResidentLocked(mb.index, 0)
+		}
+		t.residentMu.Unlock()
+		mb.mu.Unlock()
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		t.fs.dios.budget.Load().completed(mb.mfn)
+		if err == nil {
+			t.stats.evictions.Add(1)
+		}
+		// A crash may resurrect a cache copy; that is safe because its descriptor
+		// already names durable remote data. Recovery rebuilds local accounting.
+		used = t.residentSize()
+		if addSaturate(used, additional) <= limit {
+			return nil
+		}
+	}
+	return nil
+}
+
 // ensureLocalCapacity rejects writes promptly while background offload makes
 // room. Waiting for runMu here would put unbounded batches of remote I/O on the
 // publish path, leaving clients unsure whether a timed-out publish was stored.
 // This transient error must not poison fs.werr: retries can succeed after drain.
 func (t *fileS3Tier) ensureLocalCapacity() error {
+	if t.residentSize() > t.cfg.LocalHighBytes {
+		t.fs.mu.Lock()
+		err := t.reclaimCoveredCacheLocked(0, t.cfg.LocalHighBytes, 0)
+		t.fs.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
 	if t.residentSize() <= t.cfg.LocalHighBytes {
 		return nil
 	}
@@ -2550,6 +2634,9 @@ func (t *fileS3Tier) removeLocalBlock(mb *msgBlock, expected []byte, descriptor 
 		return 0, nil
 	}
 	current, err := os.ReadFile(mb.mfn)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
 	if err != nil || !bytes.Equal(current, expected) {
 		return 0, fmt.Errorf("S3 tier block %d changed during upload: %w", mb.index, err)
 	}
@@ -2669,6 +2756,9 @@ func (t *fileS3Tier) reclaimDiskBudgetBlock() error {
 // Called with fs.mu held: concurrent publishers cannot both spend the same
 // per-stream residency headroom. Reclamation remains asynchronous.
 func (t *fileS3Tier) ensureProjectedLocalCapacity(additional uint64) error {
+	if err := t.reclaimCoveredCacheLocked(diskBudgetRound(additional), t.reclaimThreshold(), 0); err != nil {
+		return err
+	}
 	b := t.fs.dios.budget.Load()
 	if b == nil {
 		// The waiting precheck runs outside fs.mu. Recheck current occupancy

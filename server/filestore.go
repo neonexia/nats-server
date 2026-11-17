@@ -9249,7 +9249,11 @@ checkCache:
 	// We want to hold the mb lock here to avoid any changes to state.
 	buf, err := mb.loadBlock(nil)
 	if err != nil {
-		mb.fs.warn("loadBlock error: %v", err)
+		// A cold-tier miss is normal control flow; the caller hydrates and retries.
+		var coldMiss *errS3TierBlockNotHydrated
+		if !errors.As(err, &coldMiss) {
+			mb.fs.warn("loadBlock error: %v", err)
+		}
 		if err == errNoBlkData {
 			if ld, _, _ := mb.rebuildStateLocked(); ld != nil {
 				// Rebuild fs state too.
