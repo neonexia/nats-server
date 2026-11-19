@@ -18,12 +18,12 @@ func TestDiskMigrationMaximumRootsPreserveCeilingAfterReload(t *testing.T) {
 	budget, err := newFileDiskBudget(root, cfg)
 	require_NoError(t, err)
 	reservation := diskMigrationReservation{Version: 1, OperationID: "maximum-roots", LimitBytes: 2 << 20}
-	for i := 0; i < 256; i++ {
+	for i := 0; i < 4096; i++ {
 		reservation.Roots = append(reservation.Roots, fmt.Sprintf("stage/%03d", i), fmt.Sprintf("streams/%03d", i))
 	}
 	require_NoError(t, budget.reserveMigration(reservation, 1<<20))
 	for pass := 0; pass < 2; pass++ {
-		for _, path := range []string{"stage/000/blocks/1.blk", "stage/255", "streams/255/consumers/name/state.dat"} {
+		for _, path := range []string{"stage/000/blocks/1.blk", "stage/4095", "streams/4095/consumers/name/state.dat"} {
 			if _, err := budget.reserveGrowth(filepath.Join(root, path), 3<<20, true); !errors.Is(err, ErrMigrationBudgetExceeded) {
 				t.Fatalf("reserved subtree escaped migration limit (%s, reload=%d): %v", path, pass, err)
 			}

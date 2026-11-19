@@ -11,6 +11,11 @@ import (
 	"sort"
 )
 
+// Whole shards can contain several namespaces. Keep both the stream count and
+// durable reservation journal finite before any source is paused.
+const maxMigrationStreams = 4096
+const maxMigrationJournalBytes = 1 << 20
+
 const (
 	JSApiMigrationReserve = "$JS.API.MIGRATION.RESERVE"
 	JSApiMigrationRelease = "$JS.API.MIGRATION.RELEASE"
@@ -66,8 +71,8 @@ func (s *Server) jsMigrationReservationRequest(_ *subscription, c *client, _ *Ac
 		fail(err)
 		return
 	}
-	if !validS3TierRemoteRestoreOperationID(req.OperationID) || len(req.Streams) == 0 || len(req.Streams) > 256 {
-		fail(errors.New("migration requires an operation and 1–256 unique streams"))
+	if !validS3TierRemoteRestoreOperationID(req.OperationID) || len(req.Streams) == 0 || len(req.Streams) > maxMigrationStreams {
+		fail(errors.New("migration requires an operation and 1–4096 unique streams"))
 		return
 	}
 	sort.Strings(req.Streams)

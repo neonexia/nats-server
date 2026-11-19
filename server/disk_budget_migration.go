@@ -29,7 +29,7 @@ type diskMigrationReservation struct {
 }
 
 func (r *diskMigrationReservation) validate() error {
-	if r == nil || r.Version != 1 || !validS3TierRemoteRestoreOperationID(r.OperationID) || r.LimitBytes == 0 || len(r.Roots) == 0 || len(r.Roots) > 512 {
+	if r == nil || r.Version != 1 || !validS3TierRemoteRestoreOperationID(r.OperationID) || r.LimitBytes == 0 || len(r.Roots) == 0 || len(r.Roots) > 2*maxMigrationStreams {
 		return errors.New("invalid migration disk reservation")
 	}
 	for i, root := range r.Roots {
@@ -42,7 +42,7 @@ func (r *diskMigrationReservation) validate() error {
 			}
 		}
 	}
-	if data, err := json.Marshal(r); err != nil || len(data) > 64<<10 {
+	if data, err := json.Marshal(r); err != nil || len(data) > maxMigrationJournalBytes {
 		return errors.New("migration reservation exceeds journal limit")
 	}
 	return nil
@@ -127,7 +127,7 @@ func (b *fileDiskBudget) loadMigrationReservation() error {
 		return err
 	}
 	var r diskMigrationReservation
-	if len(data) > 64<<10 {
+	if len(data) > maxMigrationJournalBytes {
 		return errors.New("migration reservation exceeds journal limit")
 	}
 	if err = json.Unmarshal(data, &r); err != nil {
@@ -156,8 +156,18 @@ func (b *fileDiskBudget) reserveMigration(r diskMigrationReservation, siblingHea
 	if siblingHeadroom == 0 {
 		return errors.New("migration requires protected sibling headroom")
 	}
-	if b.cfg.ReserveBytes < migrationJournalHeadroom {
-		return errors.New("migration requires at least 128 KiB of engine maintenance reserve")
+	// Atomic replacement temporarily retains both journal copies. Large shard
+	// manifests need more maintenance space than the small namespace minimum.
+	encoded, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	if len(encoded) > maxMigrationJournalBytes {
+		return errors.New("migration reservation exceeds journal limit")
+	}
+	journalHeadroom := max(uint64(migrationJournalHeadroom), uint64(len(encoded))*2+8192)
+	if b.cfg.ReserveBytes < journalHeadroom {
+		return errors.New("engine maintenance reserve is too small for migration journal")
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -184,7 +194,7 @@ func (b *fileDiskBudget) reserveMigration(r diskMigrationReservation, siblingHea
 	if err := b.refreshFreeLocked(); err != nil {
 		return err
 	}
-	need := addSaturate(hold, addSaturate(siblingHeadroom, migrationJournalHeadroom))
+	need := addSaturate(hold, addSaturate(siblingHeadroom, journalHeadroom))
 	total := addSaturate(b.used, b.reserved)
 	ceiling := b.cfg.LimitBytes - b.cfg.ReserveBytes
 	if total > ceiling || need > ceiling-total || b.available < addSaturate(b.cfg.MinFreeBytes, addSaturate(b.reserved, need)) {
@@ -205,7 +215,7 @@ func (b *fileDiskBudget) persistMigrationLocked(r diskMigrationReservation) erro
 	if err != nil {
 		return err
 	}
-	if len(data) > 64<<10 {
+	if len(data) > maxMigrationJournalBytes {
 		return errors.New("migration reservation exceeds journal limit")
 	}
 	if err = writeAtomically(newDiskIOSemaphore(4), filepath.Join(b.root, migrationBudgetFile), data, defaultFilePerms, true); err != nil {
