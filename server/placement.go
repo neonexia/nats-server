@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +59,8 @@ func parsePlacementConfig(v any) (*PlacementConfig, error) {
 		return nil, errors.New("placement must be a configuration block")
 	}
 	p := &PlacementConfig{}
+	var tokenEnv string
+	var hasToken, hasTokenEnv bool
 	for k, v := range m {
 		_, v = unwrapValue(v, nil)
 		value, ok := v.(string)
@@ -71,9 +74,24 @@ func parsePlacementConfig(v any) (*PlacementConfig, error) {
 			p.ControlListen = value
 		case "control_token":
 			p.ControlToken = value
+			hasToken = true
+		case "control_token_env":
+			tokenEnv, hasTokenEnv = value, true
 		default:
 			return nil, fmt.Errorf("unknown placement option %q", k)
 		}
+	}
+	if hasToken && hasTokenEnv {
+		return nil, errors.New("placement control_token and control_token_env are mutually exclusive")
+	}
+	if hasTokenEnv {
+		// Secrets are opaque bytes: generic config substitution reparses numbers
+		// and syntax, which can reject or alter a randomly generated credential.
+		token, ok := os.LookupEnv(tokenEnv)
+		if tokenEnv == "" || !ok || token == "" {
+			return nil, errors.New("placement control_token_env must reference a nonempty environment variable")
+		}
+		p.ControlToken = token
 	}
 	return p, nil
 }

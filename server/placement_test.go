@@ -361,3 +361,48 @@ func TestPlacementConfigurationReload(t *testing.T) {
 		})
 	}
 }
+
+func TestPlacementTokenEnvironmentRemainsOpaque(t *testing.T) {
+	for _, token := range []string{"1invalid-number-token", "12345678901234567890", "-1234567890123456789", "+1234567890123456789", "true-false_null-token", "abc_DEF-0123456789"} {
+		t.Run(token[:3], func(t *testing.T) {
+			t.Setenv("PLACEMENT_TEST_SECRET", token)
+			file := createConfFile(t, []byte(`port: -1
+ authorization { users: [{user: control, password: secret}] }
+ placement { control_user: control, control_listen: "127.0.0.1:0", control_token_env: "PLACEMENT_TEST_SECRET" }
+`))
+			opts, err := ProcessConfigFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := RunServer(opts)
+			defer s.Shutdown()
+			placementRequest(t, s, "", token, nil, 200)
+			placementRequest(t, s, "", "incorrect-token", nil, 401)
+		})
+	}
+}
+
+func TestPlacementTokenEnvironmentRejectsInvalidSources(t *testing.T) {
+	t.Setenv("PLACEMENT_TEST_EMPTY", "")
+	t.Setenv("PLACEMENT_TEST_SHORT", "short-secret")
+	for _, source := range []string{`control_token_env: ""`, `control_token_env: "PLACEMENT_TEST_EMPTY"`, `control_token_env: "PLACEMENT_TEST_SHORT"`, `control_token: "literal-secret-value", control_token_env: "PLACEMENT_TEST_EMPTY"`} {
+		file := createConfFile(t, []byte(`port: -1
+ authorization { users: [{user: control, password: secret}] }
+ placement { control_user: control, control_listen: "127.0.0.1:0", `+source+` }
+`))
+		opts, err := ProcessConfigFile(file)
+		if err == nil {
+			var s *Server
+			s, err = NewServer(opts)
+			if s != nil {
+				s.Shutdown()
+			}
+		}
+		if err == nil {
+			t.Fatal("accepted invalid secret source")
+		}
+		if strings.Contains(err.Error(), "short-secret") || strings.Contains(err.Error(), "literal-secret-value") {
+			t.Fatal("error exposed credential")
+		}
+	}
+}
