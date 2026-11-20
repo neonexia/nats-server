@@ -16,14 +16,16 @@ authorization {
 placement {
   control_user: node-agent
   control_listen: "127.0.0.1:8223"
-  control_token: $PLACEMENT_CONTROL_TOKEN
+  control_token_env: "PLACEMENT_CONTROL_TOKEN"
 }
 ```
 
 The private HTTP listener uses a separate bearer token of at least 16 bytes.
 Keep it on loopback or a protected management network; it does not provide TLS.
 Do not expose it through a public messaging gateway. Configuration changes to the
-placement block require a process restart. Tokens are never returned by status.
+placement block require a process restart. Tokens are never returned by status. `control_token_env` reads the environment value
+without interpreting it as configuration syntax. It is mutually exclusive with
+the literal `control_token` field; missing or empty environment values fail startup.
 
 Ordinary NATS authentication runs first. The configured password-authenticated
 control user bypasses only placement admission and can prepare/checkpoint/restore

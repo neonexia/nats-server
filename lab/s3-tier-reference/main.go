@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -165,16 +166,22 @@ func ensureBucket(ctx context.Context, client *minio.Client, bucket string, time
 	var lastErr error
 	for time.Now().Before(deadline) {
 		err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
-		if err == nil {
-			return nil
-		}
 		code := minio.ToErrorResponse(err).Code
-		if code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists" {
-			return nil
+		if err == nil || code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists" {
+			// A restarted RustFS may accept bucket PUTs before location GETs.
+			// Use a fresh client so a cached location cannot satisfy readiness.
+			var fresh *minio.Client
+			fresh, err = minio.New(client.EndpointURL().Host, &minio.Options{
+				Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+				Secure: client.EndpointURL().Scheme == "https",
+			})
+			if err == nil {
+				_, err = fresh.GetBucketLocation(ctx, bucket)
+			}
+			if err == nil {
+				return nil
+			}
 		}
-		// RustFS can report healthy before its storage namespace accepts bucket
-		// creation. Retrying here keeps the fault workload from confusing that
-		// startup boundary with a JetStream recovery failure.
 		lastErr = err
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -231,6 +238,39 @@ func request(nc *nats.Conn, subject string, value any) (restoreResponse, error) 
 		return response, err
 	}
 	return response, nil
+}
+
+// Only an explicit capacity rejection is safe to retry; timeouts and unknown
+// outcomes must remain visible rather than risk publishing a duplicate.
+func publishWithCapacityWait(publish func() (*nats.PubAck, error), timeout time.Duration) (*nats.PubAck, int, error) {
+	deadline := time.Now().Add(timeout)
+	rejected := 0
+	for {
+		ack, err := publish()
+		var api *nats.APIError
+		if !errors.As(err, &api) || api.ErrorCode != 10077 {
+			return ack, rejected, err
+		}
+		rejected++
+		if time.Now().After(deadline) {
+			return nil, rejected, err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Drain is idempotent. After a deliberate store outage, a worker may still
+// report its last storage failure until its next pass; require bounded recovery.
+func drainAfterOutage(call func() (restoreResponse, error), timeout time.Duration) (restoreResponse, error) {
+	deadline := time.Now().Add(timeout)
+	for attempt := 1; ; attempt++ {
+		response, err := call()
+		if err != nil || response.Error == nil || response.Error.ErrCode != 10051 || time.Now().After(deadline) {
+			return response, err
+		}
+		fmt.Printf("Drain recovery attempt %d reported storage error: %s\n", attempt, response.Error)
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func mustActive(response restoreResponse, want string) error {
@@ -506,7 +546,7 @@ jetstream {
 	if err := ensureBucket(ctx, client, "reference", 15*time.Second); err != nil {
 		panic(err)
 	}
-	drain, err := request(nc, "$JS.API.STREAM.DRAIN_REMOTE.PRESSURE", nil)
+	drain, err := drainAfterOutage(func() (restoreResponse, error) { return request(nc, "$JS.API.STREAM.DRAIN_REMOTE.PRESSURE", nil) }, 15*time.Second)
 	if err != nil || !drain.Success || drain.Error != nil {
 		output, _ := os.ReadFile(filepath.Join(logs, "source.log"))
 		panic(fmt.Errorf("drain after upload outage: %v %+v (%s); source log: %s", err, drain, drain.Error, output))
@@ -521,6 +561,7 @@ jetstream {
 	auditA := &consumerAudit{name: "audit-a", seen: make(map[uint64]string)}
 	auditB := &consumerAudit{name: "audit-b", seen: make(map[uint64]string)}
 	var wg sync.WaitGroup
+	var capacityRejections atomic.Int64
 	for publisher := 0; publisher < publishers; publisher++ {
 		publisher := publisher
 		wg.Add(1)
@@ -528,7 +569,8 @@ jetstream {
 			defer wg.Done()
 			for seq := 0; seq < messagesPerPublisher; seq++ {
 				payload := fmt.Sprintf("publisher=%d sequence=%d", publisher, seq)
-				ack, err := js.Publish(subject, []byte(payload))
+				ack, rejected, err := publishWithCapacityWait(func() (*nats.PubAck, error) { return js.Publish(subject, []byte(payload)) }, 5*time.Second)
+				capacityRejections.Add(int64(rejected))
 				if err != nil {
 					panic(err)
 				}
@@ -539,6 +581,7 @@ jetstream {
 		}()
 	}
 	wg.Wait()
+	fmt.Printf("Initial workload explicit capacity rejections retried: %d\n", capacityRejections.Load())
 	if err := consumeAndAck(js, auditA, ledger, total/3); err != nil {
 		panic(err)
 	}
