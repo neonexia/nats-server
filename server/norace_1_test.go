@@ -5036,6 +5036,10 @@ func TestNoRaceJetStreamAccountLimitsAndRestartForceSnapshot(t *testing.T) {
 	checkFor(t, 2*time.Second, 500*time.Millisecond, func() error {
 		return checkState(t, c, "$JS", "TEST")
 	})
+	expected, err := checkStateAndErr(t, c, "$JS", "TEST")
+	require_NoError(t, err)
+	require_True(t, expected.Msgs > 0)
+
 	// Then install snapshots so the shutdown server needs to catchup based on a snapshot.
 	for _, s := range c.servers {
 		if s == snl {
@@ -5054,12 +5058,22 @@ func TestNoRaceJetStreamAccountLimitsAndRestartForceSnapshot(t *testing.T) {
 	c.waitOnLeader()
 	c.waitOnStreamLeader("$JS", "TEST")
 
-	checkFor(t, 2*time.Second, 500*time.Millisecond, func() error {
-		return checkState(t, c, "$JS", "TEST")
-	})
+	// Election does not imply snapshot catch-up is complete. Use the existing
+	// bounded readiness wait before comparing replicas, including the offline peer.
 	for _, cs := range c.servers {
 		c.waitOnStreamCurrent(cs, "$JS", "TEST")
 	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		state, err := checkStateAndErr(t, c, "$JS", "TEST")
+		if err != nil {
+			return err
+		}
+		// Replica agreement alone could hide all replicas losing the same data.
+		if state.Msgs != expected.Msgs || state.FirstSeq != expected.FirstSeq || state.LastSeq != expected.LastSeq {
+			return fmt.Errorf("Restart changed stream state: before=%+v after=%+v", expected, state)
+		}
+		return nil
+	})
 }
 
 func TestNoRaceJetStreamPullConsumersAndInteriorDeletes(t *testing.T) {
