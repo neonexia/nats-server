@@ -97,12 +97,16 @@ const (
 	JSApiStreamPrepareRemoteRestoreT    = "$JS.API.STREAM.PREPARE_REMOTE_RESTORE.%s"
 	JSApiStreamCheckpointRemoteRestore  = "$JS.API.STREAM.CHECKPOINT_REMOTE_RESTORE.*"
 	JSApiStreamCheckpointRemoteRestoreT = "$JS.API.STREAM.CHECKPOINT_REMOTE_RESTORE.%s"
+	JSApiStreamRecoveryCheckpoint       = "$JS.API.STREAM.RECOVERY_CHECKPOINT.*"
+	JSApiStreamRecoveryCheckpointT      = "$JS.API.STREAM.RECOVERY_CHECKPOINT.%s"
 	JSApiStreamWarmupRemoteRestore      = "$JS.API.STREAM.WARMUP_REMOTE_RESTORE.*"
 	JSApiStreamWarmupRemoteRestoreT     = "$JS.API.STREAM.WARMUP_REMOTE_RESTORE.%s"
 	JSApiStreamAbortRemoteRestore       = "$JS.API.STREAM.ABORT_REMOTE_RESTORE.*"
 	JSApiStreamAbortRemoteRestoreT      = "$JS.API.STREAM.ABORT_REMOTE_RESTORE.%s"
 	JSApiStreamRemoteRestoreStatus      = "$JS.API.STREAM.REMOTE_RESTORE_STATUS.*"
 	JSApiStreamRemoteRestoreStatusT     = "$JS.API.STREAM.REMOTE_RESTORE_STATUS.%s"
+	JSApiStreamRecoverRemote            = "$JS.API.STREAM.RECOVER_REMOTE.*"
+	JSApiStreamRecoverRemoteT           = "$JS.API.STREAM.RECOVER_REMOTE.%s"
 	JSApiStreamRestoreRemote            = "$JS.API.STREAM.RESTORE_REMOTE.*"
 	JSApiStreamRestoreRemoteT           = "$JS.API.STREAM.RESTORE_REMOTE.%s"
 	JSApiStreamRetireRemoteSource       = "$JS.API.STREAM.RETIRE_REMOTE_SOURCE.*"
@@ -502,6 +506,7 @@ type JSApiAccountInfoResponse struct {
 	*JetStreamAccountStats
 	// Callers must negotiate staging before sending new restore flags to an
 	// older engine, which would otherwise ignore them and activate immediately.
+	RecoveryCheckpointVersion        int `json:"recovery_checkpoint_version,omitempty"`
 	RemoteRestoreWarmupVersion       int `json:"remote_restore_warmup_version,omitempty"`
 	RemoteRestoreRollbackVersion     int `json:"remote_restore_rollback_version,omitempty"`
 	RemoteRestoreStagingVersion      int `json:"remote_restore_staging_version,omitempty"`
@@ -633,22 +638,28 @@ const JSApiStreamCollectRemoteGarbageResponseType = "io.nats.jetstream.api.v1.st
 // operation. Callers must retain and retry the same operation ID after a lost
 // response; the server never derives it from a client connection.
 type JSApiStreamRemoteRestoreRequest struct {
-	SourceLimits *S3TierSourceLimits `json:"source_limits,omitempty"`
-	OperationID  string              `json:"operation_id"`
+	StorageGeneration string              `json:"storage_generation,omitempty"`
+	SourceGeneration  uint64              `json:"source_generation,omitempty"`
+	SourceLimits      *S3TierSourceLimits `json:"source_limits,omitempty"`
+	OperationID       string              `json:"operation_id"`
 }
 
 // JSApiStreamRestoreRemoteRequest selects an immutable checkpoint through its
 // operation ID. The server derives the S3 prefix and credentials from its own
 // configuration; TargetID is the coordinator's stable target-node identity.
 type JSApiStreamRestoreRemoteRequest struct {
-	WarmupOnly     bool                 `json:"warmup_only,omitempty"`
-	DiscardStaged  bool                 `json:"discard_staged,omitempty"`
-	StageOnly      bool                 `json:"stage_only,omitempty"`
-	RestoreLimits  *S3TierRestoreLimits `json:"restore_limits,omitempty"`
-	ActivateStaged bool                 `json:"activate_staged,omitempty"`
-	OperationID    string               `json:"operation_id"`
-	ExpectedEpoch  uint64               `json:"expected_epoch"`
-	TargetID       string               `json:"target_id"`
+	StorageGeneration        string               `json:"storage_generation,omitempty"`
+	RecoveryCheckpointID     string               `json:"recovery_checkpoint_id,omitempty"`
+	RecoveryCheckpointSHA256 string               `json:"recovery_checkpoint_sha256,omitempty"`
+	SourceFenced             bool                 `json:"source_fenced,omitempty"`
+	WarmupOnly               bool                 `json:"warmup_only,omitempty"`
+	DiscardStaged            bool                 `json:"discard_staged,omitempty"`
+	StageOnly                bool                 `json:"stage_only,omitempty"`
+	RestoreLimits            *S3TierRestoreLimits `json:"restore_limits,omitempty"`
+	ActivateStaged           bool                 `json:"activate_staged,omitempty"`
+	OperationID              string               `json:"operation_id"`
+	ExpectedEpoch            uint64               `json:"expected_epoch"`
+	TargetID                 string               `json:"target_id"`
 }
 
 // JSApiStreamRemoteRestoreResponse reports source-side fencing or target activation
@@ -656,6 +667,7 @@ type JSApiStreamRestoreRemoteRequest struct {
 // counters so a coordinator can monitor and retry without S3 credentials.
 // CheckpointKey is opaque S3 metadata; credentials stay in server configuration.
 type JSApiStreamRemoteRestoreResponse struct {
+	CoveredThrough uint64 `json:"covered_through,omitempty"`
 	ApiResponse
 	Success          bool         `json:"success,omitempty"`
 	OperationID      string       `json:"operation_id,omitempty"`
@@ -1240,10 +1252,12 @@ func (s *Server) setJetStreamExportSubs() error {
 		{JSApiStreamCheckpointRemoteRestore, s.jsStreamCheckpointRemoteRestoreRequest},
 		{JSApiStreamAbortRemoteRestore, s.jsStreamAbortRemoteRestoreRequest},
 		{JSApiStreamWarmupRemoteRestore, s.jsStreamWarmupRemoteRestoreRequest},
+		{JSApiStreamRecoveryCheckpoint, s.jsStreamRecoveryCheckpointRequest},
 		{JSApiStreamRemoteRestoreStatus, s.jsStreamRemoteRestoreStatusRequest},
 		{JSApiStreamRetireRemoteSource, s.jsStreamRetireRemoteSourceRequest},
 		{JSApiStreamArchiveRemote, s.jsStreamArchiveRemoteRequest},
 		{JSApiStreamRestoreRemote, s.jsStreamRestoreRemoteRequest},
+		{JSApiStreamRecoverRemote, s.jsStreamRecoverRemoteRequest},
 		{JSApiMigrationReserve, s.jsMigrationReservationRequest},
 		{JSApiMigrationRelease, s.jsMigrationReservationRequest},
 		{JSApiStreamSnapshot, s.jsStreamSnapshotRequest},
@@ -1606,6 +1620,7 @@ func (s *Server) jsAccountInfoRequest(sub *subscription, c *client, _ *Account, 
 			resp.RemoteRestoreStagingVersion = 1
 			resp.RemoteRestoreRollbackVersion = 1
 			resp.RemoteRestoreWarmupVersion = 1
+			resp.RecoveryCheckpointVersion = 1
 			resp.RemoteRestoreSourceLimitsVersion = 1
 			resp.RemoteRestoreParallelVersion = 1
 		}
@@ -4581,7 +4596,12 @@ const (
 	s3TierRemoteRestoreAbort
 	s3TierRemoteRestoreStatus
 	s3TierRemoteRestoreWarmup
+	s3TierRecoveryCheckpoint
 )
+
+func (s *Server) jsStreamRecoveryCheckpointRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	s.jsStreamRemoteRestoreRequest(c, subject, reply, rmsg, s3TierRecoveryCheckpoint)
+}
 
 func (s *Server) jsStreamPrepareRemoteRestoreRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	s.jsStreamRemoteRestoreRequest(c, subject, reply, rmsg, s3TierRemoteRestorePrepare)
@@ -4796,13 +4816,19 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 			return
 		}
 	}
+	if req.StorageGeneration != "" && !validS3TierRemoteRestoreOperationID(req.StorageGeneration) {
+		err := errors.New("invalid source storage generation")
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 	stream := streamNameFromSubject(subject)
 	mset, err := acc.lookupStream(stream)
 	if err != nil {
 		// Status remains queryable after retirement when the caller supplies
 		// its stable operation ID. This is needed after local source cleanup.
 		if action == s3TierRemoteRestoreStatus && validS3TierRemoteRestoreOperationID(req.OperationID) {
-			if cfg := s.s3TierConfigForRemoteRestore(acc, stream); cfg != nil && cfg.Store != nil {
+			if cfg := s.s3TierConfigForGeneration(acc, stream, req.StorageGeneration); cfg != nil && cfg.Store != nil {
 				tier := newFileS3Tier(nil, *cfg)
 				if retired, retiredErr := tier.remoteRestoreRetirement(req.OperationID); retiredErr == nil && retired != nil {
 					resp.Success, resp.OperationID, resp.Epoch, resp.State = true, retired.OperationID, retired.Epoch, s3TierRemoteRestoreRetired
@@ -4826,6 +4852,15 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 		return
 	}
 
+	mset.mu.RLock()
+	storageGeneration := mset.cfg.S3TierGeneration
+	mset.mu.RUnlock()
+	if req.StorageGeneration != storageGeneration {
+		err := errors.New("source storage generation does not match command")
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 	stage := fs.tier.remoteRestoreTargetStage()
 	if stage != nil && !stage.Activated && action != s3TierRemoteRestoreStatus {
 		err := errors.New("staged target requires explicit activation")
@@ -4889,6 +4924,20 @@ func (s *Server) jsStreamRemoteRestoreRequest(c *client, subject, reply string, 
 	defer mset.isolateMu.Unlock()
 	mset.remoteConsumerMu.Lock()
 	defer mset.remoteConsumerMu.Unlock()
+
+	if action == s3TierRecoveryCheckpoint {
+		checkpoint, key, digest, checkpointErr := mset.recoveryCheckpoint(req)
+		if checkpointErr != nil {
+			resp.Error = NewJSStreamGeneralError(checkpointErr, Unless(checkpointErr))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
+		resp.Success, resp.State, resp.OperationID = true, "recovery_checkpoint", checkpoint.OperationID
+		resp.Epoch, resp.CoveredThrough = checkpoint.Epoch, checkpoint.StreamState.LastSeq
+		resp.CheckpointKey, resp.CheckpointSHA256 = key, digest
+		s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
+		return
+	}
 
 	var state *s3TierRemoteRestoreState
 	switch action {
@@ -5017,6 +5066,14 @@ func (s *Server) s3TierConfigForRemoteRestore(acc *Account, stream string) *S3Ti
 // private file-store directory, verifies the recovered state, then claims the
 // target activation receipt before publishing the stream to local ingress.
 func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	s.jsStreamRestoreRemoteRequestMode(c, subject, reply, rmsg, false)
+}
+
+func (s *Server) jsStreamRecoverRemoteRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	s.jsStreamRestoreRemoteRequestMode(c, subject, reply, rmsg, true)
+}
+
+func (s *Server) jsStreamRestoreRemoteRequestMode(c *client, subject, reply string, rmsg []byte, recovery bool) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -5047,6 +5104,14 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 	var req JSApiStreamRestoreRemoteRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
 		resp.Error = NewJSStreamGeneralError(fmt.Errorf("invalid remote restore request: %w", err), Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if (req.StorageGeneration != "" && !validS3TierRemoteRestoreOperationID(req.StorageGeneration)) ||
+		(recovery && (!req.StageOnly || req.WarmupOnly || req.ActivateStaged || req.DiscardStaged || !req.SourceFenced || !validS3TierRemoteRestoreOperationID(req.RecoveryCheckpointID) || len(req.RecoveryCheckpointSHA256) != 64)) ||
+		(!recovery && (req.RecoveryCheckpointID != "" || req.RecoveryCheckpointSHA256 != "" || req.SourceFenced)) {
+		err := errors.New("recovery requires a fenced source, exact checkpoint and staged restoration")
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -5092,7 +5157,7 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 	// The abort receipt outlives local staging. Check it under the same lock
 	// as stage/cleanup so a delayed retry cannot recreate an abandoned target.
 	aborted := false
-	if cfg := s.s3TierConfigForRemoteRestore(acc, stream); cfg != nil && cfg.Store != nil {
+	if cfg := s.s3TierConfigForGeneration(acc, stream, req.StorageGeneration); cfg != nil && cfg.Store != nil {
 		probe := newFileS3Tier(nil, *cfg)
 		data, found, checkErr := probe.getImmutableIfPresent(probe.remoteRestoreActivationKey(req.OperationID))
 		probe.remoteCancel()
@@ -5131,7 +5196,7 @@ func (s *Server) jsStreamRestoreRemoteRequest(_ *subscription, c *client, _ *Acc
 		fs, ok := existing.store.(*fileStore)
 		if ok && fs.tier != nil {
 			if stage := fs.tier.remoteRestoreTargetStage(); stage != nil {
-				if stage.OperationID != req.OperationID || stage.Epoch != req.ExpectedEpoch || stage.TargetID != req.TargetID || (!req.StageOnly && !req.ActivateStaged) {
+				if stage.OperationID != req.OperationID || stage.Epoch != req.ExpectedEpoch || stage.TargetID != req.TargetID || (recovery && (stage.RecoveryCheckpointID != req.RecoveryCheckpointID || stage.RecoveryCheckpointSHA256 != req.RecoveryCheckpointSHA256)) || (!req.StageOnly && !req.ActivateStaged) {
 					resp.Error = NewJSStreamNameExistRestoreFailedError()
 				} else if !stage.Ready {
 					if req.StageOnly {
@@ -5197,7 +5262,7 @@ stageTarget:
 			return
 		}
 	}
-	tierConfig := s.s3TierConfigForRemoteRestore(acc, stream)
+	tierConfig := s.s3TierConfigForGeneration(acc, stream, req.StorageGeneration)
 	if tierConfig == nil || tierConfig.Store == nil {
 		resp.Error = NewJSStreamGeneralError(errS3TierNotEnabled, Unless(errS3TierNotEnabled))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
@@ -5231,7 +5296,12 @@ stageTarget:
 		}
 		return
 	}
-	material, err := tier.loadRemoteRestoreMaterial(req.OperationID, req.ExpectedEpoch)
+	var material *s3TierRemoteRestoreMaterial
+	if recovery {
+		material, err = tier.loadRestoreMaterialAt(tier.recoveryCheckpointKey(req.RecoveryCheckpointID), req.RecoveryCheckpointID, req.ExpectedEpoch, req.RecoveryCheckpointSHA256)
+	} else {
+		material, err = tier.loadRemoteRestoreMaterial(req.OperationID, req.ExpectedEpoch)
+	}
 	if err != nil {
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
@@ -5242,6 +5312,11 @@ stageTarget:
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
+	}
+	checkpointKey := tier.remoteRestoreCheckpointKey(req.OperationID)
+	if recovery {
+		checkpointKey = tier.recoveryCheckpointKey(req.RecoveryCheckpointID)
+		material.checkpoint.StreamConfig.S3TierGeneration = req.OperationID
 	}
 	stageDir := filepath.Join(jsa.storeDir, "__remote_restore__", stream, req.OperationID)
 	if _, err := os.Stat(jsa.archiveTombstoneFile(stream)); err == nil || !os.IsNotExist(err) {
@@ -5261,8 +5336,19 @@ stageTarget:
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	if recovery {
+		newTier := s.s3TierConfigForGeneration(acc, stream, req.OperationID)
+		if err := rebaseRecoveryStore(s.diskIOSemaphore(), stageDir, newTier.Prefix); err != nil {
+			resp.Error = NewJSStreamGeneralError(err, Unless(err))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
+	}
 	if req.StageOnly {
-		stage := s3TierRemoteRestoreTargetStage{Version: 1, OperationID: req.OperationID, Epoch: req.ExpectedEpoch, TargetID: req.TargetID, CheckpointKey: tier.remoteRestoreCheckpointKey(req.OperationID)}
+		stage := s3TierRemoteRestoreTargetStage{Version: 1, OperationID: req.OperationID, Epoch: req.ExpectedEpoch, TargetID: req.TargetID, CheckpointKey: checkpointKey}
+		if recovery {
+			stage.RecoveryCheckpointID, stage.RecoveryCheckpointSHA256 = req.RecoveryCheckpointID, req.RecoveryCheckpointSHA256
+		}
 		data, marshalErr := json.Marshal(stage)
 		err = marshalErr
 		if err == nil {
@@ -5367,7 +5453,6 @@ stageTarget:
 			return
 		}
 	}
-	checkpointKey := tier.remoteRestoreCheckpointKey(req.OperationID)
 	// Staging verifies the complete checkpoint locally. Reclaim its covered
 	// payloads before advertising an active target, otherwise the first publish
 	// can hit the residency fence while background eviction is still pending.

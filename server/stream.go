@@ -90,6 +90,8 @@ type StreamConfig struct {
 	// streams remain local-only, so this is deliberately false by default.
 	// It cannot change after creation because the file-store layout is fixed.
 	S3Tier bool `json:"s3_tier,omitempty"`
+	// A recovery forks storage identity without changing stream subjects or sequences.
+	S3TierGeneration string `json:"s3_tier_generation,omitempty"`
 
 	// Optional qualifiers. These can not be modified after set to true.
 
@@ -1141,6 +1143,14 @@ func (a *Account) addStreamWithAssignmentAndModeLocked(config *StreamConfig, fsC
 		} else {
 			fsCfg.S3Tier = opts.JetStreamS3Tiers[a.GetName()+"/"+cfg.Name]
 		}
+	}
+	if cfg.S3TierGeneration != "" {
+		if !validS3TierRemoteRestoreOperationID(cfg.S3TierGeneration) || fsCfg.S3Tier == nil {
+			return nil, errors.New("storage generation requires a valid S3 recovery identity")
+		}
+		copy := *fsCfg.S3Tier
+		copy.Prefix = strings.TrimRight(copy.Prefix, "/") + "/generations/" + cfg.S3TierGeneration
+		fsCfg.S3Tier = &copy
 	}
 	if fsCfg.S3Tier != nil && fsCfg.S3Tier.BlockSize > 0 {
 		fsCfg.BlockSize = fsCfg.S3Tier.BlockSize
@@ -2619,7 +2629,12 @@ func (jsa *jsAccount) configUpdateCheckLocked(old, new *StreamConfig, s *Server,
 	if cfg.Storage != old.Storage {
 		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update can not change storage type"))
 	}
-	if cfg.S3Tier != old.S3Tier {
+	// Storage lineage is server-managed. Older clients omit this extension
+	// when sealing/updating a stream; omission must preserve its recovery root.
+	if cfg.S3TierGeneration == "" {
+		cfg.S3TierGeneration = old.S3TierGeneration
+	}
+	if cfg.S3Tier != old.S3Tier || cfg.S3TierGeneration != old.S3TierGeneration {
 		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update can not change S3 tier setting"))
 	}
 	// Can only change retention from limits to interest or back, not to/from work queue for now.

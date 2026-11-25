@@ -15,13 +15,15 @@ import (
 // not claim remote ownership, and a restarted target must not infer activation
 // merely because its stream directory and consumers already exist.
 type s3TierRemoteRestoreTargetStage struct {
-	Version       uint8  `json:"version"`
-	OperationID   string `json:"operation_id"`
-	Epoch         uint64 `json:"epoch"`
-	TargetID      string `json:"target_id"`
-	CheckpointKey string `json:"checkpoint_key"`
-	Ready         bool   `json:"ready"`
-	Activated     bool   `json:"activated"`
+	RecoveryCheckpointID     string `json:"recovery_checkpoint_id,omitempty"`
+	RecoveryCheckpointSHA256 string `json:"recovery_checkpoint_sha256,omitempty"`
+	Version                  uint8  `json:"version"`
+	OperationID              string `json:"operation_id"`
+	Epoch                    uint64 `json:"epoch"`
+	TargetID                 string `json:"target_id"`
+	CheckpointKey            string `json:"checkpoint_key"`
+	Ready                    bool   `json:"ready"`
+	Activated                bool   `json:"activated"`
 }
 
 func (s *s3TierRemoteRestoreTargetStage) valid() bool {

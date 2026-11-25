@@ -50,13 +50,19 @@ func (t *fileS3Tier) loadRemoteRestoreMaterial(operationID string, expectedEpoch
 	if !validS3TierRemoteRestoreOperationID(operationID) || expectedEpoch == 0 {
 		return nil, errors.New("remote restore requires an operation ID and expected epoch")
 	}
-	checkpointKey := t.remoteRestoreCheckpointKey(operationID)
+	return t.loadRestoreMaterialAt(t.remoteRestoreCheckpointKey(operationID), operationID, expectedEpoch, "")
+}
+
+func (t *fileS3Tier) loadRestoreMaterialAt(checkpointKey, operationID string, expectedEpoch uint64, digest string) (*s3TierRemoteRestoreMaterial, error) {
 	checkpointData, found, err := t.getImmutableIfPresent(checkpointKey)
 	if err != nil {
 		return nil, err
 	}
 	if !found {
 		return nil, errors.New("remote restore checkpoint was not found")
+	}
+	if digest != "" && checksumS3Block(checkpointData) != digest {
+		return nil, errors.New("recovery checkpoint checksum mismatch")
 	}
 	var checkpoint s3TierRemoteRestoreCheckpoint
 	if err := json.Unmarshal(checkpointData, &checkpoint); err != nil || checkpoint.Version != 1 || checkpoint.OperationID != operationID || checkpoint.Epoch != expectedEpoch || checkpoint.Created.IsZero() {
