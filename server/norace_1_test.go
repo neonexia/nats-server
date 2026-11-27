@@ -2984,9 +2984,20 @@ func TestNoRaceJetStreamClusterExtendedStreamPurge(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
-			// Do manually for now.
-			nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
-			c.waitOnStreamLeader("$G", "KV")
+			createStream := func() {
+				t.Helper()
+				resp, err := nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
+				require_NoError(t, err)
+				var created JSApiStreamCreateResponse
+				require_NoError(t, json.Unmarshal(resp.Data, &created))
+				if created.Error != nil {
+					t.Fatalf("Stream creation failed: %v", created.Error)
+				}
+				// Each recreation elects a new stream leader; publishing before it is
+				// ready can make this test purge fewer messages than it intended.
+				c.waitOnStreamLeader("$G", "KV")
+			}
+			createStream()
 
 			si, err := js.StreamInfo("KV")
 			if err != nil {
@@ -2996,18 +3007,39 @@ func TestNoRaceJetStreamClusterExtendedStreamPurge(t *testing.T) {
 				t.Fatalf("StreamInfo is not correct %+v", si)
 			}
 
+			var pending []nats.PubAckFuture
+			putAsync := func(subject string) {
+				t.Helper()
+				ack, err := js.PublishAsync(subject, []byte("OK"))
+				require_NoError(t, err)
+				pending = append(pending, ack)
+			}
+			checkAcks := func() {
+				t.Helper()
+				for _, ack := range pending {
+					select {
+					case <-ack.Ok():
+					case err := <-ack.Err():
+						t.Fatalf("Publish failed before purge: %v", err)
+					default:
+						t.Fatal("Publish acknowledgement missing after async completion")
+					}
+				}
+				pending = nil
+			}
 			for i := 0; i < 1000; i++ {
-				js.PublishAsync("kv.foo", []byte("OK")) // 1 * i
-				js.PublishAsync("kv.bar", []byte("OK")) // 2 * i
-				js.PublishAsync("kv.baz", []byte("OK")) // 3 * i
+				putAsync("kv.foo") // 1 * i
+				putAsync("kv.bar") // 2 * i
+				putAsync("kv.baz") // 3 * i
 			}
 			// First is 2700, last is 3000
 			for i := 0; i < 700; i++ {
-				js.PublishAsync(fmt.Sprintf("kv.%d", i+1), []byte("OK"))
+				putAsync(fmt.Sprintf("kv.%d", i+1))
 			}
 			// Now first is 2700, last is 3700
 			select {
 			case <-js.PublishAsyncComplete():
+				checkAcks()
 			case <-time.After(10 * time.Second):
 				t.Fatalf("Did not receive completion signal")
 			}
@@ -3084,20 +3116,19 @@ func TestNoRaceJetStreamClusterExtendedStreamPurge(t *testing.T) {
 			purge(&JSApiStreamPurgeRequest{Subject: "kv.*"}, 0)
 
 			// RESET
-			js.DeleteStream("KV")
-			// Do manually for now.
-			nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
-			c.waitOnStreamLeader("$G", "KV")
+			require_NoError(t, js.DeleteStream("KV"))
+			createStream()
 
 			if _, err := js.StreamInfo("KV"); err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
 			// Put in 100.
 			for i := 0; i < 100; i++ {
-				js.PublishAsync("kv.foo", []byte("OK"))
+				putAsync("kv.foo")
 			}
 			select {
 			case <-js.PublishAsyncComplete():
+				checkAcks()
 			case <-time.After(time.Second):
 				t.Fatalf("Did not receive completion signal")
 			}
@@ -3106,31 +3137,32 @@ func TestNoRaceJetStreamClusterExtendedStreamPurge(t *testing.T) {
 			expectLeft("kv.foo", 10)
 
 			// RESET AGAIN
-			js.DeleteStream("KV")
-			// Do manually for now.
-			nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
-			c.waitOnStreamLeader("$G", "KV")
+			require_NoError(t, js.DeleteStream("KV"))
+			createStream()
 
 			if _, err := js.StreamInfo("KV"); err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
 			// Put in 100.
 			for i := 0; i < 100; i++ {
-				js.Publish("kv.foo", []byte("OK"))
+				pa, err := js.Publish("kv.foo", []byte("OK"))
+				require_NoError(t, err)
+				require_Equal(t, pa.Sequence, uint64(i+1))
 			}
 			purge(&JSApiStreamPurgeRequest{Keep: 10}, 10)
 			expectLeft(">", 10)
 
 			// RESET AGAIN
-			js.DeleteStream("KV")
-			// Do manually for now.
-			nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
+			require_NoError(t, js.DeleteStream("KV"))
+			createStream()
 			if _, err := js.StreamInfo("KV"); err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
 			// Put in 100.
 			for i := 0; i < 100; i++ {
-				js.Publish("kv.foo", []byte("OK"))
+				pa, err := js.Publish("kv.foo", []byte("OK"))
+				require_NoError(t, err)
+				require_Equal(t, pa.Sequence, uint64(i+1))
 			}
 			purge(&JSApiStreamPurgeRequest{Sequence: 90}, 11) // Up to 90 so we keep that, hence the 11.
 			expectLeft(">", 11)
